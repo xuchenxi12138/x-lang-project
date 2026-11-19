@@ -1,0 +1,63 @@
+// 17-for.x — for 循环
+//
+// for 在 parser 层展开成 var + while（纯语法糖），所以这里验证的是
+// 「展开后的语义与手写 while 完全一致」。下游没有任何 for 专属代码。
+
+// 右开区间：遍历 0..n 恰好 n 次，不用写 n-1
+for i in 0..5 {
+    println(i)
+}
+
+println("---")
+
+// 右闭区间：0..=3 是 0,1,2,3
+for i in 0..=3 {
+    println(i)
+}
+
+println("---")
+
+// 遍历数组
+let a = array(4, 0)
+a[0] = 10
+a[1] = 20
+a[2] = 30
+a[3] = 40
+for v in a {
+    print(v)
+    print(" ")
+}
+println("")
+
+println("---")
+
+// 嵌套
+var acc = 0
+for i in 0..3 {
+    for j in 0..3 {
+        acc += i * j
+    }
+}
+println(acc)
+
+println("---")
+
+// 累计与提前退出
+var found = -1
+for i in 0..100 {
+    if i * i > 50 {
+        found = i
+        break
+    }
+}
+println(found)
+
+// 索引式遍历（扫雷画格子会用到）
+let w = 3
+let grid = array(9, 0)
+for y in 0..3 {
+    for x in 0..3 {
+        grid[y * w + x] = y * 10 + x
+    }
+}
+println(grid)

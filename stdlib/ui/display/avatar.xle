@@ -1,0 +1,107 @@
+// ui/display/avatar.xle — 头像（圆形 + 首字母）
+//
+// ── 为什么用首字母而不是图片 ───────────────────
+//
+// 窗口层没有加载图片的能力（winScreenshot 只能写不能读）。所以
+// 头像走「确定性生成」路线：名字的首字符 + 一个由名字哈希决定
+// 的后备色。同一个人永远同一个颜色，视觉上就能当简易识别用 ——
+// 而在真实产品里，首字母头像本来也是最常见的降级方案。
+//
+// ── 尺寸常量 ──────────────────────────────────
+//
+// 三档足够覆盖所有场景：列表行内（小）、工具栏（中）、个人资料
+// 页（大）。给太多档位反而让设计者纠结。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 头像的三档尺寸。
+const AVATAR_SM = 24
+const AVATAR_MD = 32
+const AVATAR_LG = 48
+
+// ── 为什么用首字母而不是图片 ───────────────────
+//
+// 窗口层没有加载图片的能力（winScreenshot 只能写不能读）。
+// 所以头像走「确定性生成」路线：名字的首字符 + 一个由名字
+// 哈希决定的后备色。同一个人永远同一个颜色，视觉上就能当
+// 简易识别用。
+class Avatar extends Widget {
+    name: String,
+    size: Int,
+
+    constructor(r: Rect, name: String) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.name    = name
+        self.size    = r.w
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, name: String) -> Avatar {
+        return new Avatar(r, name)
+    }
+
+    // 由名字算一个稳定的颜色。
+    //
+    // ── 为什么用字符串哈希而不是随机 ────────────────
+    //
+    // 随机的话每次重建对象颜色就变，而头像是「身份标识」，
+    // 变色等于换人。哈希保证同名字永远同色。
+    //
+    // 取模到一个 8 色的调色板而不是直接映射到 RGB，是为了
+    // 保证颜色都在同一个明度区间内 —— 直接映射会把名字 "a"
+    // 映到近黑色，在某些主题下看不清。
+    fn bgColor(th: Theme) -> Int {
+        let palette = [
+            0x3B82F6, 0x8B5CF6, 0xEC4899, 0xF59E0B,
+            0x10B981, 0x06B6D4, 0xEF4444, 0x6366F1,
+        ]
+        var h = 0
+        var i = 0
+        while i < len(self.name) {
+            h = h * 31 + strCode(strSub(self.name, i, i + 1))
+            // 钳到 32 位，避免长名字把整数撑爆成浮点。
+            h = h % 1000003
+            i = i + 1
+        }
+        if (h < 0) { h = 0 - h }
+        let idx = h % len(palette)
+        return toInt(palette[idx])
+    }
+
+    // 首字符。空名字给 "?"。
+    //
+    // ── 为什么取一个字符而不是两个字 ────────────────
+    //
+    // 中文名的惯例是取姓（一个汉字），英文名取首字母。取两个字
+    // 在中文里好看（"张三"），在英文里就变成 "Al" 这种怪东西。
+    // 统一取一个字符最不容易出错。
+    fn initial() -> String {
+        if (len(self.name) == 0) { return "?" }
+        return strUpper(strSub(self.name, 0, 1))
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        let rad = self.r.w / 2
+
+        let bg = self.bgColor(th)
+        winEllipse(self.r.x, self.r.y, self.r.w, self.r.h, bg)
+
+        // 首字母：用白色，因为上面那 8 个颜色都是中深色，
+        // 白字在任何主题下都有足够对比度。
+        uiTextInRect(self.r, self.initial(), 0xFFFFFF)
+    }
+
+    fn hit(mx: Int, my: Int) -> Bool {
+        return false
+    }
+}

@@ -1,0 +1,221 @@
+// ============================================================
+// std.text.find —— 查找与替换
+// ============================================================
+//
+// ── 为什么大小写不敏感靠「整体转小写」────────────────────
+//
+// 语言没有「忽略大小写的 strFind」。逐位置比较要写 O(n·m) 的嵌套
+// 循环，而且每比较一次都要切子串。把整行与查询都转成小写再查，
+// 是 O(n) 的一次转换 + 一次现成的字符串查找。
+//
+// 正确性依赖一个前提：**转小写不改变码点个数**。当前 strLower 只
+// 处理 ASCII，非 ASCII 原样保留，所以码点下标完全对齐 —— 在原文
+// 上取 [at, at+len(q)) 与在小写串上找到的位置是同一个位置。
+// 这条注释就是前提声明：将来 strLower 如果做了 Unicode 大小写映射
+// （例如 İ → i̇ 会改变长度），这里必须改成逐位置比较。
+//
+// ── 全词匹配的边界 ────────────────────────────────────
+//
+// 词字符 = ASCII 字母/数字/下划线 + 所有非 ASCII 码点。后者是为了
+// 中文：把「中文」当成一个词，这样搜索「文」时不会命中它。
+//
+// ── 为什么替换全部从后往前 ────────────────────────────
+//
+// 替换会让文本位移（长度变化、可能插入多行）。从前往后替换时，
+// 后面已经算好的匹配位置全部失效；从后往前替换，越早的位置越不
+// 受影响，因而一次遍历即可。这也是「先收集、再倒序改」的原因。
+
+from "doc.xle" import Doc, txtIsWordCode
+
+// ── 内部工具 ────────────────────────────────────────
+
+fn fndNorm(s: String, matchCase: Int) -> String {
+    if (matchCase == 1) { return s }
+    return strLower(s)
+}
+
+fn fndEqual(a: String, b: String, matchCase: Int) -> Bool {
+    return fndNorm(a, matchCase) == fndNorm(b, matchCase)
+}
+
+// 在一行里从 start 开始找 q。返回码点下标，找不到 -1。
+fn fndInLine(line: String, q: String, start: Int, matchCase: Int, wholeWord: Int) -> Int {
+    if (len(q) == 0) { return 0 - 1 }
+    let hay = fndNorm(line, matchCase)
+    let nee = fndNorm(q, matchCase)
+    let qn = len(q)
+    var pos = start
+    if (pos < 0) { pos = 0 }
+    while (pos <= len(line)) {
+        let at = strFindFrom(hay, nee, pos)
+        if (at < 0) { return 0 - 1 }
+        var ok = true
+        if (wholeWord == 1) {
+            if (at > 0) {
+                if (txtIsWordCode(strCode(strAt(line, at - 1)))) { ok = false }
+            }
+            if (at + qn < len(line)) {
+                if (txtIsWordCode(strCode(strAt(line, at + qn)))) { ok = false }
+            }
+        }
+        if (ok) { return at }
+        pos = at + 1
+    }
+    return 0 - 1
+}
+
+// ── 查找全部 ────────────────────────────────────────
+
+// 返回 [[ln, col, len], ...]，按文档顺序、同一行内不重叠。
+fn findAllIn(doc: Doc, q: String, matchCase: Int, wholeWord: Int) -> Array {
+    let out = []
+    if (len(q) == 0) { return out }
+    var l = 0
+    while (l < doc.lineCount()) {
+        let line = doc.lineAt(l)
+        var pos = 0
+        while (pos <= len(line)) {
+            let at = fndInLine(line, q, pos, matchCase, wholeWord)
+            if (at < 0) { break }
+            arrPush(out, [l, at, len(q)])
+            pos = at + len(q)
+        }
+        l = l + 1
+    }
+    return out
+}
+
+fn countIn(doc: Doc, q: String, matchCase: Int, wholeWord: Int) -> Int {
+    return len(findAllIn(doc, q, matchCase, wholeWord))
+}
+
+// ── 查找下一个／上一个 ───────────────────────────────
+
+// 从「当前选区末端」或光标处向后找；wrap=1 时到文末后回到开头。
+// 命中后把该匹配设为选区。
+fn findNextIn(doc: Doc, q: String, matchCase: Int, wholeWord: Int, wrap: Int) -> Bool {
+    if (len(q) == 0) { return false }
+    var sl = doc.ln
+    var sc = doc.col
+    if (doc.hasSel()) {
+        let b = doc.selEnd()
+        sl = toInt(b[0])
+        sc = toInt(b[1])
+    }
+    var l = sl
+    while (l < doc.lineCount()) {
+        var st = 0
+        if (l == sl) { st = sc }
+        let at = fndInLine(doc.lineAt(l), q, st, matchCase, wholeWord)
+        if (at >= 0) {
+            doc.selectRange(l, at, l, at + len(q))
+            return true
+        }
+        l = l + 1
+    }
+    if (wrap == 1) {
+        l = 0
+        while (l <= sl) {
+            let at = fndInLine(doc.lineAt(l), q, 0, matchCase, wholeWord)
+            if (at >= 0) {
+                doc.selectRange(l, at, l, at + len(q))
+                return true
+            }
+            l = l + 1
+        }
+    }
+    return false
+}
+
+// 上一个。实现是「取全部匹配，挑当前位置之前最后一个」——比反向
+// 逐行扫描短，也不需要为反向查找再写一套边界逻辑（比如「末行
+// 从行尾开始」）。代价是每次 O(文档)，F3 的频率下完全可接受。
+fn findPrevIn(doc: Doc, q: String, matchCase: Int, wholeWord: Int, wrap: Int) -> Bool {
+    if (len(q) == 0) { return false }
+    let all = findAllIn(doc, q, matchCase, wholeWord)
+    if (len(all) == 0) { return false }
+
+    var curL = doc.ln
+    var curC = doc.col
+    if (doc.hasSel()) {
+        let a = doc.selStart()
+        curL = toInt(a[0])
+        curC = toInt(a[1])
+    }
+
+    var pick = 0 - 1
+    var i = 0
+    while (i < len(all)) {
+        let m = all[i]
+        let ml = toInt(m[0])
+        let mc = toInt(m[1])
+        if (ml < curL || (ml == curL && mc < curC)) { pick = i }
+        i = i + 1
+    }
+    if (pick < 0) {
+        if (wrap == 0) { return false }
+        pick = len(all) - 1
+    }
+    let m = all[pick]
+    let l = toInt(m[0])
+    let c = toInt(m[1])
+    doc.selectRange(l, c, l, c + toInt(m[2]))
+    return true
+}
+
+// ── 替换 ───────────────────────────────────────────
+
+// 在指定位置原地替换。支持替换文本含换行（会插入行）。
+// 调用方负责 beforeEdit()，这里只改数据。
+fn fndReplaceAt(doc: Doc, ln: Int, col: Int, n: Int, repl: String) {
+    let line = doc.lineAt(ln)
+    let head = strSub(line, 0, col)
+    let tail = strSub(line, col + n, len(line))
+    let parts = strSplit(repl, "\n")
+    if (len(parts) == 1) {
+        doc.lines[ln] = head + toString(parts[0]) + tail
+        return
+    }
+    doc.lines[ln] = head + toString(parts[0])
+    var k = 1
+    while (k < len(parts)) {
+        arrInsert(doc.lines, ln + k, parts[k])
+        k = k + 1
+    }
+    let last = ln + len(parts) - 1
+    doc.lines[last] = toString(doc.lines[last]) + tail
+}
+
+// 替换当前这一个：当前选区恰好是目标就直接换，否则先找下一个。
+fn replaceOne(doc: Doc, q: String, repl: String, matchCase: Int, wholeWord: Int) -> Bool {
+    if (len(q) == 0) { return false }
+    if (doc.hasSel()) {
+        if (fndEqual(doc.selText(), q, matchCase)) {
+            doc.insertText(repl)
+            return true
+        }
+    }
+    if (!findNextIn(doc, q, matchCase, wholeWord, 1)) { return false }
+    doc.insertText(repl)
+    return true
+}
+
+fn replaceAll(doc: Doc, q: String, repl: String, matchCase: Int, wholeWord: Int) -> Int {
+    if (len(q) == 0) { return 0 }
+    let all = findAllIn(doc, q, matchCase, wholeWord)
+    if (len(all) == 0) { return 0 }
+
+    doc.beforeEdit()
+    var i = len(all) - 1
+    while (i >= 0) {
+        let m = all[i]
+        fndReplaceAt(doc, toInt(m[0]), toInt(m[1]), toInt(m[2]), repl)
+        i = i - 1
+    }
+    doc.ln = 0
+    doc.col = 0
+    doc.clearSel()
+    doc.ensureCursor()
+    doc.dirty = true
+    return len(all)
+}

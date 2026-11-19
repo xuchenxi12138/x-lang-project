@@ -1,0 +1,152 @@
+// ui/control/progress.xle — 进度条
+//
+// ── 和滑块共享「轨道 + 填充」的视觉语言 ─────────────
+//
+// 两者视觉上是一家：一条底槽 + 一段强调色填充 + 一个比例。
+// 但不接受任何输入，也不处理拖动。
+//
+// ── 为什么是独立一个类而不是滑块加 readonly ──────────
+//
+// 因为进度条有一个滑块没有的能力：**不确定态**（indeterminate）。
+// 当进度无法估算时（等网络响应、扫描未知大小的目录），应该显示
+// 一个来回移动的条而不是 0% —— 假进度比没有进度更糟，用户会
+// 盯着不动的 0% 等下去。
+//
+// 滑块不需要这个概念，所以分成两个类而不是靠一个标志位控制行为：
+// 「读一读 Progress 有哪些能力」比「读一遍 if (readonly) 的分支」
+// 快得多。
+//
+// ── 百分比文字为什么压在条上 ────────────────────
+//
+// 因为进度条的高度常常只有 8~16px，文字放外面会让整行变高，
+// 而进度条通常夹在列表行里，行高很紧。压在上面时靠颜色对比
+// 保证可读：填充过半用 onAccent，否则用正文色。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+class Progress extends Widget {
+    ratio: Float,          // 0.0 ~ 1.0
+
+    // 不确定态：不知道进度，只表示「在忙」。
+    indeterminate: Bool,
+
+    // 是否显示百分比文字。
+    showLabel: Bool,
+
+    // 动画相位（0.0~1.0），不确定态下用它驱动来回移动。
+    //
+    // ── 为什么不自己调 winTime ────────────────────
+    //
+    // 因为「每帧推进多少」应该由调用方决定：暂停的界面不该继续
+    // 动，而组件的 draw 拿不到「现在是不是暂停」这个信息。所以
+    // 由外部调 tick(dt)，组件只负责按 phase 画。
+    phase: Float,
+
+    constructor(r: Rect, ratio: Float) {
+        self.r             = r
+        self.vis           = true
+        self.enabled       = true
+        self.focused       = false
+        self.hovered       = false
+        self.ratio         = ratio
+        self.indeterminate = false
+        self.showLabel     = false
+        self.phase         = 0.0
+        self.style         = Style.plain()
+    }
+
+    static fn of(r: Rect, ratio: Float) -> Progress {
+        return new Progress(r, ratio)
+    }
+
+    // 不确定态工厂。名字叫 busy 而不是 indeterminate，因为调用点
+    // 读起来是「这里在忙」，而不是「这里有个布尔标志」。
+    static fn busy(r: Rect) -> Progress {
+        let p = new Progress(r, 0.0)
+        p.indeterminate = true
+        return p
+    }
+
+    fn setRatio(v: Float) -> Progress {
+        self.ratio = v
+        return self
+    }
+
+    fn setLabel(v: Bool) -> Progress {
+        self.showLabel = v
+        return self
+    }
+
+    // 推进不确定态的相位。dt 是秒。每帧调一次。
+    //
+    // 周期 1.2 秒：太慢像卡住了，太快像故障。这个值是照着
+    // 「人能感知到的忙碌感」调的，不是随意取的。
+    fn tick(dt: Float) -> Progress {
+        self.phase = self.phase + dt / 1.2
+        // 用 while 而不是 if：切回窗口时 dt 可能累积到好几秒，
+        // 一次取模会把相位推到区间外。
+        while self.phase > 1.0 {
+            self.phase = self.phase - 1.0
+        }
+        return self
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        let h = self.r.h
+        if (h <= 0) { return }
+        let rad = h / 2
+
+        // 底槽。
+        winFillRound(self.r.x, self.r.y, self.r.w, h, rad, th.track)
+
+        var accent = th.accent
+        if (!self.enabled) { accent = th.disabled }
+
+        if (self.indeterminate) {
+            // 不确定态：一段宽度约 30% 的填充在轨道上来回跑。
+            //
+            // 位置用 sin 波而不是线性来回 —— 线性会让它「撞墙」
+            // 然后突兀地反向，正弦的缓入缓出让运动自然得多。
+            let segW = self.r.w * 30 / 100
+            let span = self.r.w - segW
+            if (span > 0) {
+                // sin 输出 -1~1，映射到 0~1 再乘 span。
+                let s = math(sin, self.phase * 6.2831853)
+                let t = (s + 1.0) / 2.0
+                let sx = self.r.x + toInt(t * toFloat(span))
+                winFillRound(sx, self.r.y, segW, h, rad, accent)
+            }
+        } else {
+            // 确定态：按比例填充。
+            //
+            // 夹紧到 [0,1]：上游算出 -3% 或 108% 是上游的 bug，
+            // 但进度条不该因此画到框外。
+            var t = self.ratio
+            if (t < 0.0) { t = 0.0 }
+            if (t > 1.0) { t = 1.0 }
+            let fw = toInt(t * toFloat(self.r.w) + 0.5)
+            if (fw > 0) {
+                winFillRound(self.r.x, self.r.y, fw, h, rad, accent)
+            }
+        }
+
+        // 百分比文字。有文字时不裁剪，因为百分比在最坏情况下
+        //（100%）也放得下。
+        if (self.showLabel && !self.indeterminate) {
+            let s = fixed(self.ratio * 100.0, 0) + "%"
+            // 文字颜色要考虑「压在填充段上还是压在底槽上」：
+            // 填充过半时用 onAccent，否则用正文色，保证对比度。
+            var tc = th.text
+            if (self.ratio > 0.55) { tc = th.onAccent }
+            uiTextInRect(self.r, s, tc)
+        }
+    }
+}

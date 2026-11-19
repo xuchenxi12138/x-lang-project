@@ -1,0 +1,75 @@
+{
+  "name": "x-lang",
+  "displayName": "X Language",
+  "description": "X 语言的语法高亮与智能代码提示（.xle / .xlc）。补全、悬停、参数提示、文档大纲，由 x lsp 提供。支持中文关键字与 12 个绘制原语。",
+  "version": "0.4.1",
+  "publisher": "x-lang",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "x",
+    "xle",
+    "xlc",
+    "language",
+    "中文编程",
+    "lsp"
+  ],
+  "main": "./src/lspClient.js",
+  "activationEvents": [
+    "onLanguage:x",
+    "onCommand:xlang.showServerLog",
+    "onCommand:xlang.restartServer"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "x",
+        "aliases": [
+          "X",
+          "x"
+        ],
+        "extensions": [
+          ".xle",
+          ".xlc"
+        ],
+        "configuration": "./language-configuration/language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "x",
+        "scopeName": "source.x",
+        "path": "./syntaxes/x.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "X Language",
+      "properties": {
+        "xlang.executablePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "`x` 可执行文件的完整路径（含文件名，如 `F:/项目/x-project/x-lang/build/x.exe`）。留空时依次查找：工作区下 `build/x.exe`、`build/x`、`x.exe`、`x`，最后查找 PATH。改完需要重新加载窗口。"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "xlang.showServerLog",
+        "title": "X: 查看语言服务日志"
+      },
+      {
+        "command": "xlang.restartServer",
+        "title": "X: 停止语言服务"
+      }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://gitee.com/xuchenxi996/x-project"
+  }
+}

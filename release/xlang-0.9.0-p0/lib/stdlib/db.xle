@@ -1,0 +1,1034 @@
+// ============================================================
+// std.db —— 文件存储的表引擎 + SQL 子集
+// ============================================================
+//
+// ── 为什么是「文件 + 文本」而不是「内嵌一个真数据库」──────
+//
+// 用户的要求是「标准库，跟 x.exe 放一个文件夹，import 就能用」。
+// 内嵌 SQLite 需要把 C 库编进产物（几万行），而 sqlite3.c 本身
+// 不是一个「import 就能用」的东西 —— 它要构建、要适配平台、
+// 要把错误码翻译成人类语言。那与「纯 X 标准库」的定位冲突。
+//
+// 所以这一层是「够用」的实现：
+//   · 数据存成 UTF-8 文本文件，一行一条记录，字段用 \t 分隔
+//   · 支持 CREATE / INSERT / SELECT / UPDATE / DELETE
+//   · 支持 WHERE（= != < <= > >=、AND、OR、LIKE）、ORDER BY、LIMIT
+//   · 支持 COUNT / SUM / AVG / MIN / MAX
+//   · 支持单列索引（一个旁挂文件存「值 → 行号」）
+//   · 支持事务（写之前先备份，提交才落盘，回滚就恢复）
+//
+// 明确的边界：**没有** 外键、JOIN、子查询、并发写。文档写明，
+// 不在「能跑就行」和「假装支持」之间含糊。
+//
+// ── 为什么不存成 JSON ──────────────────────────────────────
+//
+// 每写一行要把整个文件重新序列化一遍，O(n²)。一万行之后一次
+// INSERT 就要几百毫秒。行式文本是 O(1) 追加，且人能直接打开看
+// —— 对「小项目配置级数据库」这个定位，可读性比紧凑更有价值。
+//
+// ── 为什么用 \t 而不是逗号 ──────────────────────────────────
+//
+// CSV 要处理引号转义、内嵌逗号、内嵌换行，规则比它看起来复杂
+// 得多，而且各家实现不一致（Excel 与 RFC 4180 就有分歧）。
+// 制表符在正常文本里几乎不出现，转义规则可以简化成「\t → \\t、
+// \n → \\n、\\ → \\\\」三条。
+
+import std.str
+import std.fs
+
+// 字段分隔符与转义。所有读写都必须走下面两个函数，不允许直接拼。
+const DB_SEP = "\t"
+
+// 表对象的槽位。
+//
+//   [ dir, name, columns, rows, dirty ]
+//     0     1      2         3      4
+//
+//   dir     —— 表文件所在目录
+//   columns —— 列名数组
+//   rows    —— 行数组，每行又是一个「字段值数组」
+//   dirty   —— 有未提交的修改（事务用）
+const TBL_DIR    = 0
+const TBL_NAME   = 1
+const TBL_COLS   = 2
+const TBL_ROWS   = 3
+const TBL_DIRTY  = 4
+
+// ============================================================
+// 值编码
+// ============================================================
+//
+// 文件里的每个字段是「编码后的字符串」。为什么要编码而不是直接
+// 拼：字段里可能出现制表符（用户粘贴的内容）、换行（多行地址）、
+// 反斜杠（Windows 路径）。任何一种出现都会把行结构打乱，而症状
+// 是「某些记录读回来字段数不对」—— 极难定位。
+//
+// 编码规则（只有三条，顺序必须是从反斜杠开始）：
+//   \  → \\      必须先做，否则后面插入的转义符会被二次转义
+//   \t → \t
+//   \n → \n
+//   \r → \r
+fn dbEncode(v: String) -> String {
+    var s = strReplace(v, "\\", "\\\\")
+    s = strReplace(s, "\t", "\\t")
+    s = strReplace(s, "\n", "\\n")
+    s = strReplace(s, "\r", "\\r")
+    return s
+}
+
+fn dbDecode(s: String) -> String {
+    // 解码必须**单遍扫描**，不能用四次 strReplace ——
+    // 四次替换会互相干扰：先把 \\ 换成 \ 之后，原本的 \t（两个
+    // 字符）里那个 \ 已经被处理过，再替换 \t 就漏了；反过来先换
+    // \t 再换 \\，则 \\t（转义过的反斜杠加 t）会被误当成制表符。
+    var out = ""
+    var i = 0
+    let n = len(s)
+    while (i < n) {
+        let ch = strAt(s, i)
+        if (ch == "\\" && i + 1 < n) {
+            let nx = strAt(s, i + 1)
+            if (nx == "\\") { out = out + "\\" }
+            else if (nx == "t") { out = out + "\t" }
+            else if (nx == "n") { out = out + "\n" }
+            else if (nx == "r") { out = out + "\r" }
+            else { out = out + nx }      // 未知转义：原样给后一个字符
+            i = i + 2
+        } else {
+            out = out + ch
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ============================================================
+// 表文件路径
+// ============================================================
+
+fn dbPath(tbl: Array, suffix: String) -> String {
+    return tbl[TBL_DIR] + "/" + tbl[TBL_NAME] + suffix
+}
+
+// 表文件本身。第一行是表头（列名，用 \t 分隔并同样编码），
+// 之后每行一条记录。
+fn dbDataPath(tbl: Array) -> String {
+    return dbPath(tbl, ".tbl")
+}
+
+// 索引文件：[值, 行号] 交替。
+fn dbIndexPath(tbl: Array, col: String) -> String {
+    return dbPath(tbl, ".idx." + col)
+}
+
+// ============================================================
+// 建表与载入
+// ============================================================
+
+// 创建（或打开）一张表。已存在则直接载入。
+//
+// cols 是列名数组。列名会做合法性检查：不许含分隔符与换行，
+// 因为它要写进表头。
+fn dbCreate(dir: String, name: String, cols: Array) -> Array {
+    if (len(cols) == 0) {
+        fail("建表 `" + name + "` 失败：至少要有一列")
+    }
+    var i = 0
+    while (i < len(cols)) {
+        let c = cols[i]
+        if (len(c) == 0) {
+            fail("建表 `" + name + "` 失败：第 " + toString(i + 1) + " 列的名字是空的")
+        }
+        if (strFind(c, DB_SEP) >= 0 || strFind(c, "\n") >= 0) {
+            fail("建表 `" + name + "` 失败：列名 `" + c + "` 含制表符或换行")
+        }
+        // 重名列会让 SELECT 的结果无法解释（两个同名列，取哪个？）
+        if (dbColIndex(cols, c) != i) {
+            fail("建表 `" + name + "` 失败：列名 `" + c + "` 重复")
+        }
+        i = i + 1
+    }
+
+    fsEnsureDir(dir)
+    let tbl = array(5, 0)
+    tbl[TBL_DIR] = dir
+    tbl[TBL_NAME] = name
+    tbl[TBL_COLS] = cols
+    tbl[TBL_ROWS] = array(0, 0)
+    tbl[TBL_DIRTY] = false
+
+    // 已存在：载入现有数据，而不是清空。语义是「打开或创建」。
+    // 清空的语义会让「忘了先判断存在」变成数据丢失，而那种错误
+    // 没有任何提示。
+    if (fsExists(dbDataPath(tbl))) {
+        return dbLoad(tbl)
+    }
+    dbFlush(tbl)
+    return tbl
+}
+
+fn dbColIndex(cols: Array, c: String) -> Int {
+    var i = 0
+    while (i < len(cols)) {
+        if (cols[i] == c) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// 把磁盘上的表读进内存。
+fn dbLoad(tbl: Array) -> Array {
+    let path = dbDataPath(tbl)
+    if (!fsExists(path)) { return tbl }
+    let text = fsRead(path)
+    let lines = dbSplitRaw(text)
+    if (len(lines) == 0) { return tbl }
+
+    // 第一行是表头。以文件为准而不是以调用方传的 cols 为准 ——
+    // 这样「改了代码里的列定义但没迁移数据」会表现为列不匹配的
+    // 明确错误，而不是静默用错列。
+    let header = strSplit(lines[0], DB_SEP)
+    let cols = array(0, "")
+    var i = 0
+    while (i < len(header)) {
+        arrPush(cols, dbDecode(header[i]))
+        i = i + 1
+    }
+    tbl[TBL_COLS] = cols
+
+    let rows = array(0, 0)
+    i = 1
+    while (i < len(lines)) {
+        let raw = lines[i]
+        if (len(raw) > 0) {
+            let fields = strSplit(raw, DB_SEP)
+            let row = array(0, "")
+            var k = 0
+            while (k < len(fields)) {
+                arrPush(row, dbDecode(fields[k]))
+                k = k + 1
+            }
+            // 字段数与列数不符：补空或截断，但这是数据损坏的信号。
+            // 静默补齐比报错好 —— 报错会让整张表打不开，而用户
+            // 此时最需要的是「先看到能看的数据」。不过要把列数
+            // 对齐，否则后面按列取值会越界。
+            while (len(row) < len(cols)) { arrPush(row, "") }
+            if (len(row) > len(cols)) {
+                row = arrSlice(row, 0, len(cols))
+            }
+            arrPush(rows, row)
+        }
+        i = i + 1
+    }
+    tbl[TBL_ROWS] = rows
+    return tbl
+}
+
+// 按 \n 切行，但**不**丢掉空行 —— 空行在数据文件里没有意义，
+// 所以调用方会跳过；用 strLines 那种「去掉空行」的语义会让
+// 「一条记录所有字段都是空串」被误解成不存在的行... 实际上
+// 那种行会被编码成 "\t\t"，不是空行，所以这里可以直接用。
+fn dbSplitRaw(text: String) -> Array {
+    let out = array(0, "")
+    if (len(text) == 0) { return out }
+    let parts = strSplit(text, "\n")
+    var i = 0
+    while (i < len(parts)) {
+        var ln = parts[i]
+        if (strEnds(ln, "\r")) { ln = strSub(ln, 0, len(ln) - 1) }
+        arrPush(out, ln)
+        i = i + 1
+    }
+    // 文件末尾的 \n 会切出一个空串，去掉它
+    if (len(out) > 0 && len(out[len(out) - 1]) == 0) {
+        arrRemove(out, len(out) - 1)
+    }
+    return out
+}
+
+// ============================================================
+// 落盘
+// ============================================================
+//
+// ── 为什么必须走 fsReplace（临时文件 + 改名）────────────────
+//
+// 直接用 fsWrite 是「打开 → 截断 → 写」。如果进程在截断之后、
+// 写完之前崩了（或断电），文件里是半截数据 —— 一张几万行的表
+// 变成前三千行，而且**没有任何备份**。
+//
+// fsReplace 的做法是写 .tmp 再 rename。rename 在同一个文件系统
+// 上是原子的：要么看到旧文件，要么看到新文件，不存在中间态。
+// 代价是多一次文件操作，而在「保存数据库」这个场景里，这个
+// 代价是完全值得的。
+fn dbFlush(tbl: Array) -> Bool {
+    let lines = array(0, "")
+    let cols = tbl[TBL_COLS]
+    var head = ""
+    var i = 0
+    while (i < len(cols)) {
+        if (i > 0) { head = head + DB_SEP }
+        head = head + dbEncode(cols[i])
+        i = i + 1
+    }
+    arrPush(lines, head)
+
+    let rows = tbl[TBL_ROWS]
+    var r = 0
+    while (r < len(rows)) {
+        let row = rows[r]
+        var line = ""
+        var c = 0
+        while (c < len(cols)) {
+            if (c > 0) { line = line + DB_SEP }
+            var v = ""
+            if (c < len(row)) { v = row[c] }
+            line = line + dbEncode(v)
+            c = c + 1
+        }
+        arrPush(lines, line)
+        r = r + 1
+    }
+
+    let ok = fsReplace(dbDataPath(tbl), strJoin(lines, "\n") + "\n")
+    if (ok) { tbl[TBL_DIRTY] = false }
+    return ok
+}
+
+// ============================================================
+// INSERT
+// ============================================================
+//
+// vals 的顺序必须与表的列顺序一致，长度也必须一致。
+//
+// ── 为什么不做「按列名插入」 ────────────────────────────────
+//
+// `INSERT INTO t (a, c) VALUES (1, 2)` 这种写法要求解析列名列表，
+// 并在缺列时填默认值。默认值是什么？空串、0、还是 null？语言没有
+// null 字面量的语义（null 是个值，但不能参与比较）。选择任何一个
+// 都会在用户那里变成「为什么我的缺少字段变成空串」的困惑。
+//
+// 强制全列，让「缺字段」变成一个明确的参数个数错误。要少写字，
+// 可以自己建一个只含需要的列的视图表 —— 那比隐式默认值清楚。
+fn dbInsert(tbl: Array, vals: Array) -> Int {
+    let cols = tbl[TBL_COLS]
+    if (len(vals) != len(cols)) {
+        fail("表 `" + tbl[TBL_NAME] + "` 有 " + toString(len(cols)) +
+             " 列，插入给了 " + toString(len(vals)) + " 个值")
+    }
+    let row = array(0, "")
+    var i = 0
+    while (i < len(vals)) {
+        arrPush(row, dbToStr(vals[i]))
+        i = i + 1
+    }
+    arrPush(tbl[TBL_ROWS], row)
+    tbl[TBL_DIRTY] = true
+    return len(tbl[TBL_ROWS]) - 1
+}
+
+// 把任意值转成字段字符串。
+//
+// ── 为什么布尔要写成 true/false 而不是 1/0 ──────────────────
+//
+// 数据文件是给人看的（这是这个引擎的定位之一）。写 1/0 之后，
+// 用户打开文件无法区分「布尔真」与「整数 1」。写成 true/false
+// 虽然占几个字节，但可读性值这个代价。
+//
+// 代价是查询时 `WHERE flag = 1` 匹配不到 true —— 所以 dbCompare
+// 里专门处理了「布尔与数字互认」这一条。
+fn dbToStr(v) -> String {
+    let t = typeOf(v)
+    if (t == "String") { return v }
+    if (t == "Bool") {
+        if (v) { return "true" }
+        return "false"
+    }
+    if (t == "Null") { return "" }
+    return toString(v)
+}
+
+// ============================================================
+// SELECT
+// ============================================================
+//
+// 返回「结果表」：第一个元素是列名数组，之后每行一个值数组。
+// 形状与 dbCreate 建的表不同 —— 结果表是只读的，不能直接
+// dbInsert 进去。这是有意的：查询结果和可写表混用是混淆的来源。
+const RS_COLS = 0
+
+fn dbResultCols(rs: Array) -> Array {
+    return rs[RS_COLS]
+}
+
+fn dbResultRows(rs: Array) -> Array {
+    return arrSlice(rs, 1, len(rs))
+}
+
+fn dbResultCount(rs: Array) -> Int {
+    return len(rs) - 1
+}
+
+// 全表查询，返回所有行（不含表头）。
+fn dbSelectAll(tbl: Array) -> Array {
+    return dbSelectCols(tbl, tbl[TBL_COLS])
+}
+
+// 只取指定列。cols 是列名数组。
+fn dbSelectCols(tbl: Array, cols: Array) -> Array {
+    let all = tbl[TBL_COLS]
+    let idx = array(0, 0)
+    var i = 0
+    while (i < len(cols)) {
+        let k = dbColIndex(all, cols[i])
+        if (k < 0) {
+            fail("表 `" + tbl[TBL_NAME] + "` 没有列 `" + cols[i] + "`")
+        }
+        arrPush(idx, k)
+        i = i + 1
+    }
+    let rs = array(0, 0)
+    arrPush(rs, cols)
+    let rows = tbl[TBL_ROWS]
+    var r = 0
+    while (r < len(rows)) {
+        let src = rows[r]
+        let out = array(0, "")
+        var c = 0
+        while (c < len(idx)) {
+            let j = toInt(idx[c])
+            if (j < len(src)) { arrPush(out, src[j]) } else { arrPush(out, "") }
+            c = c + 1
+        }
+        arrPush(rs, out)
+        r = r + 1
+    }
+    return rs
+}
+
+// ============================================================
+// WHERE 条件
+// ============================================================
+//
+// 条件用「扁平三元组数组」表示：[列名, 操作符, 值, 列名, 操作符, 值, ...]
+// 多个条件默认 AND。OR 用 dbOr 包一层。
+//
+// ── 为什么不用字符串表达式（"age > 18 AND name LIKE 'a%'"）────
+//
+// 那种写法要写一个完整的表达式解析器（优先级、括号、类型转换），
+// 而 X 没有闭包，没法把解析结果变成一个可调用的谓词。折中方案
+// 是三元组：调用方直接用数组表达条件，没有字符串解析这一层。
+//
+// SQL 文本入口（dbExec）内部也是把文本解析成三元组，所以两条
+// 路径最终走同一个比较实现，不会出现「SQL 查出的结果和数组
+// 查出的不一样」。
+fn dbWhere(tbl: Array, conds: Array) -> Array {
+    let rs = array(0, 0)
+    arrPush(rs, tbl[TBL_COLS])
+    let rows = tbl[TBL_ROWS]
+    var r = 0
+    while (r < len(rows)) {
+        if (dbMatch(tbl, rows[r], conds)) {
+            arrPush(rs, arrCopy(rows[r]))
+        }
+        r = r + 1
+    }
+    return rs
+}
+
+// 一行是否满足全部条件。
+//
+// conds 为空 → 恒真（这是「没有 WHERE」的语义）。
+//
+// ── 两种条件形态 ────────────────────────────────────────────
+//
+//   1. 全部 AND（默认）：[col, op, val, col, op, val, ...]
+//   2. 整体 OR：[ "||", col, op, val, col, op, val, ... ]
+//
+// 只做这两层，不做「AND 和 OR 混用」—— 那需要优先级规则，而没有
+// 括号的扁平数组表达不了优先级。想要混用就自己嵌套调用：先各自
+// dbWhere 再合并。把「做不到的事」明确化，比做一个「有时对有时
+// 错」的优先级猜测要好。
+fn dbMatch(tbl: Array, row: Array, conds: Array) -> Bool {
+    if (len(conds) == 0) { return true }
+    if (conds[0] == "||") {
+        var i = 1
+        // 边界写成 `i + 2 < len`：需要 conds[i]、[i+1]、[i+2] 三个元素，
+        // 最大合法下标是 len-1，所以 i 的上界是 len-3，即 i <= len-3，
+        // 等价于 i + 2 <= len - 1，也就是 i + 2 < len。
+        while (i + 2 < len(conds)) {
+            let one = arrSlice(conds, i, i + 3)
+            if (dbMatch(tbl, row, one)) { return true }
+            i = i + 3
+        }
+        return false
+    }
+    var i = 0
+    while (i + 2 < len(conds)) {
+        let col = conds[i]
+        let op = conds[i + 1]
+        let want = conds[i + 2]
+        let ci = dbColIndex(tbl[TBL_COLS], col)
+        if (ci < 0) {
+            fail("条件里的列 `" + col + "` 不存在于表 `" + tbl[TBL_NAME] + "`")
+        }
+        var have = ""
+        if (ci < len(row)) { have = row[ci] }
+        if (!dbCompare(have, op, want)) { return false }
+        i = i + 3
+    }
+    return true
+}
+
+// 比较两个**字符串**（数据文件里的值都是字符串）。
+//
+// ── 类型怎么处理 ────────────────────────────────────────────
+//
+// 数据文件里只有文本，所以 `age = 18` 要比较的是 "18" 与 "18"。
+// 但用户用数组 API 传条件时给的是 Int 18，而 row 里是 "18"。
+// 所以这里统一先转字符串再比 —— 但对大小比较必须按**数值**
+// 而不是字典序，否则 "9" > "18"（字典序里 '9' > '1'）。
+//
+// 判据：两边都能解析成数字，就按数字比；否则按字符串比。
+// 这个规则在 SQL 里是隐含的（有类型），在这里是显式的，
+// 因为文本存储丢掉了类型信息。
+fn dbCompare(have: String, op: String, want: String) -> Bool {
+    if (op == "="  || op == "==") { return dbEq(have, want) }
+    if (op == "!=" || op == "<>") { return !dbEq(have, want) }
+    if (op == "LIKE") { return dbLike(have, want) }
+    if (op == "NOT LIKE") { return !dbLike(have, want) }
+    if (op == "IS NULL")     { return len(have) == 0 }
+    if (op == "IS NOT NULL") { return len(have) > 0 }
+
+    // 大小比较按数值（若两边都是数字）
+    let num = strIsFloat(have) && strIsFloat(want)
+    if (num) {
+        let a = strParseFloat(have)
+        let b = strParseFloat(want)
+        if (op == "<")  { return a < b }
+        if (op == "<=") { return a <= b }
+        if (op == ">")  { return a > b }
+        if (op == ">=") { return a >= b }
+        return false
+    }
+    if (op == "<")  { return have < want }
+    if (op == "<=") { return have <= want }
+    if (op == ">")  { return have > want }
+    if (op == ">=") { return have >= want }
+    fail("不认识的比较操作符 `" + op + "`\n" +
+         "  help: 支持 = != < <= > >= LIKE IS NULL IS NOT NULL")
+    return false
+}
+
+// 相等判断，带「布尔与数字互认」。
+//
+// 为什么需要：dbToStr 把 true 写成 "true"，而用户用 SQL 写
+// `WHERE done = 1` 时想表达的是「真」。不互认的话，这个查询
+// 永远返回 0 行 —— 而它看起来完全正确。
+fn dbEq(have: String, want: String) -> Bool {
+    if (have == want) { return true }
+    // true/false 与 1/0 互认
+    if (have == "true"  && want == "1") { return true }
+    if (have == "false" && want == "0") { return true }
+    if (want == "true"  && have == "1") { return true }
+    if (want == "false" && have == "0") { return true }
+    // 数值等价："18" 与 "18.0"
+    if (strIsFloat(have) && strIsFloat(want)) {
+        return strParseFloat(have) == strParseFloat(want)
+    }
+    return false
+}
+
+// LIKE：% 匹配任意长度，_ 匹配单个字符。
+//
+// ── 为什么不用正则 ──────────────────────────────────────────
+//
+// 语言没有正则。写一个完整的正则引擎超出「标准库」的合理范围，
+// 而 SQL 的 LIKE 只需要两个通配符 —— 实现它只要二十行。
+//
+// 匹配用「双指针 + 回退」而不是递归：递归在 `%a%a%a%...` 这类
+// 模式上会指数爆炸，而模式来自用户输入，是可以被恶意构造的。
+fn dbLike(s: String, pat: String) -> Bool {
+    var si = 0
+    var pi = 0
+    var star = -1        // 最近一个 % 的位置
+    var mark = 0         // 该 % 匹配到 s 的哪个位置
+    var sn = len(s)
+    var pn = len(pat)
+    while (si < sn) {
+        if (pi < pn) {
+            let pc = strAt(pat, pi)
+            if (pc == "%") {
+                star = pi
+                mark = si
+                pi = pi + 1
+                continue
+            }
+            if (pc == "_" || pc == strAt(s, si)) {
+                si = si + 1
+                pi = pi + 1
+                continue
+            }
+        }
+        // 失配：回退到上一个 %，让它多吞一个字符
+        if (star >= 0) {
+            pi = star + 1
+            mark = mark + 1
+            si = mark
+            continue
+        }
+        return false
+    }
+    // s 走完了，pat 剩下的必须全是 %
+    while (pi < pn && strAt(pat, pi) == "%") { pi = pi + 1 }
+    return pi == pn
+}
+
+// ============================================================
+// ORDER BY / LIMIT
+// ============================================================
+//
+// 结果是 [cols, row1, row2, ...]。排序与截断都作用在这个形状上。
+//
+// ── 为什么排序用插入排序 ────────────────────────────────────
+//
+// 语言没有闭包，而 arrSort 只对数组本身排序，没法传比较函数。
+// 所以只能自己写。插入排序在「几千行」这个量级上完全够用
+// （这个引擎的定位就是小数据量），而且代码短到能一眼看懂。
+// 数据量大到需要快排时，该换的是存储引擎，不是排序算法。
+
+// ── 实现说明：为什么先排「纯数据数组」再拼表头 ──────────────
+//
+// 最初写的是「把表头也放进待排序数组、下标整体偏移 1」。那个写法
+// 在下标上极易出错（插入位置是 j+1 还是 j+2、循环边界要不要 -1），
+// 而且第一版真的写错了 —— 运行时直接报「数组下标越界：写入 [2]，
+// 数组长度 2」。
+//
+// 现在的做法把两件事分开：
+//   1. 只对纯数据数组做插入排序（下标就是 0..n-1，没有任何偏移）
+//   2. 排完之后把表头插到最前面
+//
+// 多一次数组拼接，但省掉了一整类下标错误。对「小表排序」这个
+// 场景，这个交换是划算的。
+fn dbOrderBy(rs: Array, tbl: Array, col: String, desc: Bool) -> Array {
+    let ci = dbColIndex(tbl[TBL_COLS], col)
+    if (ci < 0) {
+        fail("ORDER BY 的列 `" + col + "` 不存在于表 `" + tbl[TBL_NAME] + "`")
+    }
+    let body = dbResultRows(rs)
+    let sorted = array(0, 0)
+    var i = 0
+    while (i < len(body)) {
+        let cur = body[i]
+        // 从末尾往前找第一个「不该排在 cur 之后」的位置
+        var j = len(sorted) - 1
+        while (j >= 0 && dbShouldSwap(sorted[j], cur, ci, desc)) {
+            j = j - 1
+        }
+        // j 之后就是 cur 的位置
+        if (j == len(sorted) - 1) {
+            arrPush(sorted, cur)          // 直接追加（最常见：已排序输入）
+        } else {
+            arrInsert(sorted, j + 1, cur)
+        }
+        i = i + 1
+    }
+
+    let out = array(0, 0)
+    arrPush(out, rs[0])
+    i = 0
+    while (i < len(sorted)) {
+        arrPush(out, sorted[i])
+        i = i + 1
+    }
+    return out
+}
+
+// prev 是否应该排在 cur 之后（即需要交换）。
+fn dbShouldSwap(prev: Array, cur: Array, ci: Int, desc: Bool) -> Bool {
+    var a = ""
+    var b = ""
+    if (ci < len(prev)) { a = prev[ci] }
+    if (ci < len(cur))  { b = cur[ci] }
+    if (strIsFloat(a) && strIsFloat(b)) {
+        let x = strParseFloat(a)
+        let y = strParseFloat(b)
+        if (desc) { return x < y }
+        return x > y
+    }
+    if (desc) { return a < b }
+    return a > b
+}
+
+// 取前 n 行。
+fn dbLimit(rs: Array, n: Int) -> Array {
+    if (n < 0) { return rs }
+    let out = array(0, 0)
+    arrPush(out, rs[0])
+    let body = dbResultRows(rs)
+    var i = 0
+    while (i < len(body) && i < n) {
+        arrPush(out, body[i])
+        i = i + 1
+    }
+    return out
+}
+
+// OFFSET：跳过前 n 行再取。
+fn dbOffset(rs: Array, n: Int) -> Array {
+    if (n <= 0) { return rs }
+    let out = array(0, 0)
+    arrPush(out, rs[0])
+    let body = dbResultRows(rs)
+    var i = n
+    while (i < len(body)) {
+        arrPush(out, body[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================
+// 聚合
+// ============================================================
+//
+// 聚合成一个单值。返回字符串（与数据文件的表示一致）。
+//
+// ── 为什么 COUNT(*) 单独一个函数 ────────────────────────────
+//
+// COUNT(*) 不关心列的值，只数行数。如果按列数，空值要不要算？
+// SQL 的答案是「不算」，但那需要区分「空串」与「NULL」，而本
+// 引擎里两者都是 ""。所以 COUNT(*) 明确只数行，不给歧义空间。
+
+fn dbCount(rs: Array) -> Int {
+    return len(rs) - 1
+}
+
+// 对某列求和。非数字的字段跳过（不报错 —— 数据里有脏值比
+// 「查询直接失败」更常见，而求和跳过脏值是更实用的默认）。
+fn dbSum(rs: Array, col: String) -> Float {
+    let ci = dbColIndex(rs[0], col)
+    if (ci < 0) {
+        fail("SUM 的列 `" + col + "` 不在结果里")
+    }
+    var total = 0.0
+    let body = dbResultRows(rs)
+    var i = 0
+    while (i < len(body)) {
+        let v = body[i][ci]
+        if (strIsFloat(v)) { total = total + strParseFloat(v) }
+        i = i + 1
+    }
+    return total
+}
+
+fn dbAvg(rs: Array, col: String) -> Float {
+    let ci = dbColIndex(rs[0], col)
+    if (ci < 0) {
+        fail("AVG 的列 `" + col + "` 不在结果里")
+    }
+    var total = 0.0
+    var cnt = 0
+    let body = dbResultRows(rs)
+    var i = 0
+    while (i < len(body)) {
+        let v = body[i][ci]
+        if (strIsFloat(v)) {
+            total = total + strParseFloat(v)
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    if (cnt == 0) { return 0.0 }
+    return total / toFloat(cnt)
+}
+
+fn dbMin(rs: Array, col: String) -> String {
+    let ci = dbColIndex(rs[0], col)
+    if (ci < 0) {
+        fail("MIN 的列 `" + col + "` 不在结果里")
+    }
+    var best = ""
+    var found = false
+    let body = dbResultRows(rs)
+    var i = 0
+    while (i < len(body)) {
+        let v = body[i][ci]
+        if (len(v) > 0) {
+            if (!found) {
+                best = v
+                found = true
+            } else if (dbCmpOrder(v, best) < 0) {
+                best = v
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn dbMax(rs: Array, col: String) -> String {
+    let ci = dbColIndex(rs[0], col)
+    if (ci < 0) {
+        fail("MAX 的列 `" + col + "` 不在结果里")
+    }
+    var best = ""
+    var found = false
+    let body = dbResultRows(rs)
+    var i = 0
+    while (i < len(body)) {
+        let v = body[i][ci]
+        if (len(v) > 0) {
+            if (!found) {
+                best = v
+                found = true
+            } else if (dbCmpOrder(v, best) > 0) {
+                best = v
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// 排序用的三向比较（-1 / 0 / 1）。数字按数值，其余按字典序。
+fn dbCmpOrder(a: String, b: String) -> Int {
+    if (strIsFloat(a) && strIsFloat(b)) {
+        let x = strParseFloat(a)
+        let y = strParseFloat(b)
+        if (x < y) { return -1 }
+        if (x > y) { return 1 }
+        return 0
+    }
+    if (a < b) { return -1 }
+    if (a > b) { return 1 }
+    return 0
+}
+
+// ============================================================
+// UPDATE / DELETE
+// ============================================================
+
+// 按条件更新。返回受影响的行数。
+//
+// setCols / setVals 是并行的两个数组：第 i 个列被设成第 i 个值。
+// 传空条件表示更新所有行 —— 这是危险操作，但 SQL 的语义就是
+// 如此；不想全改就一定要给条件。
+fn dbUpdate(tbl: Array, setCols: Array, setVals: Array, conds: Array) -> Int {
+    if (len(setCols) != len(setVals)) {
+        fail("UPDATE 的列数与值数不一致：给了 " + toString(len(setCols)) +
+             " 列、" + toString(len(setVals)) + " 个值")
+    }
+    let idx = array(0, 0)
+    var i = 0
+    while (i < len(setCols)) {
+        let k = dbColIndex(tbl[TBL_COLS], setCols[i])
+        if (k < 0) {
+            fail("UPDATE 的列 `" + setCols[i] + "` 不存在于表 `" + tbl[TBL_NAME] + "`")
+        }
+        arrPush(idx, k)
+        i = i + 1
+    }
+
+    var n = 0
+    let rows = tbl[TBL_ROWS]
+    var r = 0
+    while (r < len(rows)) {
+        if (dbMatch(tbl, rows[r], conds)) {
+            var c = 0
+            while (c < len(idx)) {
+                rows[r][toInt(idx[c])] = dbToStr(setVals[c])
+                c = c + 1
+            }
+            n = n + 1
+        }
+        r = r + 1
+    }
+    if (n > 0) { tbl[TBL_DIRTY] = true }
+    return n
+}
+
+// 按条件删除。返回删除的行数。
+//
+// 倒序遍历删除：正序删会让后面的元素前移，而循环变量还在自增，
+// 于是删掉一个就跳过下一个。这类 bug 的表现是「删了一半」。
+fn dbDelete(tbl: Array, conds: Array) -> Int {
+    var n = 0
+    let rows = tbl[TBL_ROWS]
+    var r = len(rows) - 1
+    while (r >= 0) {
+        if (dbMatch(tbl, rows[r], conds)) {
+            arrRemove(rows, r)
+            n = n + 1
+        }
+        r = r - 1
+    }
+    if (n > 0) { tbl[TBL_DIRTY] = true }
+    return n
+}
+
+// ============================================================
+// 事务
+// ============================================================
+//
+// ── 为什么是「快照回滚」而不是「日志重放」──────────────────
+//
+// 真数据库用 undo/redo 日志，因为它要支持「改到一半断电还能恢复」。
+// 这里只需要「同一个进程里的一段操作要么全成、要么全不成」，而
+// 数据量很小（内存里整个表都在），所以最直接的办法是：开始时把
+// 整个表快照一份，回滚就把快照换回去。
+//
+// 代价是内存翻倍、且不能跨进程。这两个限制在这个引擎的定位下
+// 都可以接受，而它比日志方案短一百行、也不会有「日志回放逻辑
+// 本身有 bug」这种二级故障。
+//
+// 事务对象：[tbl, rowsSnapshot, wasDirty]
+const TX_TBL   = 0
+const TX_ROWS  = 1
+const TX_DIRTY = 2
+
+fn dbBegin(tbl: Array) -> Array {
+    let tx = array(3, 0)
+    tx[TX_TBL] = tbl
+    // arrCopy 是浅拷贝吗？—— 不是完全独立：里面每行还是同一个
+    // 数组引用。所以必须逐行深拷，否则回滚只能恢复「行的列表」，
+    // 而被 UPDATE 改过的行内容已经变了。
+    let rows = tbl[TBL_ROWS]
+    let snap = array(0, 0)
+    var i = 0
+    while (i < len(rows)) {
+        arrPush(snap, arrCopy(rows[i]))
+        i = i + 1
+    }
+    tx[TX_ROWS] = snap
+    tx[TX_DIRTY] = tbl[TBL_DIRTY]
+    return tx
+}
+
+// 提交：落盘。失败返回 false（此时内存里的改动还在，调用方可以
+// 选择重试或回滚）。
+fn dbCommit(tx: Array) -> Bool {
+    let tbl = tx[TX_TBL]
+    let ok = dbFlush(tbl)
+    return ok
+}
+
+// 回滚：把快照换回去。
+fn dbRollback(tx: Array) -> Void {
+    let tbl = tx[TX_TBL]
+    tbl[TBL_ROWS] = tx[TX_ROWS]
+    tbl[TBL_DIRTY] = tx[TX_DIRTY]
+}
+
+// ============================================================
+// 索引
+// ============================================================
+//
+// ── 为什么索引要单独一个文件 ────────────────────────────────
+//
+// 把索引写进表文件会让表文件不再是「一行一条记录」的简单格式，
+// 而那个格式是这个引擎可读性的基础。
+//
+// 索引文件内容是 [值, 行号, 值, 行号, ...] 交替，同样用 \t 分隔。
+//
+// ── 这个索引实际带来了什么 ──────────────────────────────────
+//
+// 说实话：在「整个表都在内存里」的前提下，建索引**不会**让
+// 查询变快 —— dbWhere 仍然是全表扫描。索引真正的价值是：
+//
+//   1. 唯一性约束（dbCreateUnique）—— 这是真正的功能，不是优化
+//   2. 为将来的磁盘化引擎留出接口位置
+//
+// 所以这里不谎称「索引加速查询」。写清楚它现在是用来做唯一性
+// 检查和外部工具消费的，比让用户以为「加了索引就快」要好。
+
+// 建一个普通索引（只是把值→行号落盘，供外部工具或将来使用）。
+fn dbIndex(tbl: Array, col: String) -> Bool {
+    let ci = dbColIndex(tbl[TBL_COLS], col)
+    if (ci < 0) {
+        fail("建索引失败：表 `" + tbl[TBL_NAME] + "` 没有列 `" + col + "`")
+    }
+    let lines = array(0, "")
+    let rows = tbl[TBL_ROWS]
+    var r = 0
+    while (r < len(rows)) {
+        var v = ""
+        if (ci < len(rows[r])) { v = rows[r][ci] }
+        arrPush(lines, dbEncode(v) + DB_SEP + toString(r))
+        r = r + 1
+    }
+    return fsReplace(dbIndexPath(tbl, col), strJoin(lines, "\n") + "\n")
+}
+
+// 在插入前检查唯一性。返回造成冲突的行号，没有冲突返回 -1。
+//
+// 这是索引唯一的「真正功能」：没有一个包含全部已有值的结构，
+// 唯一性检查就必须每次扫全表。虽然这里也是扫全表（数据在内存），
+// 但它把「检查」这件事变成了一个明确的 API，而不是让每个调用方
+// 自己实现。
+fn dbFindDuplicate(tbl: Array, col: String, value: String) -> Int {
+    let ci = dbColIndex(tbl[TBL_COLS], col)
+    if (ci < 0) {
+        fail("检查唯一性失败：表 `" + tbl[TBL_NAME] + "` 没有列 `" + col + "`")
+    }
+    let rows = tbl[TBL_ROWS]
+    var r = 0
+    while (r < len(rows)) {
+        var v = ""
+        if (ci < len(rows[r])) { v = rows[r][ci] }
+        if (v == value) { return r }
+        r = r + 1
+    }
+    return -1
+}
+
+// 带唯一性检查的插入。冲突时返回 -1 且不插入。
+fn dbInsertUnique(tbl: Array, vals: Array, uniqueCol: String) -> Int {
+    let ci = dbColIndex(tbl[TBL_COLS], uniqueCol)
+    if (ci < 0) {
+        fail("表 `" + tbl[TBL_NAME] + "` 没有列 `" + uniqueCol + "`")
+    }
+    var v = ""
+    if (ci < len(vals)) { v = dbToStr(vals[ci]) }
+    if (dbFindDuplicate(tbl, uniqueCol, v) >= 0) { return -1 }
+    return dbInsert(tbl, vals)
+}
+
+// ============================================================
+// 保存
+// ============================================================
+
+// 把内存里的改动落盘。
+//
+// ── 为什么没有一个「自动保存」的开关 ────────────────────────
+//
+// 自动保存意味着「每次 INSERT 都写一次盘」。这在小表上没什么，
+// 但批量插入一千行就变成一千次写文件，每次都是「写临时文件 +
+// 改名」。而且它让事务失去意义（想回滚时数据早就落盘了）。
+//
+// 显式 save 让「什么时候落盘」是调用方的决定，而不是库的猜测。
+fn dbSave(tbl: Array) -> Bool {
+    return dbFlush(tbl)
+}
+
+// 表是否存在（数据文件在）。
+fn dbExists(dir: String, name: String) -> Bool {
+    return fsExists(dir + "/" + name + ".tbl")
+}
+
+// 删除整张表（数据文件 + 所有索引文件）。
+fn dbDrop(dir: String, name: String) -> Bool {
+    let base = dir + "/" + name
+    if (!fsExists(base + ".tbl")) { return false }
+    fsRemove(base + ".tbl")
+    // 索引文件按列名命名，无法枚举已知列，所以扫目录删前缀匹配的。
+    let names = fsList(dir)
+    var i = 0
+    while (i < len(names)) {
+        let f = names[i]
+        if (strStarts(f, name + ".idx.")) {
+            fsRemove(dir + "/" + f)
+        }
+        i = i + 1
+    }
+    return true
+}

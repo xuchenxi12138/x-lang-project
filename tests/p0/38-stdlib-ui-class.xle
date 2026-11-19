@@ -1,0 +1,91 @@
+// 38-stdlib-ui-class.xle — 类层 UI 组件库：抽象基类 + 多态遍历
+//
+// 这个测试证明类系统真的能承载一个组件库，而不只是能 `new` 一个对象。
+// 三个关键点：
+//
+//   1. Widget 是 abstract，五个子类各自实现 draw
+//   2. UiTree 用一个循环画出全部控件 —— 调用点只有 `w.draw(th)`，
+//      不区分类型。结构体做不到这件事。
+//   3. 引用语义让控件状态可变，且共享可见
+//
+// 注意本测试**不**开窗口：所有绘制都会走窗口运行时的空实现路径
+// （console 场景），断言只检查状态与几何，不检查像素。像素级的
+// 验收在 games/settings/demo 里做。
+
+from std.ui import uiHit, uiHitDown, uiTextCenter, uiTextInRect, uiTextLeft, uiButton, uiButtonEx, uiButtonPrimary, uiButtonDanger, uiButtonFlat, uiConsumeClick, uiCheckMark, uiCheck, uiCheckEx, uiRadioGroup, uiSlider, uiSliderLabeled, uiSliderEx, uiField, uiFieldLabeled, uiSeparator, uiPanel, uiPanelTitled, uiProgress, uiProgressLabeled, uiSeparatorEx, uiVRuleEx, uiPanelEx, uiPanelTitledEx, uiProgressEx, uiProgressLabeledEx, uiList, uiListScroll, uiCursor, uiCursorTake, uiModalBg, uiDialog, uiStatus, uiToolbar, uiFixed, Rect, Theme, Style, Anim, Button, Label, Panel, Progress, Cursor, Check, Slider, Frame, Widget, UiLabel, UiButton, UiPanel, UiProgress, UiCheck, UiSlider, UiTree, UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_NONE, UI_BTN_NORMAL, UI_BTN_PRIMARY, UI_BTN_DANGER
+
+fn main() -> Int {
+    let th = Theme.light()
+
+    // ---- 1. 构造一棵异构控件树 ----
+    let tree = new UiTree()
+
+    let pnl = new UiPanel(Rect { x: 24, y: 24, w: 360, h: 240 }, "设置")
+    let lbl = new UiLabel(Rect { x: 48, y: 76, w: 300, h: 20 }, "音量")
+    let chk = new UiCheck(Rect { x: 48, y: 110, w: 300, h: 20 }, "静音", false)
+    let btn = UiButton.primary(Rect { x: 48, y: 148, w: 120, h: 32 }, "应用")
+    let vol = new UiProgress(Rect { x: 48, y: 200, w: 300, h: 12 }, 0.0)
+    vol.set(65)
+
+    tree.add(pnl).add(lbl).add(chk).add(btn).add(vol)
+    println(tree.size())          // 5
+
+    // ---- 2. 多态遍历 ----
+    //
+    // 这就是整个类层存在的理由：一行 `w.draw(th)` 对五种控件都成立。
+    tree.draw(th)
+    println("drawn")
+
+    // ---- 3. 命中查询（倒序，后画的在上）----
+    //
+    // (60,160) 落在按钮上；按钮是第 4 个加入的，压在上面。
+    let h1 = tree.pick(60, 160)
+    println(h1.hit(60, 160))      // true
+
+    // 空白处没命中
+    //
+    // (380,30) 在面板右边界之外（面板 24..384），但 Y 在范围内 ——
+    // 精确落在 384 的右边一像素，所以只有面板可能命中。
+    let h2 = tree.pick(380, 30)
+    println(h2 == pnl)            // true —— 落在面板上
+    let h3 = tree.pick(1000, 1000)
+    println(h3 == null)           // true —— 完全在图外
+
+    // ---- 4. 引用语义：状态可变且共享 ----
+    println(chk.on)               // false
+    chk.toggle()
+    println(chk.on)               // true
+    let alias = chk
+    alias.toggle()
+    println(chk.on)               // false —— 同一个对象
+
+    // ---- 5. 继承来的方法 ----
+    println(pnl.bounds())
+    println(pnl.body())           // 有标题，所以顶部让出 40
+
+    // ---- 6. 隐藏后不参与命中，pick 会落到下层 ----
+    btn.hide()
+    println(btn.hit(60, 160))     // false
+    let h4 = tree.pick(60, 160)
+    println(h4 == btn)            // false
+    println(h4 == pnl)            // true —— 落到下面的面板
+
+    // ---- 7. moveTo 改几何 ----
+    lbl.moveTo(50, 80)
+    println(lbl.bounds())
+
+    // ---- 8. 进度夹取 ----
+    vol.set(120)                  // 超过 100
+    println(vol.ratio)            // 1.0
+    vol.set(-5)
+    println(vol.ratio)            // 0.0
+
+    // ---- 9. 子类特有方法 ----
+    let lbl2 = new UiLabel(Rect { x: 0, y: 0, w: 100, h: 20 }, "a")
+    lbl2.dim(th)
+    lbl2.setText("b")
+    println(lbl2.text)
+
+    println("ui class ok")
+    return 0
+}

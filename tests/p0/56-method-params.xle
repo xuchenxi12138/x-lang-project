@@ -1,0 +1,59 @@
+// 56-method-params.xle — 参数元数据反射：按名绑定的基础
+//
+// aot-skip —— methodParams 与框架动态调用（classNew / methodCall）
+// 目前只在解释器路径实现，见 55-dynamic.xle 的说明。
+//
+// methodParams(cls, "方法名") 返回 [[name, type], ...]。框架（路由
+// 分派）拿路径变量 / 查询串 / 请求体字段**按参数名**对号入座，
+// 类型名负责把 HTTP 的字符串转成 Int/Float/Bool —— 这是「处理器
+// 直接声明要什么参数」这条 Spring 风格链路的最后一环。
+//
+// 两个关键语义：
+//   1. 方法按虚表槽解析 —— 继承来的方法返回**实现方**的参数表
+//      （绑定数据给谁，就按谁的签名来）；
+//   2. 接收者收实例或类名都行（与 anno* 同一约定，扫描阶段还没有
+//      实例）。
+
+class BaseRepo {
+    fn findById(id: Int, withLogs: Bool) -> String {
+        if withLogs { return "log:" + toString(id) }
+        return "row:" + toString(id)
+    }
+
+    fn noParams() -> Int { return 7 }
+}
+
+class UserRepo extends BaseRepo {
+    fn search(keyword: String, limit: Int) -> Array {
+        return [keyword, limit]
+    }
+}
+
+class OrderRepo {
+    fn create(userId: Int, amount: Float, note: String) -> String {
+        return "order:" + toString(userId) + ":" + toString(amount)
+    }
+
+    private fn audit(id: Int) -> String { return "audit:" + toString(id) }
+}
+
+fn main() {
+    println("-- 按名查参数（实例接收者）--")
+    let r = new UserRepo()
+    println("search: " + methodParams(r, "search"))
+    println("noParams: " + methodParams(r, "noParams"))
+
+    println("-- 继承方法的参数表来自实现方 --")
+    println("findById: " + methodParams(r, "findById"))
+
+    println("-- 按类名查（扫描阶段还没有实例）--")
+    println("UserRepo.search: " + methodParams("UserRepo", "search"))
+    println("OrderRepo.create: " + methodParams("OrderRepo", "create"))
+
+    println("-- 没有参数的方法返回空数组 --")
+    println("len: " + toString(len(methodParams(r, "noParams"))))
+
+    println("-- 不存在的方法返回空数组（查无此参 ≠ 查无此法）--")
+    println("missing: " + methodParams(r, "noSuchMethod"))
+    println("done")
+}

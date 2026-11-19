@@ -1,0 +1,657 @@
+// ============================================================
+// std.net / std.service / std.web —— 纯逻辑层测试
+// ============================================================
+//
+// 这个测试**不开监听端口**（除了一个本机回环用于 TCP 往返）。
+// 它验证的是：
+//
+//   net/http/uri      百分号编码、URL 解析、相对解析、点段归一化
+//   net/http/header   大小写无关、重复头、折行、序列化
+//   net/http/cookie   请求 cookie 解析、SetCookie 生成、错误配置检测
+//   net/http/status   状态码原因短语、无 body 判定
+//   net/http/request  起始行解析、走私检测、缺 Host
+//   net/http/response 序列化、HEAD、204 丢弃 body
+//   net/http/router   路径匹配、参数捕获、通配、405
+//   net/core/tcp      回环收发（含中文与二进制）
+//   service/*         生命周期、健康分级、配置来源与校验
+//   web/core/*        容器注册、启停顺序、启动回滚
+//
+// 不测的部分（需要真实网络/环境）：
+//   net/http/client   依赖外部服务端
+//   net/http/server   依赖 accept 循环
+//   service/config    环境变量（语言无内建）
+//
+// 这两者已用 Python 做过端到端验证（见 commit 说明）。
+
+from "../../stdlib/net/http/uri.xle" import uriIsUnreserved, uriPctEncodeByte, uriEncode, uriEncodePath, uriEncodeQueryValue, uriDecode, uriHexVal, uriFindSchemeColon, uriSplitAuthority, strLastFind, uriDirOf, uriNormalizePath, Uri
+from "../../stdlib/net/http/header.xle" import arrRemoveAt, Headers, HD_COLON, HD_MAX_LINE
+from "../../stdlib/net/http/cookie.xle" import ckParseRequestHeader, ckGet, ckDelete, SetCookie
+from "../../stdlib/net/http/status.xle" import hsCommonCodes, hsReason, hsClass, hsHasNoBody, hsAdvice
+from "../../stdlib/net/http/request.xle" import rqKnownMethods, rqParseQuery, rqPlusToSpace, Request
+from "../../stdlib/net/http/response.xle" import Response
+from "../../stdlib/net/http/router.xle" import rnNormalizePattern, rnMatchPattern, rnSplitSegs, arrHas, Route, Match, Router
+from "../../stdlib/net/core/tcp_listener.xle" import TcpListener, TL_POLL_MS, TL_DEFAULT_WAIT_MS
+from "../../stdlib/net/core/tcp_stream.xle" import TcpStream, TS_POLL_MS, TS_DEFAULT_WAIT_MS
+from "../../stdlib/service/lifecycle.xle" import lcStateName, lcStateInit, lcStateStarting, lcStateRunning, lcStateStopping, lcStateStopped, lcStateFailed, Component, Lifecycle
+from "../../stdlib/service/health.xle" import hqJson, CheckResult, HealthChecker
+from "../../stdlib/service/config.xle" import cfgPriority, cfgEnvName, envGet, ConfigEntry, Config
+from "../../stdlib/web/core/container.xle" import Bean, Container
+from "../../stdlib/web/core/application.xle" import AppOptions, Application
+
+fn main() {
+    testUri()
+    testHeader()
+    testCookie()
+    testStatus()
+    testRequest()
+    testResponse()
+    testRouter()
+    testTcp()
+    testLifecycle()
+    testHealth()
+    testConfig()
+    testContainer()
+    testApplication()
+}
+
+// ── URI ──────────────────────────────────────
+
+fn testUri() {
+    println("---- uri encode ----")
+    println(uriEncodePath("/a b/中文.txt"))
+    println(uriEncodeQueryValue("a=1&b=?/"))
+    println(boolToString(uriDecode(uriEncodePath("/a b/中文.txt")) == "/a b/中文.txt"))
+    // 非法编码不丢字节
+    println(uriDecode("a%ZZb%"))
+    println(uriDecode("%"))
+
+    println("---- uri parse ----")
+    let u = Uri.parse("http://u:p@ss@a.com:8080/p/a%20b?q=1&r=2#frag")
+    println(u.scheme)
+    println(u.user)
+    println(u.password)
+    println(u.host)
+    println(toString(u.port))
+    println(u.path)
+    println(u.query)
+    println(u.fragment)
+    println(u.requestTarget())
+    println(u.hostHeader())
+
+    // IPv6
+    let v6 = Uri.parse("https://[::1]:8443/x")
+    println(v6.host)
+    println(toString(v6.port))
+    println(toString(v6.effectivePort()))
+
+    // query 里的 :// 不能被当 scheme
+    let trick = Uri.parse("/a/b?u=http://x/y")
+    println("[" + trick.scheme + "][" + trick.host + "][" + trick.path + "]")
+
+    // 无 authority
+    let rel = Uri.parse("a/b:c")
+    println("[" + rel.scheme + "][" + rel.path + "]")
+
+    println("---- uri host header ----")
+    println(Uri.parse("http://a.com/x").hostHeader())
+    println(Uri.parse("http://a.com:80/x").hostHeader())
+    println(Uri.parse("http://a.com:8080/x").hostHeader())
+
+    println("---- uri resolve ----")
+    let base = Uri.parse("http://a.com/dir/page?x=1")
+    println(Uri.resolve(base, "/login").toString())
+    println(Uri.resolve(base, "sub/x").toString())
+    println(Uri.resolve(base, "../up").toString())
+    println(Uri.resolve(base, "?p=2").toString())
+    println(Uri.resolve(base, "#top").toString())
+    println(Uri.resolve(base, "//cdn.com/z").toString())
+    println(Uri.resolve(base, "http://other.com/z").toString())
+
+    println("---- uri dot segments ----")
+    println(uriNormalizePath("/a/./b/../c"))
+    println(uriNormalizePath("/../a"))
+    println(uriNormalizePath("/a//b"))
+    println(uriNormalizePath("/a/b/"))
+}
+
+// ── Header ───────────────────────────────────
+
+fn testHeader() {
+    println("---- header ----")
+    let h = new Headers()
+    h.add("Content-Type", "text/plain")
+    h.add("Set-Cookie", "a=1")
+    h.add("Set-Cookie", "b=2")
+    h.add("cache-control", "no-cache")
+    h.add("Cache-Control", "max-age=0")
+    h.set("X-Test", "1")
+    h.add("X-Test", "2")
+
+    println(toString(h.count()))
+    println(h.get("CONTENT-TYPE"))
+    println(h.get("content-type"))
+    println(toString(len(h.getAll("set-cookie"))))
+    println(h.getJoined("cache-control"))
+    println(h.getOr("X-None", "<none>"))
+    println(boolToString(h.has("x-test")))
+    println(toString(h.getAll("x-test")))
+
+    // 序列化
+    print(h.toText())
+
+    // 解析：含折行与畸形行
+    let lines = [
+        "Host: a.com",
+        "X-Long: first",
+        "  second",
+        "Set-Cookie: a=1",
+        "Set-Cookie: b=2",
+        "BadLineNoColon",
+        ": empty",
+        "X-Empty:"
+    ]
+    let p = Headers.parseLines(lines)
+    println(toString(p.count()))
+    println(p.get("x-long"))
+    println(boolToString(p.has("x-empty")))
+    println("[" + p.get("x-empty") + "]")
+    println(boolToString(p.has("badlinenocolon")))
+
+    // copy 独立性
+    let q = p.copy()
+    q.remove("set-cookie")
+    println(toString(q.count()) + "/" + toString(p.count()))
+    println(toString(len(p.getAll("set-cookie"))))
+}
+
+// ── Cookie ───────────────────────────────────
+
+fn testCookie() {
+    println("---- cookie parse ----")
+    let r = ckParseRequestHeader("session=abc=def; theme=dark; flag; q=\"quoted\"")
+    let names: Array  = r[0]
+    let values: Array = r[1]
+    println(toString(len(names)))
+    println(toString(names))
+    println(toString(values))
+    println(ckGet(names, values, "session", "<none>"))
+    println("[" + ckGet(names, values, "flag", "<none>") + "]")
+    println(ckGet(names, values, "q", "<none>"))
+    // 大小写敏感
+    println(ckGet(names, values, "Session", "<none>"))
+
+    println("---- set cookie ----")
+    let a = new SetCookie("session", "abc123")
+    a.asHttpOnly().asSecure().withSameSite("Lax").withMaxAge(3600).withPath("/app")
+    println(a.toHeaderValue())
+    println("[" + a.validate() + "]")
+
+    let b = new SetCookie("theme", "dark")
+    println(b.toHeaderValue())
+    println(boolToString(b.isSession()))
+
+    // 错误配置
+    println((new SetCookie("bad name", "x")).validate())
+    let c = new SetCookie("k", "v")
+    c.withSameSite("None")
+    println(c.validate())
+    let d = new SetCookie("k", "v")
+    d.withSameSite("none")
+    println(d.validate())
+    println((new SetCookie("", "v")).validate())
+
+    println("---- cookie delete ----")
+    let del = ckDelete("session", "/", "")
+    println(del.toHeaderValue())
+    println(boolToString(del.isSession()))
+}
+
+// ── Status ───────────────────────────────────
+
+fn testStatus() {
+    println("---- status ----")
+    println(hsReason(200))
+    println(hsReason(404))
+    println(hsReason(418))
+    println("[" + hsReason(599) + "]")
+    println(toString(hsClass(404)))
+    println(toString(hsClass(503)))
+    // 无 body 判定
+    println(boolToString(hsHasNoBody(204)))
+    println(boolToString(hsHasNoBody(304)))
+    println(boolToString(hsHasNoBody(100)))
+    println(boolToString(hsHasNoBody(200)))
+    println(boolToString(hsHasNoBody(404)))
+}
+
+// ── Request ──────────────────────────────────
+
+fn testRequest() {
+    println("---- request line ----")
+    let r = new Request()
+    let ok = r.parseRequestLine("GET /a/b?id=1&kw=%E4%B8%AD&flag HTTP/1.1")
+    println(boolToString(ok[0]))
+    println(r.method)
+    println(r.target)
+    println(r.path())
+    println(r.queryOf("id", "<none>"))
+    println(r.queryOf("kw", "<none>"))
+    println("[" + r.queryOf("flag", "<none>") + "]")
+
+    // 畸形
+    let b1 = new Request()
+    println(boolToString(b1.parseRequestLine("GET /")[0]))
+    let b2 = new Request()
+    println(b2.parseRequestLine("GET / HTTP/2")[1])
+    let b3 = new Request()
+    println(b3.parseRequestLine("GET / HTTP/0.9")[1])
+
+    println("---- request finalize ----")
+    // 走私
+    let sm = new Request()
+    sm.parseRequestLine("POST /x HTTP/1.1")
+    sm.headers.add("Host", "a.com")
+    sm.headers.add("Transfer-Encoding", "chunked")
+    sm.headers.add("Content-Length", "5")
+    let sf = sm.finalizeHead()
+    println(boolToString(sf[0]))
+    println(sf[1])
+
+    // 缺 Host
+    let nh = new Request()
+    nh.parseRequestLine("GET /x HTTP/1.1")
+    let nf = nh.finalizeHead()
+    println(boolToString(nf[0]))
+    println(nf[1])
+
+    // 正常
+    let gd = new Request()
+    gd.parseRequestLine("GET /x HTTP/1.1")
+    gd.headers.add("Host", "a.com")
+    gd.headers.add("Cookie", "s=1; t=2")
+    let gf = gd.finalizeHead()
+    println(boolToString(gf[0]))
+    println(gd.cookieOf("s", "<none>"))
+    println(gd.cookieOf("t", "<none>"))
+    println(toString(gd.contentLength))
+    println(boolToString(gd.chunked))
+}
+
+// ── Response ─────────────────────────────────
+
+fn testResponse() {
+    println("---- response serialize ----")
+
+    // 普通 JSON
+    let r = Response.json(200, "{\"ok\":true}")
+    r.addCookie(new SetCookie("a", "1"))
+    r.addCookie(new SetCookie("b", "2"))
+    print(bbToText(r.serializeForTest(false)))
+
+    // HEAD：头保留 CL，无 body
+    println("---- response head ----")
+    let h = Response.text(200, "0123456789")
+    let hw = bbToText(h.serializeForTest(true))
+    print(hw)
+    println(boolToString(strFind(hw, "Content-Length: 10") >= 0))
+    println(boolToString(strFind(hw, "0123456789") < 0))
+
+    // 204 带 body 应被丢弃
+    println("---- response 204 ----")
+    let e = Response.text(204, "must-not-appear")
+    let ew = bbToText(e.serializeForTest(false))
+    print(ew)
+    println(boolToString(strFind(ew, "must-not-appear") < 0))
+    println(boolToString(strFind(ew, "Content-Length") < 0))
+
+    // 重定向
+    println("---- response redirect ----")
+    let rd = Response.redirect(307, "/new?x=1")
+    let rw = bbToText(rd.serializeForTest(false))
+    println(boolToString(strFind(rw, "Location: /new?x=1") >= 0))
+    println(boolToString(strFind(rw, "307") >= 0))
+
+    // 未知状态码要有兜底短语
+    let unk = Response.empty(599)
+    let uw = bbToText(unk.serializeForTest(false))
+    println(boolToString(strFind(uw, "Unknown") >= 0))
+}
+
+// ── Router ───────────────────────────────────
+
+fn testRouter() {
+    println("---- router ----")
+    let r = new Router()
+    r.get("/", "home")
+    r.get("/user/list", "userList")
+    r.get("/user/:id", "userDetail")
+    r.get("/user/:id/post/:pid", "userPost")
+    r.post("/user/:id", "userUpdate")
+    r.get("/files/*rest", "fileServe")
+    r.any("/health", "health")
+
+    println(toString(r.count()))
+
+    // 命中
+    let m1 = r.route("GET", "/")
+    println(m1.route.handlerName)
+    let m2 = r.route("GET", "/user/list")
+    println(m2.route.handlerName)
+    let m3 = r.route("GET", "/user/42")
+    println(m3.route.handlerName + " id=" + m3.paramOf("id", ""))
+    // 末尾斜杠归一化
+    let m4 = r.route("GET", "/user/42/")
+    println(m4.route.handlerName)
+    // 多参数
+    let m5 = r.route("GET", "/user/42/post/7")
+    println(m5.route.handlerName + " id=" + m5.paramOf("id", "") +
+            " pid=" + m5.paramOf("pid", ""))
+    // 方法区分
+    let m6 = r.route("POST", "/user/42")
+    println(m6.route.handlerName)
+    // 空段不捕获
+    let m7 = r.route("GET", "/user//post/7")
+    println(boolToString(m7.matched))
+    // 通配
+    let m8 = r.route("GET", "/files/a/b/c.txt")
+    println(m8.route.handlerName + " rest=" + m8.paramOf("rest", ""))
+    // 任意方法
+    let m9 = r.route("DELETE", "/health")
+    println(boolToString(m9.matched))
+    // HEAD 复用 GET
+    let m10 = r.route("HEAD", "/user/42")
+    println(m10.route.handlerName)
+    // 未命中
+    let m11 = r.route("GET", "/nope")
+    println(boolToString(m11.matched))
+    // 405
+    let allowed = r.allowedMethods("/user/list")
+    println(toString(allowed))
+
+    // 编码路径
+    println("---- router encoded ----")
+    let r2 = new Router()
+    r2.get("/a b", "space")
+    r2.get("/中文/:x", "cn")
+    println(boolToString(r2.route("GET", "/a%20b").matched))
+    println(boolToString(r2.route("GET", "/a b").matched))
+    let cm = r2.route("GET", "/%E4%B8%AD%E6%96%87/v")
+    println(boolToString(cm.matched) + " x=" + cm.paramOf("x", ""))
+}
+
+// ── TCP 回环 ─────────────────────────────────
+
+fn testTcp() {
+    println("---- tcp loopback ----")
+    let l = TcpListener.localOnly(0)
+    println(boolToString(l.isOpen()))
+    println(boolToString(l.port == 0))          // 请求的是 0
+    println(boolToString(l.boundPort > 0))      // 系统分配的
+
+    // 空 accept 应立即返回 false
+    let probe = l.accept()
+    println(boolToString(probe[0]))
+
+    let rc = TcpStream.connect("127.0.0.1", l.boundPort)
+    println(boolToString(rc[0]))
+    if (rc[0] != true) { l.close(); return }
+    let cli: TcpStream = rc[1]
+
+    let ra = l.acceptWithin(2000)
+    println(boolToString(ra[0]))
+    if (ra[0] != true) { cli.close(); l.close(); return }
+    let srv: TcpStream = ra[1]
+
+    // 中文往返
+    let text = "你好，TCP"
+    let rs = cli.sendText(text)
+    println(boolToString(rs[0]))
+    let rg = srv.recvTextWithin(2000)
+    println(boolToString(rg[0]))
+    println(toString(rg[1]))
+
+    // 二进制必须原样
+    let bin = [0, 1, 127, 128, 254, 255, 0, 65]
+    cli.sendAll(bin, 2000)
+    let rbin = srv.recvWithin(2000)
+    println(boolToString(rbin[0]))
+    println(bbHex(rbin[1], 16))
+    println(boolToString(bbEq(bin, rbin[1])))
+
+    // 大包（跨内核缓冲，验证 sendAll 循环）
+    var big = ""
+    var i = 0
+    while i < 2000 {
+        big = big + "ABCDEFGHIJ"
+        i = i + 1
+    }
+    let rb = cli.sendAll(bbFromUtf8(big), 5000)
+    println(boolToString(rb[0]))
+    println(toString(rb[1]))
+    let rbig = srv.drain(2000)
+    println(boolToString(rbig[0]))
+    println(toString(len(rbig[1])))
+
+    // 对端关闭检测
+    println(boolToString(srv.alive()))
+    cli.close()
+    sleep(100)
+    println(boolToString(srv.alive()))
+    // 已确认关闭后发送必须失败
+    let rf = srv.sendText("x")
+    println(boolToString(rf[0]))
+
+    srv.close()
+    l.close()
+}
+
+// ── Lifecycle ────────────────────────────────
+
+fn testLifecycle() {
+    println("---- lifecycle ----")
+    let lc = new Lifecycle()
+    lc.add("db", 10)
+    lc.add("cache", 20)
+    let dup = lc.add("db", 15)
+    lc.add("http", 40)
+    println(dup.lastError)
+    println(toString(lc.count()))
+
+    // 启动顺序
+    let asc = lc.startOrder()
+    var order1 = []
+    var i = 0
+    while i < len(asc) {
+        let idx: Int = asc[i]
+        let c: Component = lc.components[idx]
+        arrPush(order1, c.name)
+        i = i + 1
+    }
+    println(toString(order1))
+
+    // 关停顺序（逆序）
+    let desc = lc.stopOrder()
+    var order2 = []
+    var j = 0
+    while j < len(desc) {
+        let idx: Int = desc[j]
+        let c: Component = lc.components[idx]
+        arrPush(order2, c.name)
+        j = j + 1
+    }
+    println(toString(order2))
+
+    // 状态迁移
+    println(lcStateName(lc.state))
+    let st = lc.beginStart()
+    println(boolToString(st[0]))
+    let st2 = lc.beginStart()
+    println(boolToString(st2[0]))
+    println(st2[1])
+    lc.markRunning()
+    println(lcStateName(lc.state))
+    println(boolToString(lc.isRunning()))
+
+    // 健康报告（组件都没起来）
+    let hr = lc.healthReport()
+    println(boolToString(hr[0]))
+    println(toString(hr[1]))
+}
+
+// ── Health ───────────────────────────────────
+
+fn testHealth() {
+    println("---- health ----")
+    let lv = HealthChecker.live()
+    println(boolToString(lv.ok))
+    println(lv.name)
+
+    let hc = new HealthChecker()
+    hc.add("db", "数据库", true)
+    hc.add("disk", "磁盘", false)
+
+    // required 通过 + 非 required 失败 → 仍然 ready
+    let rd = hc.readiness([
+        new CheckResult("db", true, ""),
+        new CheckResult("disk", false, "90%")
+    ])
+    println(boolToString(rd[0]))
+    println(toString(rd[1]))
+
+    // required 失败 → not ready
+    let rd2 = hc.readiness([
+        new CheckResult("db", false, "refused"),
+        new CheckResult("disk", true, "")
+    ])
+    println(boolToString(rd2[0]))
+    println(toString(rd2[1]))
+
+    // 未注册的检查默认算 required
+    let rd3 = hc.readiness([new CheckResult("unknown", false, "x")])
+    println(boolToString(rd3[0]))
+
+    // JSON 输出
+    println(hc.toJson("ok", [new CheckResult("db", true, "")]))
+}
+
+// ── Config ───────────────────────────────────
+
+fn testConfig() {
+    println("---- config ----")
+    let cfg = new Config()
+    cfg.loadText("# 注释\n"
+        + "! 老式注释\n"
+        + "db.host = 127.0.0.1\n"
+        + "db.port = 3306\n"
+        + "db.name: appdb\n"
+        + "log.level =\n"
+        + "feature.on = yes\n"
+        + "list = a, b , ,c\n"
+        + "bad.port = 80O0\n"
+        + "no separator\n")
+
+    println(toString(len(cfg.keys)))
+    println(cfg.getOr("db.host", "<none>"))
+    println(toString(cfg.getInt("db.port", 0)))
+    // 非法整数回退 + 记错误
+    println(toString(cfg.getInt("bad.port", 8080)))
+    println(boolToString(cfg.getBool("feature.on", false)))
+    // 存在但为空 与 不存在 必须能区分
+    println(boolToString(cfg.has("log.level")))
+    println("[" + cfg.get("log.level", "<none>") + "]")
+    println(boolToString(cfg.has("no.such.key")))
+    println("[" + cfg.get("no.such.key", "<none>") + "]")
+    // 列表
+    println(toString(cfg.getList("list")))
+    // 来源
+    println(cfg.sourceOf("db.host"))
+
+    // 优先级：code > env > file > default
+    cfg.put("db.host", "10.0.0.1", "code")
+    println(cfg.get("db.host", ""))
+    cfg.put("db.host", "192.168.1.1", "file")   // 更低，不覆盖
+    println(cfg.get("db.host", ""))
+    println(cfg.sourceOf("db.host"))
+
+    // 错误汇总
+    println(boolToString(cfg.hasErrors()))
+    println(cfg.errorText())
+
+    // 必需项检查
+    println(toString(cfg.missingRequired(["db.host", "secret.key"])))
+
+    // env 名映射
+    println(cfgEnvName("", "db.host"))
+    println(cfgEnvName("APP", "db.host"))
+}
+
+// ── Container ────────────────────────────────
+
+fn testContainer() {
+    println("---- container ----")
+    let c = new Container()
+    c.register("db", "makeDb")
+    c.register("repo", "makeRepo")
+    c.register("svc", "makeSvc")
+    let dup = c.register("db", "other")
+    println(boolToString(c.hasErrors()))
+    println(toString(c.count()))
+    println(toString(c.creationPlan()))
+
+    // 懒加载
+    println(boolToString(c.needsCreation("db")))
+    println(toString(c.instanceOf("db")))
+    let at = c.attach("db", 0)
+    println(boolToString(at[0]))
+    println(boolToString(c.needsCreation("db")))
+    println(toString(c.instanceOf("db")))
+    println(toString(c.creationPlan()))
+
+    // 挂载未注册的 Bean
+    let bad = c.attach("nope", 1)
+    println(boolToString(bad[0]))
+    println(bad[1])
+
+    // 顺序检查
+    let p1 = c.checkOrder([["repo", "db"], ["svc", "repo"]])
+    println(toString(p1))
+    let p2 = c.checkOrder([["db", "svc"]])
+    println(toString(p2))
+    let p3 = c.checkOrder([["ghost", "db"]])
+    println(toString(p3))
+}
+
+// ── Application ──────────────────────────────
+
+fn testApplication() {
+    println("---- application ----")
+    let app = Application.builder().bindTo("127.0.0.1", 0)
+    let r = app.prepare()
+    println(boolToString(r[0]))
+    println(boolToString(app.port() > 0))
+    // 配置里应该有 code 来源的 bind/port
+    println(app.config.sourceOf("server.bind"))
+
+    // 健康端点
+    app.registerHealthEndpoint()
+    println(toString(app.server.router.count()))
+
+    // 缺必需配置 → 失败 + 回滚
+    let app2 = Application.builder().bindTo("127.0.0.1", 0)
+    app2.requireKeys(["must.have.one", "must.have.two"])
+    let r2 = app2.prepare()
+    println(boolToString(r2[0]))
+    println(r2[1])
+    println(boolToString(app2.failed))
+    // 已起的监听必须被关掉
+    println(boolToString(app2.server.isOpen()))
+    println(lcStateName(app2.lifecycle.state))
+
+    // 指定了不存在的配置文件 → 失败
+    let app3 = Application.builder().bindTo("127.0.0.1", 0)
+    app3.withConfigFile("definitely/not/here.properties")
+    let r3 = app3.prepare()
+    println(boolToString(r3[0]))
+    println(r3[1])
+    println(boolToString(app3.server.isOpen()))
+}

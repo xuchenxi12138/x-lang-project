@@ -1,0 +1,308 @@
+// db/oracle/connect.xle — TNS CONNECT / ACCEPT 的负载构造与解析
+//
+// ── 这是整个 db 层里最难的一段 ──────────────────────────
+//
+// 因为 TNS 的 connect 负载是**四层嵌套的 TLV**：
+//
+//   CONNECT 包
+//     └─ 版本 + 版本兼容 + 服务选项 + SDU + TDU + ...
+//          └─ CONNECT_DATA（描述符）
+//               └─ TLV 列表
+//                    ├─ (DESCRIPTION= ...)
+//                    │    └─ (ADDRESS= (PROTOCOL=TCP)(HOST=x)(PORT=1521))
+//                    │    └─ (CONNECT_DATA= (SERVICE_NAME=y))
+//                    └─ ...
+//
+// 而且每一层用的是**不同的编码规则**：
+//
+//   · 包级的固定字段：定长，大端
+//   · CONNECT_DATA：TLV，但长度字段是 varint
+//   · 描述符文本：形如 `(DESCRIPTION=(ADDRESS=...))` 的字符串，
+//     但**不是**纯文本 —— 每个 `(` 前面有一个长度字节，指示这个
+//     括号组的字节数
+//
+// ── 为什么「括号字符串编码」这么怪 ────────────────────
+//
+// Oracle 想同时支持「人能读的描述符」和「机器高效解析」。做法是：
+// 描述符本身是 ASCII 文本（所以日志里看得见 `(DESCRIPTION=...)`），
+// 但每个括号组前面插一个长度字节，让解析器能 O(1) 跳到下一个组，
+// 不必逐字符扫描配对的括号。
+//
+// 例：`(ADDRESS=(PROTOCOL=TCP))` 编码成
+//
+//   1B 长度  '(' 'A' 'D' 'D' 'R' 'E' 'S' 'S' '=' 
+//   1B 长度  '(' 'P' 'R' 'O' 'T' 'O' 'C' 'O' 'L' '=' 'T' 'C' 'P' ')'
+//   ')' 
+//
+// 长度值是该子组从 '(' 到配对的 ')' 的全部字节数。
+//
+// ── 本实现的范围 ────────────────────────────────────
+//
+// 只支持「无认证」和「用户名/密码」两种 connect string，且只走
+// TCP 协议（不支持 TCPS 加密、不支持 IPC、不支持 SDU 扩展协商）。
+//
+// 这是诚实的范围声明：完整的 TNS connect 协商支持 40 多个可选项，
+// 包括 O3LOGON、O5LOGON、SDU 扩展、NA 加密套件、服务端重定向。
+// P0 实现最小可用集合，其余明确报错。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "tns.xle" import tnsConnectFlags, tnsTypeName, tnsBuild, tnsRead, tnsParseRefuse, tnsRefuseReason, TnsPacket, TNS_HDR, TNS_PKT_CONNECT, TNS_PKT_ACCEPT, TNS_PKT_ACK, TNS_PKT_REFUSE, TNS_PKT_REDIRECT, TNS_PKT_DATA, TNS_PKT_MARKER, TNS_PKT_ATTEST, TNS_PKT_CONTROL, TNS_PKT_RESEND, TNS_VERSION_11_2, TNS_VERSION_12_1
+
+// ── CONNECT 负载的字节布局 ──────────────────────────
+//
+//   偏移  长度  含义
+//   0     2     TNS 版本
+//   2     2     版本兼容（服务端会降到两者较低的那个）
+//   4     2     服务选项（0x0100 = 「我要 SDU 协商」）
+//   6     2     SDU 大小
+//   8     2     TDU 大小
+//   10    2     最大 NT protocol 特征位
+//   12    2     最大 TNS 数据单元
+//   14    2     connect data 长度
+//   16    2     connect data 偏移（相对负载起点，固定 58）
+//   18    40    保留 + 一堆协商标志（见下）
+//   58    N     connect data（描述符编码后的字节）
+//
+// ── 18..58 这 40 字节为什么必须写 ────────────────────
+//
+// 这是「连接标志区」，每一位都有含义（要不要 O3LOGON、要不要 NA
+// 加密、要不要 SDU 扩展、客户端类型是 JDBC 还是 OCI ...）。服务端
+// 会读它，全 0 表示「最保守的客户端」。
+//
+// 全 0 通常能连上（服务端降级到最基础的行为），但有个例外：某些
+// 版本的监听器看到「客户端类型 = 0」会直接 REFUSE（原因码 7
+// 「不支持该客户端类型」）。所以这里显式设成 0x0100（「通用客户端」）。
+//
+// ── 长度和偏移的位置（这里错过一次） ────────────────
+//
+// 第一次把长度/偏移当成「紧跟在最后两个 u16 之后」（偏移 14/16），
+// 但实际的 12..14 是「最大 TNS 数据单元」、16..18 才是长度 ——
+// 也就是说偏移区之前有 **7 个 u16 共 14 字节**，长度在 14、偏移在 16。
+//
+// 实测症状：connectDataLen 读出来是 58（那是 offset 的值），
+// offset 读出来是 0（那是保留区的第一个字节）。CONNECT 发出去的
+// 头就错了，服务端立即 REFUSE。
+const TNS_CONNECT_DATA_OFFSET = 58
+
+// connect 包的 SDU / TDU 默认值。
+//
+// SDU（Session Data Unit）= 单个 TNS 包的最大负载，协商后通常是
+// 8192。设小了会多分包，设大了老服务端不接受。
+//
+// TDU（Transmission Data Unit）是老协议里的对应概念，现代 Oracle
+// 忽略它，但字段必须存在。
+const TNS_SDU = 8192
+const TNS_TDU = 32767
+
+// 组装一个 CONNECT 包负载。
+//
+// `serviceName` 是数据库服务名（`SELECT value FROM v$parameter
+// WHERE name='service_names'` 那个），不是 SID。
+fn tnsBuildConnect(serviceName: String) -> Array {
+    // ① 描述符文本，编码成「带长度前缀的括号树」
+    let desc = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=host)(PORT=0))(CONNECT_DATA=(SERVICE_NAME=" +
+               serviceName + ")))"
+    let encoded = tnsEncodeDescriptor(desc)
+    if (len(encoded) == 0) {
+        // 编码失败（超长或括号不配对）—— 返回空，上层报错。
+        return []
+    }
+
+    // ② 固定头（7 个 u16 = 14 字节）
+    var b = []
+    b = bbPutU16BE(b, TNS_VERSION_11_2)   // 0: 版本
+    b = bbPutU16BE(b, TNS_VERSION_11_2)   // 2: 版本兼容
+    b = bbPutU16BE(b, 0x0100)             // 4: 服务选项
+    b = bbPutU16BE(b, TNS_SDU)            // 6: SDU
+    b = bbPutU16BE(b, TNS_TDU)            // 8: TDU
+    b = bbPutU16BE(b, 0x7F08)             // 10: 最大 NT protocol 特征
+    b = bbPutU16BE(b, 0x0000)             // 12: 最大 TNS 数据单元
+    // 14: connect data 长度
+    b = bbPutU16BE(b, len(encoded))
+    // 16: connect data 偏移
+    b = bbPutU16BE(b, TNS_CONNECT_DATA_OFFSET)
+
+    // ③ 18..58 的标志区
+    //
+    // 第一个字节是客户端类型。0x01 = 「通用/未知客户端」，
+    // 某些监听器对 0 会 REFUSE（原因码 7）。
+    b = bbPut(b, 0x01)
+    // 其余保留位全 0（= 不用 O3LOGON、不用 NA 加密、不要求 SDU 扩展）。
+    while (len(b) < TNS_CONNECT_DATA_OFFSET) {
+        b = bbPut(b, 0)
+    }
+
+    // ④ connect data
+    var i = 0
+    while (i < len(encoded)) {
+        b = bbPut(b, bbAt(encoded, i))
+        i = i + 1
+    }
+    return b
+}
+
+// 把 `(A=(B=x)(C=y))` 这种描述符文本编码成 TNS 的「带长度前缀」格式。
+//
+// ── 编码规则（这里错过一次） ─────────────────────────
+//
+// 长度字节之后跟的是**完整的组，含开头的 `(`**。
+//
+//   原文：  (A=1)
+//   编码：  05 28 41 3D 31 29
+//           ↑  ↑  └──┬──┘  ↑
+//           │  '('    │    ')'
+//           长度=5 └─ 组内容 ─┘
+//
+// 第一次实现时把开头的 '(' 丢了（只写了 body + ')'），编码成
+// `05 41 3D 31 29` —— 长度 5 但实际只有 4 字节内容，而且第一个
+// 字节是 'A' 不是 '('。服务端据此解析会把 'A' 当成「这个组的
+// 长度字节」，得到 0x41 = 65 字节，于是整个描述符对不上。
+//
+// 症状是 CONNECT 之后直接 REFUSE，原因码还可能是「协议版本不兼容」，
+// 完全指错方向。
+fn tnsEncodeDescriptor(desc: String) -> Array {
+    let pos = array(1, 0)
+    pos[0] = 0
+    return tnsEncodeGroup(desc, pos)
+}
+
+// 从 desc[pos] 的 '(' 开始编码一个组，返回字节数组。
+// pos 是单元素数组（模拟引用传递）。
+fn tnsEncodeGroup(desc: String, pos: Array) -> Array {
+    let out = []
+    let i = toInt(pos[0])
+    if (i >= len(desc) || strAt(desc, i) != "(") {
+        return out
+    }
+
+    // 找配对的 ')'
+    let close = tnsMatchParen(desc, i)
+    if (close < 0) { return out }
+
+    // 编码后总长 = 长度字节(1) + 原文从 '(' 到 ')' 的字节数。
+    //
+    // 但原文里的嵌套组会被替换成「长度+内容」，所以总长要递归算。
+    // 做法：先递归生成 body（不含长度字节），再补长度。
+    var body = []
+    // ── 从 '(' 开始，直到 close 之前 ────────────────
+    body = bbPut(body, strCode("("))
+    var k = i + 1
+    while (k < close) {
+        let c = strAt(desc, k)
+        if (c == "(") {
+            let sub = array(1, k)
+            let subBytes = tnsEncodeGroup(desc, sub)
+            var m = 0
+            while (m < len(subBytes)) {
+                body = bbPut(body, bbAt(subBytes, m))
+                m = m + 1
+            }
+            k = toInt(sub[0])
+        } else {
+            body = bbPut(body, strCode(c))
+            k = k + 1
+        }
+    }
+    body = bbPut(body, strCode(")"))
+
+    // 组总字节 = 1(长度字节) + len(body)
+    let groupLen = len(body) + 1
+    if (groupLen > 255) {
+        // 超长组要用 0 + 2 字节长度表达，P0 不支持。
+        // 返回空数组让上层报错，而不是写一个错的长度。
+        return []
+    }
+    out = bbPut(out, groupLen)
+    var j = 0
+    while (j < len(body)) {
+        out = bbPut(out, bbAt(body, j))
+        j = j + 1
+    }
+
+    pos[0] = close + 1
+    return out
+}
+
+// 找配对括号。跳过整段。
+fn tnsMatchParen(s: String, p: Int) -> Int {
+    var i = p
+    var depth = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == "(") { depth = depth + 1 }
+        else if (c == ")") {
+            depth = depth - 1
+            if (depth == 0) { return i }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ── ACCEPT 包的解析 ────────────────────────────────
+//
+// 服务端接受连接后发 ACCEPT，负载里的关键字段：
+//
+//   [0..2]   版本
+//   [2..4]   服务选项
+//   [4..6]   SDU（协商结果 —— 之后发包要按这个大小分片！）
+//   [6..8]   TDU
+//   ...
+//   后面是协商结果的数据（可选项列表）
+//
+// ── 为什么 SDU 必须读出来 ─────────────────────────
+//
+// 因为客户端之后发包不能超过这个值。假设我们按 8192 发而服务端
+// 协商成 2048，那每个超过 2048 的包都会被拒绝 —— 而小包（短 SQL）
+// 完全正常。这个 bug 的症状是「简单查询能跑，稍长的 SQL 就断连」。
+class TnsAccept {
+    version: Int,
+    serviceOptions: Int,
+    sdu: Int,
+    tdu: Int,
+    ok: Bool,
+    error: String,
+
+    constructor() {
+        self.version        = 0
+        self.serviceOptions = 0
+        self.sdu            = 0
+        self.tdu            = 0
+        self.ok             = false
+        self.error          = ""
+    }
+
+    fn describe() -> String {
+        return "ACCEPT version=0x" + toHexStr(self.version) +
+               " sdu=" + toString(self.sdu) + " tdu=" + toString(self.tdu)
+    }
+}
+
+fn tnsParseAccept(payload: Array) -> TnsAccept {
+    let a = new TnsAccept()
+    if (len(payload) < 8) {
+        a.error = "ACCEPT 负载不足 8 字节（" + toString(len(payload)) + "B）"
+        return a
+    }
+    a.version        = bbU16BE(payload, 0)
+    a.serviceOptions = bbU16BE(payload, 2)
+    a.sdu            = bbU16BE(payload, 4)
+    a.tdu            = bbU16BE(payload, 6)
+    // SDU 为 0 说明服务端不接受协商，用默认值。
+    if (a.sdu == 0) { a.sdu = TNS_SDU }
+    a.ok = true
+    return a
+}
+
+fn toHexStr(v: Int) -> String {
+    let digits = "0123456789ABCDEF"
+    if (v == 0) { return "0" }
+    var out = ""
+    var n = v
+    while (n > 0) {
+        let d = n % 16
+        out = strAt(digits, d) + out
+        n = n / 16
+    }
+    return out
+}

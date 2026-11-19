@@ -1,0 +1,256 @@
+// ui/layout/splitter.xle — 可拖拽分隔的两栏 / 多栏
+//
+// ── 分栏和 Stack 的区别 ─────────────────────────
+//
+// Stack 是「我告诉你每一项多大」，Splitter 是「两块区域分享一个
+// 总长度，用户能拖着改比例」。前者是布局，后者是**交互 + 布局**。
+//
+// ── 为什么比例用整数千分比 ──────────────────────
+//
+// 用 Float 0.0~1.0 更自然，但拖拽时的边界处理会出现「0.9999 而
+// 不是 1.0」这类问题，导致分隔条永远拖不到头。整数千分比（0~1000）
+// 天然可比较、可夹紧，而 1/1000 的精度对 1920 宽的窗口是 1.9px，
+// 完全够用。
+//
+// ── 支持几栏 ──────────────────────────────────
+//
+// 只支持**两栏**。三栏以上需要「多个分隔条 + 多个比例」，而比例
+// 之间必须满足和为 1000 —— 拖中间那条时两边怎么分？这是一个没有
+// 唯一正确答案的设计问题（VS Code 的做法是「只改相邻两栏，溢出
+// 的部分挤下一个」），而它带来的复杂度远超收益。
+//
+// 需要三栏时嵌套两个 Splitter。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 分隔条宽度。6px 是「能抓住」和「不浪费空间」的折中。
+const SP_BAR_W = 6
+
+// 比例精度。拖拽时按这个值吸附？不 —— 不吸附，因为吸附会让
+// 「微调」变得不可能。这里只用来做百分比换算。
+const SP_SCALE = 1000
+
+// 单侧最小尺寸。防止把某一栏拖成 0 宽（拖没了就再也抓不到
+// 分隔条，这是不可恢复的）。
+const SP_MIN = 80
+
+class Splitter extends Widget {
+    // 第一栏占总长度的千分比（0~1000）。
+    ratio: Int,
+
+    // 是否纵向分割（上下两栏）。默认横向（左右两栏）。
+    vertical: Bool,
+
+    // 是否正在拖动分隔条。
+    dragging: Bool,
+
+    // 按下时鼠标相对分隔条左边缘的偏移。
+    //
+    // ── 为什么需要它 ─────────────────────────
+    //
+    // 如果直接用「鼠标 x = 分隔条位置」，那么按下的瞬间分隔条会
+    // 跳到鼠标下 —— 因为用户很少正好点在分隔条正中间。记住这个
+    // 偏移量，拖动时就能保持「抓哪儿拖哪儿」的手感。
+    grabOfs: Int,
+
+    constructor(r: Rect, ratio: Int) {
+        self.r        = r
+        self.vis      = true
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.ratio    = ratio
+        self.vertical = false
+        self.dragging = false
+        self.grabOfs  = 0
+        self.style    = Style.plain()
+    }
+
+    // 横向分割（左右两栏）—— 默认。
+    static fn of(r: Rect, ratio: Int) -> Splitter {
+        return new Splitter(r, ratio)
+    }
+
+    // 纵向分割（上下两栏）。
+    static fn rows(r: Rect, ratio: Int) -> Splitter {
+        let s = new Splitter(r, ratio)
+        s.vertical = true
+        return s
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    // 总长度（按方向取 w 或 h）。
+    fn total() -> Int {
+        if (self.vertical) { return self.r.h }
+        return self.r.w
+    }
+
+    // 第一栏的可用长度。要把分隔条宽度扣掉再按比例分 —— 否则
+    // 两栏 + 分隔条会超出容器，右边那栏被切掉一截。
+    fn firstLen() -> Int {
+        let avail = self.total() - SP_BAR_W
+        if (avail <= 0) { return 0 }
+        var n = avail * self.ratio / SP_SCALE
+        if (n < SP_MIN) { n = SP_MIN }
+        if (n > avail - SP_MIN) { n = avail - SP_MIN }
+        if (n < 0) { n = 0 }
+        return n
+    }
+
+    fn first() -> Rect {
+        let n = self.firstLen()
+        if (self.vertical) {
+            return rectOf(self.r.x, self.r.y, self.r.w, n)
+        }
+        return rectOf(self.r.x, self.r.y, n, self.r.h)
+    }
+
+    fn bar() -> Rect {
+        let n = self.firstLen()
+        if (self.vertical) {
+            return rectOf(self.r.x, self.r.y + n, self.r.w, SP_BAR_W)
+        }
+        return rectOf(self.r.x + n, self.r.y, SP_BAR_W, self.r.h)
+    }
+
+    fn second() -> Rect {
+        let n = self.firstLen()
+        if (self.vertical) {
+            return rectOf(self.r.x, self.r.y + n + SP_BAR_W,
+                          self.r.w, self.total() - n - SP_BAR_W)
+        }
+        return rectOf(self.r.x + n + SP_BAR_W, self.r.y,
+                      self.total() - n - SP_BAR_W, self.r.h)
+    }
+
+    // ── 拖动 ────────────────────────────────────
+
+    // 是否点在分隔条上（可以考虑放宽几像素，见 hitArea）。
+    fn barHit(mx: Int, my: Int) -> Bool {
+        let b = self.bar()
+        // 横向分割时分隔条很窄，垂直判定没意义；反之亦然。
+        // 所以只判窄的那一维向外扩 3px，另一维要求落在容器内。
+        if (self.vertical) {
+            return my >= b.y - 3 && my < b.y + b.h + 3 &&
+                   mx >= self.r.x && mx < self.r.x + self.r.w
+        }
+        return mx >= b.x - 3 && mx < b.x + b.w + 3 &&
+               my >= self.r.y && my < self.r.y + self.r.h
+    }
+
+    // 按下。返回 true 表示抓住了分隔条。
+    fn beginDrag(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+        if (!self.barHit(mx, my)) { return false }
+        self.dragging = true
+        let b = self.bar()
+        if (self.vertical) {
+            self.grabOfs = my - b.y
+        } else {
+            self.grabOfs = mx - b.x
+        }
+        return true
+    }
+
+    // 拖动中调用。pressed 是「鼠标键是否还按着」。
+    //
+    // ── 为什么用 pressed 而不是收到 move 事件 ─────────
+    //
+    // 即时模式没有 move 事件，每帧只读得到「现在按着没」。所以
+    // 拖动的实现必然是「每帧检查 pressed，按着就更新比例」。
+    fn update(mx: Int, my: Int, pressed: Bool) -> Bool {
+        if (!self.dragging) { return false }
+        if (!pressed) {
+            self.dragging = false
+            return false
+        }
+
+        let avail = self.total() - SP_BAR_W
+        if (avail <= 0) { return false }
+
+        // 鼠标位置减掉抓取偏移，得到分隔条左边缘应有的位置。
+        // 再减掉容器原点换成「相对容器」的坐标 —— 比例是按容器
+        // 内部长度算的，用绝对坐标会随窗口位置漂移。
+        var pos = 0
+        if (self.vertical) {
+            pos = my - self.grabOfs - self.r.y
+        } else {
+            pos = mx - self.grabOfs - self.r.x
+        }
+
+        // 换成千分比。夹紧到 [SP_MIN, avail - SP_MIN] 对应的比例。
+        var r = pos * SP_SCALE / avail
+        let loR = SP_MIN * SP_SCALE / avail
+        let hiR = SP_SCALE - loR
+        if (r < loR) { r = loR }
+        if (r > hiR) { r = hiR }
+        if (r < 0) { r = 0 }
+        if (r > SP_SCALE) { r = SP_SCALE }
+
+        if (r == self.ratio) { return false }
+        self.ratio = r
+        return true
+    }
+
+    fn setRatio(r: Int) -> Splitter {
+        self.ratio = r
+        return self
+    }
+
+    // 恢复 50/50。
+    fn reset() -> Splitter {
+        self.ratio = SP_SCALE / 2
+        return self
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        let b = self.bar()
+
+        // 常态：一条比背景略深的细线；悬停/拖动：主色。
+        //
+        // ── 为什么常态不画满整个 bar 宽 ─────────────
+        //
+        // 6px 宽的实心条在中性色下看起来像一条突兀的色块。所以
+        // 常态只画中间 1px，真正「变粗」只在悬停或拖动时发生 ——
+        // 这也给了明确的交互反馈。
+        let mx = winMouseX()
+        let my = winMouseY()
+        let hot = self.dragging || self.barHit(mx, my)
+
+        if (hot) {
+            if (self.vertical) {
+                winFillRect(b.x, b.y, b.w, b.h, th.accent)
+            } else {
+                winFillRect(b.x, b.y, b.w, b.h, th.accent)
+            }
+        } else {
+            if (self.vertical) {
+                winFillRect(b.x + b.w / 2, b.y, 1, b.h, th.border)
+            } else {
+                winFillRect(b.x, b.y + b.h / 2, b.w, 1, th.border)
+            }
+        }
+
+        // 拖动时在分隔条上画三个小点，强化「这是一条能拖的东西」。
+        // 三个点比一条线更适合这个宽度。
+        if (hot) {
+            var i = -1
+            while i <= 1 {
+                if (self.vertical) {
+                    winFillRect(b.x + b.w / 2 - 6, b.y + b.h / 2 + i * 5, 12, 1, th.onAccent)
+                } else {
+                    winFillRect(b.x + b.w / 2 + i * 5, b.y + b.h / 2 - 6, 1, 12, th.onAccent)
+                }
+                i = i + 1
+            }
+        }
+    }
+}

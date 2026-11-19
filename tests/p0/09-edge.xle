@@ -1,0 +1,59 @@
+// 09-edge.x — 边界与陷阱
+//
+// 验证点：
+//   1. 整数除法的截断方向（向零，不是向下取整）
+//   2. 负数取模的符号
+//   3. 浮点除零得 Infinity（不报错）
+//   4. 位移超过 63 位的结果（01 §4.3 定义而非 UB）
+//   5. Int 的极值
+//   6. 空块的返回值
+//   7. 单行 if 与省略分号
+
+println("=== 整数除法截断方向 ===")
+// 01 §4.3：Int 除法向零截断（与 C99 一致，与 Python 的向下取整不同）
+println(7 / 2)          // 3
+println(-7 / 2)         // -3（不是 -4！）
+println(7 / -2)         // -3
+println(-7 / -2)        // 3
+
+println("=== 取模符号 ===")
+// 取模结果的符号跟随被除数
+println(7 % 3)          // 1
+println(-7 % 3)         // -1
+println(7 % -3)         // 1
+println(-7 % -3)        // -1
+
+println("=== 浮点除零 ===")
+let one = 1.0
+let zero = 0.0
+println(one / zero)     // Infinity
+println(-one / zero)    // -Infinity
+println(zero / zero)    // NaN
+
+println("=== 位移边界 ===")
+println(1 << 62)        // 4611686018427387904
+println(1 << 10)        // 1024
+println(0 << 63)        // 0
+println(-1 >> 63)       // -1（算术右移保留符号）
+println(-8 >> 2)        // -2
+// 注意：`1 << 63` 会把有效位推出 64 位，按 01 §4.3 定义为 0；
+// 但这一条与「溢出 trap」的关系需要在 P1 澄清（见文档 §5.4 的待补项）。
+
+println("=== Int 极值 ===")
+let maxv = 9223372036854775807
+let minv = -9223372036854775807 - 1
+println(maxv)
+println(minv)
+// 注意：`maxv + 1` 会触发整数溢出 trap（01 §5.4 的裁决），
+// 所以这里不能写。溢出测试单独在 10-overflow.x 里做，
+// 因为那个文件预期以退出码 70 结束。
+
+println("=== 空块 ===")
+let empty_block = {
+}
+println(empty_block)    // null
+
+println("=== 省略分号 ===")
+let a = 1
+let b = 2
+println(a + b)

@@ -1,0 +1,263 @@
+// ui/display/menu.xle — 下拉菜单 / 右键菜单
+//
+// 纵向的一组项，可以有分隔线和禁用项。下拉菜单和右键菜单的差别
+// 只在弹出位置，所以是同一个类。
+//
+// ── 为什么要调用方显式 draw ────────────────────
+//
+// 因为它必须画在所有其它控件之上。见 menubar.xle 的说明。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+from "menuitem.xle" import menuIsSep, menuIsDisabled, menuLabel, menuShortcut
+
+// 菜单项行高。
+const MENU_ROW_H = 30
+
+// 下拉菜单的宽度（含快捷键列）。
+const MENU_POPUP_W = 200
+
+class Menu extends Widget {
+    items: Array,
+    hoverIndex: Int,
+    open: Bool,
+
+    // 弹出位置（左上角）。由调用方设定。
+    anchorX: Int,
+    anchorY: Int,
+
+    constructor(items: Array) {
+        self.r          = rectOf(0, 0, 0, 0)
+        self.vis        = true
+        self.enabled    = true
+        self.focused    = false
+        self.hovered    = false
+        self.items      = items
+        self.hoverIndex = 0 - 1
+        self.open       = false
+        self.anchorX    = 0
+        self.anchorY    = 0
+        self.style      = Style.plain()
+    }
+
+    static fn of(items: Array) -> Menu {
+        let m = new Menu(items)
+        return m
+    }
+
+    fn openAt(x: Int, y: Int) -> Menu {
+        self.anchorX = x
+        self.anchorY = y
+        self.open = true
+        self.hoverIndex = 0 - 1
+        return self
+    }
+
+    fn close() -> Menu {
+        self.open = false
+        self.hoverIndex = 0 - 1
+        return self
+    }
+
+    // 菜单总高度。分隔线只占一半高度。
+    fn totalH() -> Int {
+        var h = 0
+        var i = 0
+        while i < len(self.items) {
+            if (menuIsSep(toString(self.items[i]))) {
+                h = h + 9
+            } else {
+                h = h + MENU_ROW_H
+            }
+            i = i + 1
+        }
+        return h + 8        // 上下各 4px 内边距
+    }
+
+    // 弹出框宽度。
+    //
+    // ── 为什么不是常量 ──────────────────────────
+    //
+    // 写死 200px 时，「标签 + 快捷键」这一行在中文标签（如「转换为
+    // 大写」）配长快捷键（Ctrl+Shift+U）下会直接撞在一起：左侧标签
+    // 从 12px 起排，右侧快捷键从 w-12-文字宽 起反向排，两者宽度之和
+    // 超过 w-24 就重叠。按最长一项量出来才是唯一稳的做法。
+    fn popupW() -> Int {
+        var w = 160
+        var i = 0
+        while i < len(self.items) {
+            let s = toString(self.items[i])
+            if (!menuIsSep(s)) {
+                var need = winTextWidth(menuLabel(s)) + 24
+                let sw = winTextWidth(menuShortcut(s))
+                if (sw > 0) { need = need + sw + 24 }
+                if (need > w) { w = need }
+            }
+            i = i + 1
+        }
+        return w
+    }
+
+    // 弹出框矩形。
+    fn popupRect() -> Rect {
+        return rectOf(self.anchorX, self.anchorY, self.popupW(), self.totalH())
+    }
+
+    // 第 i 项在屏幕上的矩形。
+    fn itemRect(i: Int) -> Rect {
+        let pr = self.popupRect()
+        var y = pr.y + 4
+        var k = 0
+        while k < i {
+            if (menuIsSep(toString(self.items[k]))) {
+                y = y + 9
+            } else {
+                y = y + MENU_ROW_H
+            }
+            k = k + 1
+        }
+        var h = MENU_ROW_H
+        if (i >= 0 && i < len(self.items)) {
+            if (menuIsSep(toString(self.items[i]))) { h = 9 }
+        }
+        return rectOf(pr.x, y, pr.w, h)
+    }
+
+    fn indexAt(mx: Int, my: Int) -> Int {
+        if (!self.open) { return 0 - 1 }
+        let pr = self.popupRect()
+        if (!pr.contains(mx, my)) { return 0 - 1 }
+        var i = 0
+        while i < len(self.items) {
+            let ir: Rect = self.itemRect(i)
+            if (ir.contains(mx, my)) {
+                if (menuIsSep(toString(self.items[i]))) { return 0 - 1 }
+                return i
+            }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // 点击。返回被点中的项下标，-1 表示没选中任何项（含点到外面）。
+    //
+    // ── 点到外面要关闭 ──────────────────────────
+    //
+    // 这是菜单的基本行为：点别处等于「我不要了」。如果不关，
+    // 菜单会一直浮在界面上，而用户已经没有「关掉它」的直觉。
+    fn click(mx: Int, my: Int) -> Int {
+        if (!self.open) { return 0 - 1 }
+
+        let i = self.indexAt(mx, my)
+        if (i >= 0) {
+            let s = toString(self.items[i])
+            if (menuIsDisabled(s)) {
+                // 禁用项：点了没反应，也不关闭 —— 关闭会让用户
+                // 以为「点了但没生效」，而不关闭至少保留了上下文。
+                return 0 - 1
+            }
+            self.open = false
+            return i
+        }
+
+        let pr = self.popupRect()
+        if (!pr.contains(mx, my)) {
+            self.close()
+        }
+        return 0 - 1
+    }
+
+    fn keyDown(key: String) -> Bool {
+        if (!self.open) { return false }
+        if (key == "Escape") {
+            self.close()
+            return true
+        }
+        if (key == "ArrowDown") {
+            var i = self.hoverIndex + 1
+            while i < len(self.items) {
+                if (!menuIsSep(toString(self.items[i]))) {
+                    self.hoverIndex = i
+                    return true
+                }
+                i = i + 1
+            }
+            return true
+        }
+        if (key == "ArrowUp") {
+            var i = self.hoverIndex - 1
+            while i >= 0 {
+                if (!menuIsSep(toString(self.items[i]))) {
+                    self.hoverIndex = i
+                    return true
+                }
+                i = i - 1
+            }
+            return true
+        }
+        return false
+    }
+
+    fn draw(th: Theme) {
+        if (!self.open) { return }
+        let pr = self.popupRect()
+
+        // 阴影。
+        winFillRound(pr.x + 2, pr.y + 3, pr.w, pr.h, 6, th.scrim)
+
+        // 底 + 边框。
+        winFillRound(pr.x, pr.y, pr.w, pr.h, 6, th.surface)
+        winBorderRound(pr.x, pr.y, pr.w, pr.h, 6, 1, th.border)
+
+        let mxx = winMouseX()
+        let myy = winMouseY()
+
+        var i = 0
+        while i < len(self.items) {
+            let s = toString(self.items[i])
+            let ir: Rect = self.itemRect(i)
+
+            // 分隔线。
+            if (menuIsSep(s)) {
+                let ly = ir.y + ir.h / 2
+                winFillRect(ir.x + 8, ly, ir.w - 16, 1, th.border)
+                i = i + 1
+                continue
+            }
+
+            let disabled = menuIsDisabled(s)
+            let isHover = ir.contains(mxx, myy) && !disabled
+
+            if (isHover) {
+                winFillRect(ir.x + 4, ir.y, ir.w - 8, ir.h, th.surfaceHover)
+            }
+
+            var c = th.text
+            if (disabled) { c = th.disabled }
+            else if (i == self.hoverIndex) { c = th.accent }
+
+            // 标签（左）。
+            let label = menuLabel(s)
+            uiTextLeft(ir, label, 12, c)
+
+            // 快捷键（右）。
+            let sc = menuShortcut(s)
+            if (len(sc) > 0) {
+                let scx = ir.x + ir.w - 12 - winTextWidth(sc)
+                winText(scx, ir.y + (ir.h - winTextHeight()) / 2, sc, th.textDim)
+            }
+
+            i = i + 1
+        }
+    }
+
+    fn hit(mx: Int, my: Int) -> Bool {
+        if (!self.open) { return false }
+        return self.popupRect().contains(mx, my)
+    }
+}

@@ -1,0 +1,293 @@
+// demo-class.xle — 类层组件库的验收程序
+//
+// 与 demo.xle 画同一个界面，但用**类**（abstract Widget + 子类继承 +
+// 虚方法派发 + 控件树）而不是结构体。
+//
+// ── 两个 demo 的分工 ────────────────────────────────────────
+//
+//   demo.xle        用结构体描述控件：状态不可变，改状态靠重建。
+//                   适合表单这类「一次读全量、一次写全量」的场景。
+//
+//   demo-class.xle  用类描述控件：状态可变、有身份、可派发。
+//                   适合控件树、命中查询、动态增删这类场景。
+//
+// 两者共用同一套底层 uiXxx 绘制函数和同一个 Theme，所以视觉上应当
+// 一致 —— 这也是本 demo 的验收标准之一。
+//
+// 运行方式（会开窗并截图）：
+//     x run games/settings/demo-class.xle
+
+from std.ui import uiHit, uiHitDown, uiTextCenter, uiTextInRect, uiTextLeft, uiButton, uiButtonEx, uiButtonPrimary, uiButtonDanger, uiButtonFlat, uiConsumeClick, uiCheckMark, uiCheck, uiCheckEx, uiRadioGroup, uiSlider, uiSliderLabeled, uiSliderEx, uiField, uiFieldLabeled, uiSeparator, uiPanel, uiPanelTitled, uiProgress, uiProgressLabeled, uiSeparatorEx, uiVRuleEx, uiPanelEx, uiPanelTitledEx, uiProgressEx, uiProgressLabeledEx, uiList, uiListScroll, uiCursor, uiCursorTake, uiModalBg, uiDialog, uiStatus, uiToolbar, uiFixed, Rect, Theme, Style, Anim, Button, Label, Panel, Progress, Cursor, Check, Slider, Frame, Widget, UiLabel, UiButton, UiPanel, UiProgress, UiCheck, UiSlider, UiTree, UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_NONE, UI_BTN_NORMAL, UI_BTN_PRIMARY, UI_BTN_DANGER
+from std.conv import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+const WIN_W = 560
+const WIN_H = 420
+
+// ---- 纵向节奏 ----
+//
+// 右栏所有控件的 y 都从这一组常量推出来，**没有一个手写的坐标**。
+//
+// 这不是洁癖。手写坐标的失败方式是「滑条 y=108、它的标签 y=92 高 20，
+// 于是标签底边正好压在滑条上边框」—— 这种 0~2px 的重叠在截图里只
+// 表现为字被切掉一点，很容易被当成字体渲染问题查半天。
+//
+// 间距取 8 / 12：8 是「同一组内的紧密关联」，12 是「换一组」。
+// 全局只有两个数字，读代码时能立刻判断「这两个控件算不算一组」。
+const ROW_LBL_TOP = 92      // 右栏第一行标签
+const ROW_LBL_H   = 20
+const GAP_TIGHT   = 8
+const GAP_GROUP   = 20
+
+// ---- 界面状态 ----
+//
+// 这里**没有** UiState 结构体，也没有六个 withXxx 方法。所有可变的
+// 界面状态都挂在控件对象上，因为类的字段本来就是可变的：
+//
+//   结构体版：st = st.withVolume(80)      // 六个字段抄一遍
+//   类版：    vol.set(80)                 // 直接改
+//
+// demo.xle 里的那六个 with 方法不是错误，是值语义的必然代价。字段
+// 变多时（十个以上）抄字段会成为真正的维护负担 —— 那时候类就该登场。
+class Settings {
+    themeName: String,
+    saved: String,
+
+    vol:    UiSlider,
+    music:  UiCheck,
+    sfx:    UiCheck,
+    prog:   UiProgress,
+    status: UiLabel,
+
+    constructor() {
+        self.themeName = "dark"
+        self.saved     = "就绪"
+
+        let volTop  = ROW_LBL_TOP + ROW_LBL_H + GAP_TIGHT          // 120
+        let progTop = volTop + 20 + GAP_TIGHT                      // 148
+        let swTop   = progTop + 10 + GAP_GROUP + ROW_LBL_H + GAP_TIGHT  // 206
+
+        self.vol    = new UiSlider(Rect { x: 200, y: volTop,  w: 300, h: 20 }, 0, 100, 65)
+        self.prog   = new UiProgress(Rect { x: 200, y: progTop, w: 300, h: 10 }, 0.65)
+        self.music  = new UiCheck(Rect { x: 200, y: swTop,        w: 300, h: 20 }, "背景音乐", true)
+        self.sfx    = new UiCheck(Rect { x: 200, y: swTop + 32,   w: 300, h: 20 }, "音效", false)
+        self.status = new UiLabel(Rect { x: 36, y: 372, w: 480, h: 20 }, "就绪")
+    }
+
+    fn theme() -> Theme {
+        if (self.themeName == "light") { return Theme.light() }
+        return Theme.dark()
+    }
+
+    fn setTheme(name: String) {
+        self.themeName = name
+        if (name == "light") {
+            self.saved = "已切换到浅色主题"
+        } else {
+            self.saved = "已切换到深色主题"
+        }
+    }
+}
+
+// ---- 画一帧 ----
+//
+// 与结构体版最大的差别：**没有返回值**。不存在「返回新状态」这件事，
+// 因为状态就在对象里。调用方只需要 `drawAll(st, tree, f)`。
+fn drawAll(st: Settings, tree: UiTree, f: Frame) {
+    let th = st.theme()
+
+    winFillRect(0, 0, WIN_W, WIN_H, th.bg)
+
+    // ── 标题 ──────────────────────────────────────────────────
+    uiTextLeft(36, 28, 300, 32, "设置", 0, th.text)
+    uiSeparatorEx(36, 72, WIN_W - 72, th)
+
+    // ── 左栏：外观 ────────────────────────────────────────────
+    // 标签在 y=92 占 20 高，按钮从 92+20+8=120 起 —— 两个数字都从
+    // 同一个常量推出来，不是一个写 92、一个写 90。
+    //
+    // 早先按钮直接放在 y=90，与标签同高，画出来是「标签被按钮压在
+    // 下面，只露出一个字」。这类重叠不会报错，只能靠看截图发现。
+    const LBL_TOP  = ROW_LBL_TOP
+    const LBL_H    = ROW_LBL_H
+    const BTN_GAP  = GAP_TIGHT
+    const BTN_TOP  = LBL_TOP + LBL_H + BTN_GAP
+
+    uiTextLeft(36, LBL_TOP, 140, LBL_H, "主题", 0, th.textDim)
+
+    // 主题按钮来自控件树 —— 先用多态遍历把它们画出来，
+    // 再用 pick 判断点到了哪一个。这是结构体做不到的一步。
+    //
+    // 画之前同步选中态：当前主题的按钮是 primary（蓝），另一个是
+    // 普通（灰）。否则两个蓝按钮看不出哪个生效了。
+    syncThemeButtons(st, tree)
+    tree.draw(th)
+
+    // 主题预览：把三档颜色摊开给人看。
+    //
+    // 存在的理由不是「好看」，而是**让换主题这件事有可见后果**。
+    // 一整套主题只改按钮高亮的话，用户点完只会想「变了吗」。
+    // 三个色块分别代表 背景 / 面板 / 主色 —— 一眼看出整套色板被换了。
+    let swTop = BTN_TOP + 26 + GAP_GROUP + ROW_LBL_H + GAP_TIGHT
+    uiTextLeft(36, swTop - ROW_LBL_H - GAP_TIGHT, 140, ROW_LBL_H,
+               "色板", 0, th.textDim)
+    winFillRect(36, swTop, 40, 40, th.bg)
+    winBorderRect(36, swTop, 40, 40, 1, th.border)
+    winFillRect(84, swTop, 40, 40, th.surface)
+    winBorderRect(84, swTop, 40, 40, 1, th.border)
+    winFillRect(132, swTop, 40, 40, th.accent)
+
+    // ── 右栏：音频 ────────────────────────────────────────────
+    // 竖分隔线的高度是**算出来**的，不是猜的：从「音量」标题上沿
+    // 一直画到内容区底部分隔线之上，中间留 8px 呼吸。
+    //
+    // 早先写成 WIN_W - 88 - 76（把窗口宽度当高度用），结果是那条线
+    // 一路穿到窗口底部、把状态栏文字切成两半 —— 而且不报错。
+    let ruleTop = ROW_LBL_TOP - 4
+    let ruleBot = 356 - 8
+    uiVRuleEx(182, ruleTop, ruleBot - ruleTop, th)
+
+    uiTextLeft(200, ROW_LBL_TOP, 300, ROW_LBL_H, "音量", 0, th.text)
+
+    // 滑条：拖动 + 点击都收口在 dragBy 里
+    st.vol.dragBy(winMouseX(), f)
+    st.vol.draw(th)
+
+    // 进度条跟着音量走（同一个值，两种表达：可拖的与只读的）。
+    //
+    // 顺序必须是 set 再 draw：先算新比例、再画。反过来会画出上一帧
+    // 的比例，表现为「拖动时读数已经变了、进度条慢半拍」。
+    st.prog.set(st.vol.v)
+    st.prog.draw(th)
+
+    // 开关组的标题在按钮上方，位置由 st.music 的矩形反推 ——
+    // 这样调整开关位置时标题会跟着走，不会脱节。
+    uiTextLeft(200, st.music.r.y - ROW_LBL_H - GAP_TIGHT, 300, ROW_LBL_H,
+               "开关", 0, th.textDim)
+    st.music.draw(th)
+    st.sfx.draw(th)
+
+    // ── 底部状态 ──────────────────────────────────────────────
+    uiSeparatorEx(36, 356, WIN_W - 72, th)
+    var msg = "就绪"
+    if (st.music.on && st.sfx.on)   { msg = "音乐与音效已开启" }
+    if (st.music.on && !st.sfx.on)  { msg = "仅音乐" }
+    if (!st.music.on && st.sfx.on)  { msg = "仅音效" }
+    if (!st.music.on && !st.sfx.on) { msg = "全部关闭" }
+    st.status.setText(msg)
+    st.status.draw(th)
+}
+
+// 处理一帧的输入。与绘制分开写，因为「输入 → 状态」和「状态 → 画面」
+// 是两条方向相反的链，混在一起会让状态变更多出一个隐藏入口。
+fn handleInput(st: Settings, tree: UiTree, f: Frame) {
+    // 主题按钮：用 pick 拿到被点到的控件，再与已知句柄比对。
+    //
+    // 比逐个 `f.hit(rect)` 的好处是「谁在最上面」由树决定，而不是由
+    // 这里的判断顺序决定 —— 判断顺序一旦与绘制顺序不一致，就会出现
+    // 「点到了看不见的控件」。
+    let hitw = tree.pick(f.cx, f.cy)
+    if (hitw == tree.at(0)) { st.setTheme("dark") }
+    if (hitw == tree.at(1)) { st.setTheme("light") }
+
+    // 勾选框：点一次翻一次
+    if (f.hit(st.music.bounds())) { st.music.toggle() }
+    if (f.hit(st.sfx.bounds()))   { st.sfx.toggle() }
+}
+
+// 把两个主题按钮的选中态同步到当前主题。
+//
+// ── 为什么需要这一步 ────────────────────────────────────────
+//
+// 两个按钮都是 primary（蓝底），"当前是哪个主题"在画面上完全看不出 ——
+// 用户点完不知道生效了没有。这类「状态不可见」的缺陷不会报错，只会
+// 让人反复点。
+//
+// 处理方式：当前主题的按钮保持 primary，另一个降为普通按钮（灰底）。
+// 这是最省配色预算的表达 —— 不引入第三档颜色，靠已有的两档拉开对比。
+fn syncThemeButtons(st: Settings, tree: UiTree) {
+    // 显式声明成 UiButton —— tree.at() 的返回类型是 Widget，
+    // 而 kind 是 UiButton 自己的字段，父类静态类型看不到。
+    //
+    // 这不是缺陷：Widget 只承诺「能画、有边界、能命中」，它不知道
+    // 什么叫配色档位。想要子类字段就得把静态类型写出来，语言在这里
+    // 不替人猜。
+    let dark:  UiButton = tree.at(0)
+    let light: UiButton = tree.at(1)
+    if (st.themeName == "dark") {
+        dark.kind  = UI_BTN_PRIMARY
+        light.kind = UI_BTN_NORMAL
+    } else {
+        dark.kind  = UI_BTN_NORMAL
+        light.kind = UI_BTN_PRIMARY
+    }
+}
+
+fn main() -> Int {
+    if (!winOpen("设置 · 类层组件库", WIN_W, WIN_H)) {
+        println("开窗失败")
+        return 1
+    }
+
+    let st = new Settings()
+
+    // 控件树：两个主题按钮。
+    //
+    // 它们必须进树，才能被 pick 到 —— 而 pick 是「按绘制层次判定命中」
+    // 的唯一正确做法。
+    let tree = new UiTree()
+    tree.add(UiButton.primary(Rect { x: 36, y: 120, w: 64, h: 26 }, "深色"))
+    tree.add(UiButton.primary(Rect { x: 108, y: 120, w: 64, h: 26 }, "浅色"))
+
+    // ---- 深色：跑一帧并截图 ----
+    winBeginFrame()
+    drawAll(st, tree, Frame.begin())
+    winEndFrame()
+    println("深色截图：" + toString(winScreenshot("build/shot-class-dark.bmp")))
+
+    // ---- 切浅色 ----
+    st.setTheme("light")
+    winBeginFrame()
+    drawAll(st, tree, Frame.begin())
+    winEndFrame()
+    println("浅色截图：" + toString(winScreenshot("build/shot-class-light.bmp")))
+
+    // ---- 用属性验证状态，不靠肉眼 ----
+    println("主题 " + st.themeName)
+    println("音量 " + toString(st.vol.v))
+    println("音乐 " + boolToString(st.music.on))
+    println("音效 " + boolToString(st.sfx.on))
+
+    // ---- 引用语义：别名改的就是同一个对象 ----
+    let alias = st.vol
+    alias.set(30)
+    println("别名改后 音量 " + toString(st.vol.v))
+
+    // 夹取
+    st.vol.set(150)
+    println("夹取后 音量 " + toString(st.vol.v))
+    st.vol.set(-20)
+    println("夹取后 音量 " + toString(st.vol.v))
+
+    // ---- 控件树：多态遍历与命中 ----
+    println("控件数 " + toString(tree.size()))
+    println("命中(50,100) 是第几个 " + toString(tree.pick(50, 100) == tree.at(0)))
+    println("命中(120,100) 是第几个 " + toString(tree.pick(120, 100) == tree.at(1)))
+    println("命中(1000,1000) 为空 " + toString(tree.pick(1000, 1000) == null))
+
+    // ---- 隐藏后不参与命中 ----
+    let b0 = tree.at(0)
+    b0.hide()
+    println("隐藏后命中(50,100) 为空 " + toString(tree.pick(50, 100) == null))
+    println("隐藏后 hit 为假 " + boolToString(b0.hit(50, 100)))
+
+    // ---- 面板内容区算术 ----
+    let pnl = new UiPanel(Rect { x: 0, y: 0, w: 256, h: 388 }, "检查")
+    let body = pnl.body()
+    println("内容区 " + toString(body))
+    println("面积 " + toString(body.w * body.h))
+    println("右边界 " + toString(body.x + body.w))
+
+    println("demo-class ok")
+    winClose()
+    return 0
+}

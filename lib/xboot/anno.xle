@@ -1,0 +1,187 @@
+// anno.xle — xboot 的注解约定与命名工具
+//
+// ── 这一文件为什么存在 ────────────────────────────────────
+//
+// 语言里的注解没有「类型定义」—— `@Component` 只是编译进字节码的
+// 一段元数据（名字 + 位置实参 + 键值对），运行时用 annoHas /
+// annoGet 查询。名字字符串散落在扫描器、路由、Mapper 三处的话，
+// 一个拼写错误（@RestControllor）不会在编译期报错，只会在运行期
+// 变成「扫描不到任何 Bean」。
+//
+// 所以框架把**所有**注解名收进这一处：扫描器问 componentAnnoName()，
+// 路由问 mappingAnnoNames()，拼错只会发生在这里 —— 而这里一眼就能
+// 看出来。这和 Spring 的 @Retention(RUNTIME) 注解类是同一个角色，
+// 只是没有语言级的类型检查兜底，靠的是「唯一事实来源」。
+
+// ---------------- 组件注解（IoC 扫描的目标）----------------
+//
+// 语义分层与 Spring 一致：@Component 是通用标记，其余是它的语义
+// 别名（Spring 的 @Service / @Repository 本质上就是 @Component）。
+// 扫描器对它们一视同仁 —— 语义差异体现在文档与团队约定里，
+// 不体现在容器行为里。
+
+const ANNO_COMPONENT     = "Component"
+const ANNO_SERVICE       = "Service"
+const ANNO_REPOSITORY    = "Repository"
+const ANNO_CONTROLLER    = "Controller"
+const ANNO_RESTCONTROLLER = "RestController"
+const ANNO_MAPPER        = "Mapper"
+
+// 注入注解
+const ANNO_AUTOWIRED = "Autowired"
+const ANNO_VALUE     = "Value"
+
+// Web 映射注解。数组下标 0..4 对应 GET/POST/PUT/DELETE/PATCH；
+// ANNO_REQUEST_MAPPING 单独处理（类级前缀 + 方法级通用映射）。
+const ANNO_GET_MAPPING    = "GetMapping"
+const ANNO_POST_MAPPING   = "PostMapping"
+const ANNO_PUT_MAPPING    = "PutMapping"
+const ANNO_DELETE_MAPPING = "DeleteMapping"
+const ANNO_PATCH_MAPPING  = "PatchMapping"
+const ANNO_REQUEST_MAPPING = "RequestMapping"
+
+// 数据访问注解
+const ANNO_TABLE  = "Table"
+const ANNO_TABLE_ID = "TableId"
+const ANNO_COLUMN = "Column"
+const ANNO_QUERY  = "Query"
+
+// 类级前缀路由（@RequestMapping("/api")）之外的映射注解名单，
+// 供路由扫描遍历。HTTP 方法与注解的对应关系见 web.xle。
+fn mappingAnnoNames() -> Array {
+    return [ANNO_GET_MAPPING, ANNO_POST_MAPPING, ANNO_PUT_MAPPING,
+            ANNO_DELETE_MAPPING, ANNO_PATCH_MAPPING]
+}
+
+// 判断一个注解名是不是组件注解。
+fn isComponentAnno(name: String) -> Bool {
+    if (name == ANNO_COMPONENT)     { return true }
+    if (name == ANNO_SERVICE)       { return true }
+    if (name == ANNO_REPOSITORY)    { return true }
+    if (name == ANNO_CONTROLLER)    { return true }
+    if (name == ANNO_RESTCONTROLLER) { return true }
+    if (name == ANNO_MAPPER)        { return true }
+    return false
+}
+
+// ---------------- 命名工具 ----------------
+
+// PascalCase 类名 → camelCase Bean 名。
+//
+// Spring 的默认 Bean 名就是首字母小写：UserService → userService。
+// 只有首字母下沉，其余不动（保留连续大写，UUserController 这种
+// 极端名字不折腾）。
+fn beanNameOf(clsName: String) -> String {
+    if (len(clsName) == 0) { return clsName }
+    let first = strLower(strAt(clsName, 0))
+    if (len(clsName) == 1) { return first }
+    return first + strSub(clsName, 1, len(clsName))
+}
+
+// camelCase 字段名 → snake_case 列名。
+//
+// ── 为什么默认做驼峰转下划线 ──────────────────────────────
+//
+// Java 世界的实体字段是 camelCase（userName），MySQL 世界的列名
+// 惯例是 snake_case（user_name）。MyBatis-Plus 的默认策略就是
+// 驼峰转下划线。框架沿用：没有 @Column 注解时，列名 = 驼峰转
+// 下划线；有 @Column 时以注解为准。
+//
+// 连续大写按词处理：createdAT → created_at 这种极端情况不追求
+// 完美，规则保持「大写字母前插下划线、整体转小写」。
+//
+// ── 大写字母为什么用双重判定 ───────────────────────────────
+//
+// 单看 strUpper(ch) == ch 不够：数字和下划线大写化也不变（"5" 的
+// upper 还是 "5"），会把 userId_2 之类误伤。所以「大写化不变 **且**
+// 小写化变化」才是字母大写（小写字母 lower 后变了）。这个判定曾
+// 经写反（ch != up 选中了小写字符），id 被转成 i_d —— SQL 报
+// Unknown column 才暴露，属于「转换器自身错了，所有下游一起错」
+// 的典型，因此这里把判定逻辑写全。
+fn camelToSnake(name: String) -> String {
+    var out = ""
+    var i = 0
+    while i < len(name) {
+        let ch = strAt(name, i)
+        let isUpperCh = (ch == strUpper(ch)) && (ch != strLower(ch))
+        if (isUpperCh && i > 0) {
+            // 大写字母（非首字符）前插下划线
+            out = out + "_"
+        }
+        out = out + strLower(ch)
+        i = i + 1
+    }
+    return out
+}
+
+// 类名是否可作 Bean（有组件注解）。
+// 扫描器的过滤谓词。只有类名，没有实例 —— 注解查询支持类名接收者
+// 正是为这一步：实例化之前就能过滤，构造函数不会带着未注入的
+// 依赖提前跑。
+fn isComponentClass(clsName: String) -> Bool {
+    var i = 0
+    let annos = annoAll(clsName, "class", "")
+    while i < len(annos) {
+        if (isComponentAnno(toString(annos[i]))) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---------------- 继承感知的注解查询 ----------------
+//
+// ── 为什么必须有这一组包装 ─────────────────────────────────
+//
+// 编译器把注解元数据挂在**声明它的类**上（探针结论）：
+//   annoHas(基类,   "field", "ds", "Value") == true
+//   annoHas(子类,   "field", "ds", "Value") == false
+//   annoHas(子实例, "field", "ds", "Value") == false
+// 而字段本身是继承的 —— classFields(子类) 会列出 ds。于是出现
+// 「字段可见、注解不可见」的裂缝：BaseMapper.ds 标了 @Autowired，
+// UserMapper 继承它，容器的注入却查不到注解，字段静默保持零值，
+// 第一个 SQL 调用在运行期才炸（炸点离错因十万八千里）。
+//
+// 解法：沿 classParent 链逐级查，任何一级命中即视为有。Java 注解
+// 默认不 @Inherited，但 Java 的注解处理（Spring 的
+// AnnotatedElementUtils.findMergedAnnotation）实际都是**沿层级
+// 搜索**的语义 —— 这里对齐的是 Spring 的行为，不是 Java 的裸语义。
+
+// 注解是否存在（沿父类链查）。target: "class" / "field" / "method"。
+fn annoHasInherited(clsName: String, target: String, member: String, annoName: String) -> Bool {
+    var cn = clsName
+    while (len(cn) > 0) {
+        if (annoHas(cn, target, member, annoName)) {
+            return true
+        }
+        cn = classParent(cn)
+    }
+    return false
+}
+
+// 取注解位置实参（沿父类链查，取第一个命中的定义）。
+fn annoGetInherited(clsName: String, target: String, member: String, annoName: String) -> Array {
+    var cn = clsName
+    while (len(cn) > 0) {
+        let vals = annoGet(cn, target, member, annoName)
+        if (len(vals) > 0) {
+            return vals
+        }
+        cn = classParent(cn)
+    }
+    return []
+}
+
+// 取注解键值对（沿父类链查）。
+fn annoGetKVInherited(clsName: String, target: String, member: String, annoName: String) -> Array {
+    var cn = clsName
+    while (len(cn) > 0) {
+        let kv = annoGetKV(cn, target, member, annoName)
+        if (len(kv) > 0) {
+            return kv
+        }
+        cn = classParent(cn)
+    }
+    return []
+}

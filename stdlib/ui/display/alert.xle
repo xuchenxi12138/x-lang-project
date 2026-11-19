@@ -1,0 +1,253 @@
+// ui/display/alert.xle — 内联提示条
+//
+// ── Alert 与 Toast 的分工 ─────────────────────────
+//
+//   Toast —— 临时的、浮在上面、自动消失
+//   Alert —— 常驻的、占据布局空间、需要用户处理才消失
+//
+// 所以 Alert 必须参与布局（有自己的高度），而 Toast 不占空间。
+// 这就是为什么 Alert 是 Widget 而 Toaster 只是绘制浮层。
+//
+// ── 四种类型 ─────────────────────────────────
+//
+// info / success / warn / error。每种有独立的强调色 + 图标，
+// 但布局完全一样 —— 所以用 kind 一个 Int 而不是四个类。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+const ALERT_INFO    = 0
+const ALERT_SUCCESS = 1
+const ALERT_WARN    = 2
+const ALERT_ERROR   = 3
+
+// 单行 Alert 的最小高度。
+const ALERT_MIN_H = 40
+
+// 左右内边距。
+const ALERT_PAD = 12
+
+// 图标方块边长。
+const ALERT_ICON = 18
+
+class Alert extends Widget {
+    kind: Int,
+    text: String,
+
+    // 标题（可选）。有标题时是两行布局。
+    title: String,
+
+    // 是否显示关闭按钮（X）。
+    closable: Bool,
+
+    constructor(r: Rect, text: String, kind: Int) {
+        self.r        = r
+        self.vis      = true;
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.text     = text
+        self.kind     = kind
+        self.title    = ""
+        self.closable = false
+        self.style    = Style.plain()
+    }
+
+    static fn info(r: Rect, s: String) -> Alert {
+        return new Alert(r, s, ALERT_INFO)
+    }
+
+    static fn success(r: Rect, s: String) -> Alert {
+        return new Alert(r, s, ALERT_SUCCESS)
+    }
+
+    static fn warn(r: Rect, s: String) -> Alert {
+        return new Alert(r, s, ALERT_WARN)
+    }
+
+    static fn error(r: Rect, s: String) -> Alert {
+        return new Alert(r, s, ALERT_ERROR)
+    }
+
+    fn setTitle(s: String) -> Alert {
+        self.title = s
+        return self
+    }
+
+    fn setClosable(v: Bool) -> Alert {
+        self.closable = v
+        return self
+    }
+
+    // ── 颜色 ────────────────────────────────────
+
+    fn accent(th: Theme) -> Int {
+        if (self.kind == ALERT_SUCCESS) { return th.ok }
+        if (self.kind == ALERT_WARN)    { return th.warn }
+        if (self.kind == ALERT_ERROR)   { return th.err }
+        return th.accent
+    }
+
+    fn icon() -> String {
+        if (self.kind == ALERT_SUCCESS) { return "v" }
+        if (self.kind == ALERT_WARN)    { return "!" }
+        if (self.kind == ALERT_ERROR)   { return "x" }
+        return "i"
+    }
+
+    // ── 高度 ────────────────────────────────────
+    //
+    // Alert 的高度取决于文字折几行 —— 布局阶段需要这个值，
+    // 所以是一个独立可调的方法。
+    fn measureH(width: Int) -> Int {
+        let textW = width - ALERT_PAD * 2 - ALERT_ICON - 10
+        if (self.closable) { textW = textW - 24 }
+        if (textW < 20) { textW = 20 }
+
+        let lines = uiLineCount(self.text, textW)
+        var h = lines * (winTextHeight() + 4) + 16
+        if (len(self.title) > 0) {
+            h = h + winTextHeight() + 4
+        }
+        if (h < ALERT_MIN_H) { h = ALERT_MIN_H }
+        return h
+    }
+
+    // 关闭按钮矩形。
+    fn closeRect() -> Rect {
+        let s = 20
+        return rectOf(self.r.x + self.r.w - ALERT_PAD - s,
+                      self.r.y + (self.r.h - s) / 2, s, s)
+    }
+
+    // 点击。返回 true 表示点了关闭按钮，调用方应该隐藏它。
+    fn click(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+        if (!self.closable) { return false }
+        if (self.closeRect().contains(mx, my)) {
+            self.vis = false
+            return true
+        }
+        return false
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        let ac = self.accent(th)
+
+        // ── 底 ──
+        //
+        // 用「强调色与面板色的混合色」当底色，而不是纯强调色或
+        // 纯面板色：
+        //   · 纯强调色 → 文字看不清，而且四种 Alert 全是大色块
+        //   · 纯面板色 → 看不出这是 Alert
+        // 12% 的混合是「一眼能看出色调，但文字仍然清晰」的值。
+        let bg = alertBlend(th.surface, ac, 0.12)
+        winFillRound(self.r.x, self.r.y, self.r.w, self.r.h, 6, bg)
+
+        // 左侧强调竖条。4px 宽，贴左边框。
+        winFillRound(self.r.x, self.r.y, 4, self.r.h, 2, ac)
+
+        // 细边框（用强调色的低混色）。
+        winBorderRound(self.r.x, self.r.y, self.r.w, self.r.h, 6, 1,
+                       alertBlend(th.border, ac, 0.4))
+
+        // ── 图标 ──
+        let ix = self.r.x + ALERT_PAD + 4
+        let iy = self.r.y + (self.r.h - ALERT_ICON) / 2
+        if (len(self.title) > 0) {
+            // 有标题时图标贴顶部（与标题对齐）。
+            iy = self.r.y + 12
+        }
+        let ir = rectOf(ix, iy, ALERT_ICON, ALERT_ICON)
+        winFillRound(ir.x, ir.y, ir.w, ir.h, ALERT_ICON / 2, ac)
+        uiTextInRect(ir, self.icon(), th.bg)
+
+        // ── 文字区 ──
+        var tx = ix + ALERT_ICON + 10
+        var tw = self.r.x + self.r.w - tx - ALERT_PAD
+        if (self.closable) { tw = tw - 26 }
+        if (tw < 20) { tw = 20 }
+
+        var ty = self.r.y + 10
+
+        // 标题。
+        if (len(self.title) > 0) {
+            let tr = rectOf(tx, ty, tw, winTextHeight())
+            var t = self.title
+            if (winTextWidth(t) > tw) { t = uiEllipsize(t, tw) }
+            winText(tx, ty, t, th.text)
+            ty = ty + winTextHeight() + 4
+        }
+
+        // 正文（折行）。
+        let lines = uiWrapLines(self.text, tw)
+        var i = 0
+        while i < len(lines) {
+            winText(tx, ty + i * (winTextHeight() + 4),
+                    toString(lines[i]), th.textDim)
+            i = i + 1
+        }
+
+        // ── 关闭按钮 ──
+        if (self.closable) {
+            let cr = self.closeRect()
+            let cx = cr.x + cr.w / 2
+            let cy = cr.y + cr.h / 2
+            let mxx = winMouseX()
+            let myy = winMouseY()
+            var c = th.textDim
+            if (cr.contains(mxx, myy)) {
+                // 悬停时给个底，让人知道这里能点。
+                winFillRound(cr.x, cr.y, cr.w, cr.h, 4, th.surfaceHover)
+                c = th.text
+            }
+            self.drawX(cx, cy, 4, c)
+        }
+    }
+
+    fn drawX(cx: Int, cy: Int, d: Int, c: Int) {
+        var i = 0 - d
+        while i <= d {
+            winFillRect(cx + i, cy + i, 1, 1, c)
+            winFillRect(cx + i, cy - i, 1, 1, c)
+            i = i + 1
+        }
+    }
+}
+
+// ── 颜色混合 ────────────────────────────────────
+//
+// blend(a, b, t)：取 a 为底，混入 t 比例的 b。
+//
+// 与 lerpColor 的区别只是「谁是起点」的语义。这里写一个
+// 有名字的版本，调用点读起来是 blend(surface, accent, 0.12)
+// 而不是 lerpColor(surface, accent, 0.12) —— 虽然后者也能用，
+// 但「lerp」是数学词，「blend」是设计词，后者更贴近意图。
+fn alertBlend(a: Int, b: Int, t: Float) -> Int {
+    if (t <= 0.0) { return a }
+    if (t >= 1.0) { return b }
+    let ar = (a >> 16) & 0xFF
+    let ag = (a >> 8) & 0xFF
+    let ab = a & 0xFF
+    let br = (b >> 16) & 0xFF
+    let bg = (b >> 8) & 0xFF
+    let bb = b & 0xFF
+    var r = toInt(toFloat(ar) + (toFloat(br) - toFloat(ar)) * t + 0.5)
+    var g = toInt(toFloat(ag) + (toFloat(bg) - toFloat(ag)) * t + 0.5)
+    var bl = toInt(toFloat(ab) + (toFloat(bb) - toFloat(ab)) * t + 0.5)
+    if (r < 0) { r = 0 }
+    if (r > 255) { r = 255 }
+    if (g < 0) { g = 0 }
+    if (g > 255) { g = 255 }
+    if (bl < 0) { bl = 0 }
+    if (bl > 255) { bl = 255 }
+    return (r << 16) | (g << 8) | bl
+}

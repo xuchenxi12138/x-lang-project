@@ -1,0 +1,253 @@
+// db/oracle/tns.xle — TNS 报文帧
+//
+// ── TNS 是什么 ────────────────────────────────────
+//
+// Oracle 的客户端-服务端协议叫 TNS（Transparent Network Substrate），
+// 后来改名 Net Services / Net8 / Oracle Net，但报文层一直叫 TNS。
+// 它是本套 db 层里**最复杂的协议**，复杂程度和另外六个不在一个量级：
+//
+//   · MySQL     1 种报文头（4 字节）+ 十几种命令
+//   · PostgreSQL 1 种报文头（5 字节）+ 二十几种消息
+//   · Redis     1 种文本协议（RESP）
+//   · MongoDB   2 种消息格式（OP_QUERY / OP_MSG）
+//   · ES        HTTP + JSON
+//   · SQLite    文件格式
+//   · **Oracle** 报文分两层：TNS 通用头 + 数据包内的「函数码」，
+//               而且**每个函数的结构完全不同**，没有统一的字段表
+//
+// ── TNS 报文头（8 字节） ────────────────────────────
+//
+//   偏移  长度  含义
+//   0     2     包长度（**大端，且包含这 8 字节头自己**）
+//   2     2     包校验和（通常 0，只有跨平台传输才用）
+//   3     1     包类型（package type，见 TNS_PKT_*）
+//   4     1     保留
+//   5     1     header checksum（通常 0）
+//   6     2     保留
+//
+// ── 「长度含头」这个坑 ─────────────────────────────
+//
+// 这是手写 TNS 客户端第一个会撞上的地方。MySQL 的长度只算负载，
+// PostgreSQL 的长度含自己的 4 字节，而 TNS 的长度**含全部 8 字节
+// 头**。所以读负载时要 `len - 8`。
+//
+// 三种协议三种算法，全都只差几字节 —— 而这种错误的表现是「第一
+// 个包能读对，第二个包开始错位」，看起来像协议不兼容。
+//
+// ── 包类型 ────────────────────────────────────────
+//
+//   1  CONNECT      客户端发起连接，携带 connect string
+//   2  ACCEPT       服务端接受，携带协商结果
+//   3  ACK          确认
+//   4  REFUSE       拒绝（带错误码与原因）
+//   5  REDIRECT     重定向到别的监听器
+//   6  DATA         数据包（SQL 和结果都在这里面）
+//   9  MARKER       中断标记
+//  11  ATTEST       认证
+//  12  CONTROL      控制消息
+//  14  RESEND       请重发
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+
+// TNS 报文头长度。
+const TNS_HDR = 8
+
+// 包类型。
+const TNS_PKT_CONNECT  = 1
+const TNS_PKT_ACCEPT   = 2
+const TNS_PKT_ACK      = 3
+const TNS_PKT_REFUSE   = 4
+const TNS_PKT_REDIRECT = 5
+const TNS_PKT_DATA     = 6
+const TNS_PKT_MARKER   = 9
+const TNS_PKT_ATTEST   = 11
+const TNS_PKT_CONTROL  = 12
+const TNS_PKT_RESEND   = 14
+
+// Connect 包里的标志位。
+//
+// 这些标志告诉服务端「我要用哪些能力」。P0 只需要最基础的一组：
+// 客户端要能发 SDU、要 SCN 一致性、不要 O3LOGON。
+//
+// ── 为什么标志值特别难搞 ──────────────────────────
+//
+// 因为 Oracle 从来没公开完整定义它们。业界用的值来自 Wireshark 的
+// dissector 反推和各个开源驱动的积累（python-oracledb、jdbc 的
+// 逆向分析）。这里用的是 python-oracledb 那一套，它经过了大量
+// 真实环境验证。
+//
+// 写错的症状很微妙：连接有时能建起来，有时 Accept 之后第一个 Data
+// 包就被 Refuse。所以这里的值是「能跑通的最小集合」，不是「理论上
+// 正确的集合」—— 后者不存在。
+fn tnsConnectFlags() -> Int {
+    // 0x0800 SDU 协商
+    // 0x0008 客户端支持 O5LOGON
+    // 0x0001 需要 SCN
+    return 0x0800 | 0x0008 | 0x0001
+}
+
+// TNS 版本号。0x138 是 12.1 客户端，0x0DC 是 11.2。
+//
+// 服务端会按这个值决定能用哪些特性。用低版本更兼容（服务端会降级
+// 到老特性），用高版本能拿到新特性但遇到老服务端会失败。
+//
+// P0 选 0x0DC（11.2）：这是一个「服务端一定认识」的版本。
+const TNS_VERSION_11_2 = 0x0DC
+const TNS_VERSION_12_1 = 0x138
+
+// 一个 TNS 包。
+class TnsPacket {
+    // 包类型。见 TNS_PKT_*。
+    pktType: Int,
+
+    // 负载（已经去掉 8 字节头）。
+    payload: Array,
+
+    // 解析失败原因。
+    error: String,
+
+    constructor() {
+        self.pktType = 0
+        self.payload = []
+        self.error   = ""
+    }
+
+    fn describe() -> String {
+        return "TNS " + tnsTypeName(self.pktType) + " (" + toString(len(self.payload)) + "B payload)"
+    }
+}
+
+fn tnsTypeName(t: Int) -> String {
+    if (t == TNS_PKT_CONNECT)  { return "CONNECT" }
+    if (t == TNS_PKT_ACCEPT)   { return "ACCEPT" }
+    if (t == TNS_PKT_ACK)      { return "ACK" }
+    if (t == TNS_PKT_REFUSE)   { return "REFUSE" }
+    if (t == TNS_PKT_REDIRECT) { return "REDIRECT" }
+    if (t == TNS_PKT_DATA)     { return "DATA" }
+    if (t == TNS_PKT_MARKER)   { return "MARKER" }
+    if (t == TNS_PKT_ATTEST)   { return "ATTEST" }
+    if (t == TNS_PKT_CONTROL)  { return "CONTROL" }
+    if (t == TNS_PKT_RESEND)   { return "RESEND" }
+    return "type-" + toString(t)
+}
+
+// 组装一个 TNS 包。
+//
+// 长度字段 = 8 + len(payload)，**含头自己** —— 见文件头注释。
+//
+// ── 头必须正好 8 字节 ──────────────────────────────
+//
+// 字段表（注意最后两个都是 **1 字节**，不是 2 字节）：
+//
+//   [0..2]  包长度       2
+//   [2..4]  checksum     2
+//   [4]     包类型       1
+//   [5]     reserved     1
+//   [6]     header cksum 1
+//   [7]     reserved     1
+//                        ── 共 8 ──
+//
+// 实测踩过一次：把最后一个 reserved 写成 `bbPutU16BE(b, 0)`（2 字节），
+// 于是头变成 9 字节。症状是长度字段说 11 而实际 12 字节 —— 服务端
+// 按 11 切包，把多出来的那个 00 当成下一个包的头首字节，整条流
+// 从头错位。而本地看 hex 只是「多了一个 00」，极难联想到头长度错误。
+fn tnsBuild(pktType: Int, payload: Array) -> Array {
+    var b = []
+    b = bbPutU16BE(b, TNS_HDR + len(payload))
+    b = bbPutU16BE(b, 0)            // checksum
+    b = bbPut(b, pktType)
+    b = bbPut(b, 0)                 // reserved
+    b = bbPut(b, 0)                 // header checksum
+    b = bbPut(b, 0)                 // reserved（1 字节！）
+    if (len(b) != TNS_HDR) {
+        // 头长度错了就立刻失败，不要带着错继续往下跑。
+        fail("TNS 头长度错误：" + toString(len(b)) + " 字节，应为 " + toString(TNS_HDR))
+    }
+    var i = 0
+    while (i < len(payload)) {
+        b = bbPut(b, bbAt(payload, i))
+        i = i + 1
+    }
+    return b
+}
+
+// 从连接读一个 TNS 包。
+//
+// 返回 [ok, TnsPacket, error]。
+//
+// ── 为什么先读 8 字节头再读剩余 ─────────────────────
+//
+// 因为长度在头里。不能「一次读满某个固定大小」—— TNS 的包长随
+// payload 变化（SDU 协商后通常 8KB，但小包很常见），读多了会
+// 阻塞在等不会到来的数据上。
+fn tnsRead(conn: Conn) -> Array {
+    let hr = conn.readN(TNS_HDR)
+    if (hr[0] != true) {
+        return [false, new TnsPacket(), "读 TNS 头失败（连接断开或超时）"]
+    }
+    let head = hr[1]
+    let total = bbU16BE(head, 0)
+    if (total < TNS_HDR) {
+        return [false, new TnsPacket(), "TNS 包长度 " + toString(total) + " 小于头部 8 字节"]
+    }
+
+    let p = new TnsPacket()
+    p.pktType = bbU8(head, 3)
+
+    let bodyLen = total - TNS_HDR
+    if (bodyLen == 0) {
+        return [true, p, ""]
+    }
+    let br = conn.readN(bodyLen)
+    if (br[0] != true) {
+        return [false, p, "读 TNS 负载 " + toString(bodyLen) + " 字节失败"]
+    }
+    p.payload = br[1]
+    return [true, p, ""]
+}
+
+// ── Refuse 包的解析 ────────────────────────────────
+//
+// 服务端拒绝连接时发 REFUSE，负载里有原因码。
+//
+// 这个函数很重要，因为 Oracle 的错误信息绝大多数时候**只有原因码**，
+// 没有可读文本（服务端还不知道该用哪种语言）。所以必须把它翻译成
+// 人能懂的话 + 可操作的建议。
+fn tnsParseRefuse(payload: Array) -> String {
+    if (len(payload) < 2) { return "REFUSE（负载为空，无法判断原因）" }
+
+    // 前 2 字节是原因码（大端）。
+    let code = bbU16BE(payload, 0)
+    var msg = "REFUSE 原因码 " + toString(code) + "：" + tnsRefuseReason(code)
+    // 后面可能跟一段文本（服务端的说明）。
+    if (len(payload) > 2) {
+        let extra = strTrim(bbToText(bbSlice(payload, 2, len(payload))))
+        if (len(extra) > 0) {
+            msg = msg + "\n  服务端说明：" + extra
+        }
+    }
+    return msg
+}
+
+fn tnsRefuseReason(code: Int) -> String {
+    // 这些码来自 Oracle Net 的文档和 Wireshark dissector。
+    if (code == 0)  { return "连接被接受（不该出现在 REFUSE 里）" }
+    if (code == 1)  { return "服务名/SID 不存在（检查 connect string 里的 SERVICE_NAME）" }
+    if (code == 4)  { return "服务端内部错误" }
+    if (code == 5)  { return "认证失败" }
+    if (code == 6)  { return "协议版本不兼容（试试更低的 TNS_VERSION）" }
+    if (code == 7)  { return "服务端不支持该客户端类型" }
+    if (code == 8)  { return "监听器拒绝（可能已达到 PROCESSES 上限）" }
+    if (code == 11) { return "数据库未注册到监听器（检查实例是否启动、listener.ora）" }
+    if (code == 12) { return "数据库处于 RESTRICTED 模式" }
+    if (code == 15) { return "客户端版本过低" }
+    if (code == 18) { return "服务名解析失败" }
+    if (code == 20) { return "认证方式不支持" }
+    if (code == 22) { return "调试/跟踪要求被拒" }
+    if (code == 23) { return "服务端资源不足（进程/会话数达到上限）" }
+    if (code == 26) { return "服务端不接受该协议版本" }
+    if (code == 28) { return "协议协商过程中断" }
+    if (code == 34) { return "服务名未注册" }
+    return "未知原因码（查 Oracle Net 文档的 Refuse Reason）"
+}

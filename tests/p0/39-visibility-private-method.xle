@@ -1,0 +1,37 @@
+// 39-visibility-private-method.xle — 负例：类外调用 private 方法
+//
+// 这个文件**预期以退出码 1 结束**（编译错误，不是运行时错误）。
+//
+// ── 这条用例存在的意义 ─────────────────────────────────────
+//
+// ClassMethod.vis 曾经是「解析了、存了、一次都没查」的状态：语法
+// 上完全支持 `private fn`，编译期却没有任何地方读这个字段，于是
+// 外部可以直接调用——封装形同虚设，而所有正例测试都照样通过。
+//
+// 所以这里必须有一条负例。它验证的不是「语法能解析」，而是
+// 「检查真的接在调用点上了」。
+
+class Vault {
+    private secret: Int
+
+    constructor(s: Int) {
+        self.secret = s
+    }
+
+    private fn internalHelper() -> Int {
+        return self.secret * 10
+    }
+
+    // 类内调用合法
+    fn useHelper() -> Int {
+        return self.internalHelper()
+    }
+}
+
+fn main() {
+    let v = new Vault(7)
+    // 类内调用没问题
+    println(toString(v.useHelper()))
+    // 这一行必须被编译期拒绝：internalHelper 是 private 的
+    println(toString(v.internalHelper()))
+}

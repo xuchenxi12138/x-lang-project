@@ -1,0 +1,238 @@
+// db/mysql/handshake.xle — MySQL 初始握手包解析
+//
+// ── 握手流程 ────────────────────────────────────
+//
+// 连接建立的顺序（MySQL Protocol 的 "Connection Phase"）：
+//
+//   1. 服务端主动发 Initial Handshake Packet（protocol version 10）
+//   2. 客户端回 Handshake Response 41（能力标志 + 用户名 + 认证响应）
+//   3. 服务端回 OK / ERR / Auth Switch Request
+//
+// 本文件只负责第 1 步：把服务端发来的那一坨字节解析成结构化的
+// 字段。第 2 步在 auth.xle。
+//
+// ── Initial Handshake Packet 的字节布局 ────────────
+//
+//   [0]      protocol version（固定 10）
+//   [1..]    server version，NUL 结尾（如 "8.0.35"）
+//   [4]      connection id（小端 4 字节）
+//   [8]      auth-plugin-data-part-1（8 字节）
+//   [1]      0x00 填充
+//   [2]      capability flags 低 16 位（小端）
+//   [1]      字符集
+//   [2]      status flags
+//   [2]      capability flags 高 16 位（小端）
+//   [1]      auth plugin data len（通常是 21）
+//   [10]     保留全 0
+//   [12]     auth-plugin-data-part-2（至少 13 字节，末位 0x00）
+//   [..]     auth plugin name，NUL 结尾（如 "caching_sha2_password")
+//
+// ── 为什么盐分两段 ────────────────────────────────
+//
+// 这是历史遗留。MySQL 3.23 的协议到这里就结束了（只有 8 字节挑战），
+// 4.1 之后加了 part-2 共 20 字节给新认证插件用。为了向后兼容，两段
+// 拼接才是完整的 20 字节盐。**忘了拼 part-2 是经典 bug** —— 认证
+// 响应会算错，服务端只会回一句 "Access denied"。
+
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "packet.xle" import myReadPacket, myWritePacket, myReadLenEnc, myWriteLenEnc, myWriteLenEncStr, myWriteLenEncBytes, myReadLenEncBytes, myReadLenEncStr, myReadNulStr, myReadNulBytes, myIsErrPacket, myIsOkPacket, myIsEofPacket, myParseErrPacket, myParseOkPacket, myArrBool, myArrBytes, MY_MAX_PAYLOAD
+
+// 能力标志位（只列出本项目用到的）。
+//
+// ── 为什么需要的这么少 ────────────────────────────
+//
+// 能力标志有 30 多个，但绝大多数是可选优化（压缩、SSL、多语句）。
+// 少声明一个只会让服务端退化到更保守的行为，而**多声明一个而没实现**
+// 会让服务端发来无法解析的数据。所以宁可少。
+const MY_CAP_LONG_PASSWORD   = 0x00000001
+const MY_CAP_FOUND_ROWS      = 0x00000002
+const MY_CAP_LONG_FLAG       = 0x00000004
+const MY_CAP_CONNECT_WITH_DB = 0x00000008
+const MY_CAP_PROTOCOL_41     = 0x00000200
+const MY_CAP_TRANSACTIONS    = 0x00002000
+const MY_CAP_SECURE_CONN     = 0x00008000
+const MY_CAP_MULTI_RESULTS   = 0x00020000
+const MY_CAP_PLUGIN_AUTH     = 0x00080000
+
+// 默认声明的能力组合。
+//
+// ── 为什么是函数不是 const ──────────────────────
+//
+// P0 的顶层 const 只接受字面量（不做常量表达式折叠），而这是一个
+// 位或组合。写成 fn 反而更好：调用点能看到「这是算出来的」。
+//
+// ── 为什么不声明 SSL ───────────────────────────
+//
+// 因为 P0 没有 TLS 实现。声明 0x0800 (CLIENT_SSL) 后服务端会要求
+// 先做 TLS 握手，而客户端做不出来，只能挂在那里等超时。
+fn myClientCaps() -> Int {
+    return MY_CAP_LONG_PASSWORD | MY_CAP_LONG_FLAG
+         | MY_CAP_PROTOCOL_41 | MY_CAP_TRANSACTIONS
+         | MY_CAP_SECURE_CONN | MY_CAP_MULTI_RESULTS
+         | MY_CAP_PLUGIN_AUTH
+}
+
+// 服务端初始握手包解析结果。
+class HandshakeInfo {
+    protocolVersion: Int,
+    serverVersion: String,
+    connectionId: Int,
+
+    // 拼好的 20 字节盐（part-1 + part-2）。
+    salt: Array,
+
+    // 服务端声明的能力标志（32 位）。
+    caps: Int,
+
+    charset: Int,
+    statusFlags: Int,
+    authPluginLen: Int,
+
+    // 认证插件名，"mysql_native_password" / "caching_sha2_password" 等。
+    plugin: String,
+
+    // 解析是否成功。
+    ok: Bool,
+    error: String,
+
+    constructor() {
+        self.protocolVersion = 0
+        self.serverVersion   = ""
+        self.connectionId    = 0
+        self.salt            = []
+        self.caps            = 0
+        self.charset         = 0
+        self.statusFlags     = 0
+        self.authPluginLen   = 0
+        self.plugin          = ""
+        self.ok              = false
+        self.error           = ""
+    }
+
+    fn describe() -> String {
+        return "MySQL " + self.serverVersion
+             + " conn=" + toString(self.connectionId)
+             + " plugin=" + self.plugin
+             + " salt=" + toString(len(self.salt)) + "B"
+             + " caps=0x" + toHex(self.caps)
+    }
+}
+
+// 解析握手包负载（**不含** 4 字节包头）。
+//
+// ── 为什么每个偏移都写死了数字而不是累加 ────────────
+//
+// 因为报文里有若干「条件存在」的字段：只有声明了 CLIENT_PLUGIN_AUTH
+// 才会出现插件名，只有声明了 CLIENT_SECURE_CONNECTION 才有 part-2。
+// 用累加变量在条件分支里推进极易漏加或多加。而固定偏移 + 存在性
+// 判断让每一处读取都能单独对照协议文档核对。
+fn myParseHandshake(payload: Array) -> HandshakeInfo {
+    let info = new HandshakeInfo()
+    let n = len(payload)
+    if (n < 34) {
+        info.error = "握手包太短（" + toString(n) + " 字节，至少 34）"
+        return info
+    }
+
+    let pv = bbAt(payload, 0)
+    info.protocolVersion = pv
+    if (pv != 10) {
+        // ── 为什么不接受其它版本 ──────────────────────
+        //
+        // 协议版本 9 及以前的报文布局完全不同（没有能力标志、没有
+        // 长度编码），而 MySQL 4.1 之后全是 10。接受其它版本只会
+        // 让解析在后续偏移处静默错位。
+        info.error = "不支持的协议版本 " + toString(pv) + "（只支持 10）"
+        return info
+    }
+
+    let sv = myReadNulStr(payload, 1)
+    info.serverVersion = toString(sv[0])
+    var pos = toInt(sv[1])
+
+    info.connectionId = bbU32LE(payload, pos) & 0xFFFFFFFF
+    pos = pos + 4
+
+    // part-1：固定 8 字节
+    let salt = []
+    var i = 0
+    while i < 8 && pos + i < n {
+        arrPush(salt, bbAt(payload, pos + i))
+        i = i + 1
+    }
+    pos = pos + 8 + 1     // 跳过 8 字节盐 + 1 字节填充
+
+    let capLow = bbU16LE(payload, pos) & 0xFFFF
+    pos = pos + 2
+
+    if (n <= pos) {
+        // 极老的服务器到这就结束了。
+        info.caps = capLow
+        info.salt = salt
+        info.plugin = "mysql_old_password"
+        info.ok = true
+        return info
+    }
+
+    info.charset = bbAt(payload, pos) & 0xFF
+    pos = pos + 1
+    info.statusFlags = bbU16LE(payload, pos) & 0xFFFF
+    pos = pos + 2
+
+    let capHigh = bbU16LE(payload, pos) & 0xFFFF
+    pos = pos + 2
+    info.caps = capLow | (capHigh << 16)
+
+    info.authPluginLen = bbAt(payload, pos) & 0xFF
+    pos = pos + 1
+    pos = pos + 10        // 保留 10 字节
+
+    // part-2：长度 = max(13, authPluginLen - 8)。末尾有一个 0x00，
+    // 实际有用的字节是 authPluginLen - 9（通常是 12）。
+    if ((info.caps & MY_CAP_SECURE_CONN) != 0 && pos < n) {
+        var want = info.authPluginLen - 9
+        if (want < 12) { want = 12 }
+        var k = 0
+        while k < want && pos + k < n {
+            arrPush(salt, bbAt(payload, pos + k))
+            k = k + 1
+        }
+        pos = pos + want + 1
+    }
+    info.salt = salt
+
+    // 插件名
+    if ((info.caps & MY_CAP_PLUGIN_AUTH) != 0 && pos < n) {
+        let pl = myReadNulStr(payload, pos)
+        info.plugin = toString(pl[0])
+    }
+    if (len(info.plugin) == 0) {
+        info.plugin = "mysql_native_password"
+    }
+
+    info.ok = true
+    return info
+}
+
+// 读并解析握手包（一次阻塞读 + 解析）。失败时 error 有说明。
+fn myReadHandshake(c: Conn) -> HandshakeInfo {
+    let r = myReadPacket(c)
+    if (!myArrBool(r, 0)) {
+        let h = new HandshakeInfo()
+        h.error = toString(r[3])
+        return h
+    }
+    let payload = r[2]
+    // ── 错误包的识别 ────────────────────────────
+    //
+    // 负载第 1 字节是 0xFF 表示 ERR 包（服务端拒绝连接，比如
+    // "Host is not allowed"）。此时后面的字节是错误码 + 消息，
+    // 不能当握手包解析。
+    if (bbAt(payload, 0) == 0xFF) {
+        let h = new HandshakeInfo()
+        h.error = "服务端拒绝：" + myParseErrPacket(payload)
+        return h
+    }
+    return myParseHandshake(payload)
+}

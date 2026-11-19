@@ -1,0 +1,44 @@
+// 39-visibility-narrow-override.xle — 负例：覆写不能收窄可见性
+//
+// 这个文件**预期以退出码 1 结束**。
+//
+// ── 为什么这条规则是必须的，而不是风格建议 ────────────────
+//
+// 假设允许「父类 public、子类 private」：
+//
+//     class Base { public fn hello() { } }
+//     class Sub extends Base { private fn hello() { } }
+//
+//     let b: Base = new Sub()
+//     b.hello()        // 编译期看 Base.hello 是 public，放行
+//
+// 调用点按**静态类型**判可见性，而实际执行的是子类实现。如果允许
+// 收窄，这一行就会通过静态检查却撞上一个不该被外部调用的方法 ——
+// 而调用点根本不可能预知（那需要运行时类型，而那正是多态要隐藏的）。
+//
+// 这是 LSP（里氏替换原则）的直接推论：子类必须能替换父类，包括
+// 「能做什么」这一面。所以收窄必须在编译期拒绝。
+//
+// ── 反过来的方向是允许的 ─────────────────────────────────
+//
+// 父类 protected、子类 public：那只是放宽，任何按父类调用的地方
+// 都不会因此撞墙。所以 `(int)子类vis > (int)父类vis` 才算收窄，
+// 枚举顺序 PUBLIC=0 < PROTECTED=1 < PRIVATE=2 正好让这个比较成立。
+
+class Base {
+    public fn hello() -> String {
+        return "base"
+    }
+}
+
+class Sub extends Base {
+    // 这里必须被编译期拒绝：父类 public，子类收窄成 private
+    private fn hello() -> String {
+        return "sub"
+    }
+}
+
+fn main() {
+    let b: Base = new Sub()
+    println(b.hello())
+}

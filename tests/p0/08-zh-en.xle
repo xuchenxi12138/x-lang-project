@@ -1,0 +1,53 @@
+// 08-zh-en.x — 08-zh.x 的英文对照版
+//
+// 与 08-zh.x 逐行对应，**标识符名完全相同**，只有关键字与内建类型名
+// 一个是英文一个是中文。这样两者的字节码必须完全一致，
+// 除了常量池里的字符串内容（那是程序数据，本来就该不同）。
+//
+// 这是 04 §2.5 声称的「零成本」的可执行证据：
+// 把两份文件的 disasm 输出对比，指令序列必须逐字节一致。
+
+let name_ = "X"
+let version = 0.7
+
+fn square(n: Float) -> Float {
+    return n * n
+}
+
+fn factorial(n: Int) -> Int {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+println("语言: " + name_)
+println("版本: " + version)
+println("平方: " + square(1.5))
+println("阶乘: " + factorial(6))
+
+var sum_ = 0
+var i: Int = 1
+while i <= 10 {
+    sum_ += i
+    i += 1
+}
+println("1..10 之和: " + sum_)
+
+if sum_ > 50 {
+    println("和大于 50")
+} else {
+    println("和不超过 50")
+}
+
+// 真值与空值的英文写法
+let flag: Bool = true
+let nothing = null
+if flag {
+    println("标志为真")
+}
+if nothing {
+    println("不该打印")
+} else {
+    println("空值按假处理")
+}

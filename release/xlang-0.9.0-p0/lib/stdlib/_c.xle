@@ -1,0 +1,2 @@
+import "ui/index.xle"
+fn main() -> Int { return 0 }

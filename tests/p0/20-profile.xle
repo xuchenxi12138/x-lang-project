@@ -1,0 +1,73 @@
+// profile_test.xle — 场景化入口（Profile）的行为验证
+//
+// 这个文件本身不测「窗口开不开」，那要靠截图。它测的是**档位真的
+// 带来了可观测差异**这件事：
+//
+//   1. 三档下程序算出的结果完全一样（场景不许渗进语义）
+//   2. 同一份源码在 console 与 desktop 档下产出不同的 PE 子系统
+//      （靠外部脚本读文件头验证）
+//   3. service 档的 stdout 无缓冲，进程被杀时已输出的内容都留着
+//      （靠外部脚本硬杀进程验证）
+//
+// 1 在这里断言，2 和 3 由 tools/run_tests.sh 验证 —— 语言层面读不到
+// PE 头，也没法杀掉自己再检查输出，那都是工具链的事。
+//
+// 运行：x run profile_test.xle --profile=console
+//      x run profile_test.xle --profile=service
+//      x run profile_test.xle --profile=desktop
+//
+// 三档的 **stdout 必须逐字节相同**，这是「场景不改变语义」的直接证据。
+
+// ---- 1. 纯计算：与场景完全无关 ----
+//
+// 选一段涉及整数、浮点、字符串、数组的混合计算，任何一处因档位
+// 走偏都会被下面的断言抓到。
+var acc = 0
+for i in 1..50 {
+    acc += i * i
+}
+println(acc)                        // 40425（1..50 是半开区间：1..49）
+
+let f = 1.0 / 3.0
+println(f)                          // 0.3333333333333333
+
+let s = ""
+for i in 1..5 {
+    s = s + "ab"
+}
+println(s)                          // abababab（同上，4 次）
+println(len(s))                     // 8
+
+let arr = array(4, 0)
+for i in 0..4 {
+    arr[i] = i * 7
+}
+println(arr)                        // [0, 7, 14, 21]
+
+// ---- 2. 递归：验证栈深度设定不改变结果 ----
+//
+// 桌面档的 call_depth 是 8192、其余 4096。如果某个档位把深度算错，
+// 这段递归会算错或者崩掉 —— 而「崩掉」在两档下表现不同时，
+// AOT 一致性测试就会失败。
+fn fib(n: Int) -> Int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+println(fib(20))                    // 6765
+
+fn depth_sum(n: Int) -> Int {
+    if n == 0 { return 0 }
+    return n + depth_sum(n - 1)
+}
+println(depth_sum(200))             // 20100
+
+// ---- 3. 输出缓冲：验证 stdout 策略只影响「何时可见」 ----
+//
+// 这里刻意不测缓冲本身：要在进程被杀之后检查留下多少输出，程序
+// 自己做不到。那段验证放在 tools/run_tests.sh 里 —— 它单独编一个
+// 只输出半行（没有 \n 结尾）的程序，用 TerminateProcess 硬杀，
+// 再比 console 与 service 两档留下多少字节。
+//
+// 这里只确认「正常路径下三档输出一致」。
+
+println("profile ok")

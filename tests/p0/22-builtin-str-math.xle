@@ -1,0 +1,119 @@
+// ============================================================
+// 字符串与数学原语
+// ============================================================
+//
+// 字符串内建全部按 UTF-8 **码点**索引，不是字节。按字节切会让
+// 中文用户拿到「半个人」，而字节层错误在打印时表现为乱码，
+// 很难归因到下标。本测试的每个中文用例都在守这条线。
+//
+// 数学用单入口 math(op, ...)：op 是裸标识符，在编译期定下来，
+// 不往全局命名空间塞 25 个名字。
+
+fn main() -> Void {
+    // ---- 码点索引 ----
+    let s = "Hello, 世界!"
+    // "Hello, " 是 7 个码点，所以「世」在下标 7
+    println(strAt(s, 0))        // H
+    println(strAt(s, 7))        // 世
+    println(strAt(s, 8))        // 界
+    println(strAt(s, 9))        // !
+    println(len(s))             // 14 个码点（不是 17 字节）
+
+    println(strSub(s, 0, 5))    // Hello
+    println(strSub(s, 7, 9))    // 世界
+    println(strSub(s, 5, 99))   // , 世界!  （越界钳制）
+
+    // 查找返回码点下标
+    println(strFind(s, "世界"))  // 7
+    println(strFind(s, "zzz"))   // -1
+    println(strFindFrom("a,b,c,b", "b", 2))   // 2（下标 2 处就是 b；from 是包含的）
+
+    // split / join
+    let parts = strSplit("a,b,c", ",")
+    println(parts)              // [a, b, c]
+    println(len(parts))         // 3
+    println(strJoin(parts, "-"))// a-b-c
+    // 空分隔符按码点逐字切开（与 Python/JS 一致，不是把整串当一个元素）
+    println(strSplit("abc", ""))   // [a, b, c]
+
+    // 大小写（只处理 ASCII，中文与全角原样保留）
+    println(strUpper("aBc"))    // ABC
+    println(strLower("aBc"))    // abc
+    println(strUpper("中a文"))   // 中A文
+
+    // trim
+    println(strTrim("  hi  "))  // hi
+
+    // replace：空 from 原样返回（不是死循环，也不是插在每字符之间）
+    println(strReplace("aXbXc", "X", "--"))   // a--b--c
+    println(strReplace("abc", "", "-"))       // abc
+
+    // 前后缀
+    println(strStarts(s, "Hello"))  // true
+    println(strEnds(s, "!"))        // true
+    println(strStarts(s, "hello"))  // false
+
+    // repeat
+    println(strRepeat("ab", 3))     // ababab
+
+    // 码点与字符互转
+    println(strCode("世"))          // 19990
+    println(strFromCode(19990))     // 世
+    println(strCode(""))            // 0
+
+    // 解析：允许前导空白与符号，遇非数字停止
+    println(strParseInt("  -42xyz"))   // -42
+    println(strParseInt("abc"))        // 0
+    println(strParseFloat("3.5e2"))    // 350.0
+
+    println("----math----")
+
+    // abs 保持输入类型
+    println(math(abs, -3))      // 3     （Int）
+    println(math(abs, -3.5))    // 3.5   （Float）
+
+    println(math(pow, 2.0, 10.0))  // 1024.0
+    println(math(sqrt, 2.0))       // 1.4142135623730951
+    println(math(cbrt, 27.0))      // 3.0
+
+    // floor/ceil/round/trunc 返回 Int
+    println(math(floor, 3.7))   // 3
+    println(math(ceil, 3.2))    // 4
+    println(math(round, 3.5))   // 4
+    println(math(trunc, -3.7))  // -3
+    println(math(sign, -5.0))   // -1
+    println(math(sign, 0.0))    // 0
+    println(math(sign, 9.0))    // 1
+
+    // min/max/clamp 保持输入类型：全 Int 给 Int
+    println(math(min, 3, 8))            // 3
+    println(math(max, 3, 8))            // 8
+    println(math(clamp, 15, 0, 10))     // 10
+    println(math(min, 3.5, 8.0))        // 3.5
+    // clamp 的上下界反了也容错
+    println(math(clamp, 15, 10, 0))     // 10
+
+    // 三角与对数
+    println(math(sin, 0.0))     // 0.0
+    println(math(cos, 0.0))     // 1.0
+    println(math(atan2, 1.0, 1.0))  // 0.7853981633974483
+    println(math(log, 1.0))     // 0.0
+    println(math(log2, 8.0))    // 3.0
+    println(math(log10, 1000.0))// 3.0
+    println(math(exp, 0.0))     // 1.0
+    println(math(hypot, 3.0, 4.0))   // 5.0
+    println(math(fmod, 7.5, 2.0))    // 1.5
+
+    println("----random----")
+
+    // 同种子必须给出同一序列（可复现），不同调用必须不同
+    randomSeed(12345)
+    let r1 = random()
+    let r2 = random()
+    randomSeed(12345)
+    let r3 = random()
+    println(r1 == r3)           // true  （种子相同，序列相同）
+    println(r1 != r2)           // true  （同序列内前后不同）
+    println(r1 >= 0.0)          // true  （落在 [0,1)）
+    println(r1 < 1.0)           // true
+}

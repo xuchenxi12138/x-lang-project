@@ -1,0 +1,97 @@
+// ============================================================
+// 数组原语（标准库的基础设施）
+// ============================================================
+//
+// 这些内建必须先于标准库存在：X 没有结构体、没有指针、没有引用
+// 参数，纯 X 函数拿不到「原数组」并原地扩容 —— 只能返回新数组，
+// 于是 arrPush(a, x) 会退化成 a = arrPush(a, x)，既反直觉又容易
+// 漏赋值。所以推、插、删、填、排、反转全部做成内建。
+//
+// 本次重点验证「扩容」：array(n, fill) 建出来的 cap == n，
+// 第一次 push 就要触发 realloc，这里连推 100 个把 1.5 倍增长
+// 的路径走满（4→6→9→13→19→28→42→63→94→141）。
+
+fn mk3() -> Array {
+    let a = array(3, 0)
+    a[0] = 3
+    a[1] = 1
+    a[2] = 2
+    return a
+}
+
+fn main() -> Void {
+    let a = mk3()
+    println(a)                      // [3, 1, 2]
+
+    // push 返回新长度，可以直接用在条件里
+    println(arrPush(a, 9))          // 4
+    println(a)                      // [3, 1, 2, 9]
+
+    println(arrPop(a))              // 9
+    println(a)                      // [3, 1, 2]
+    println(len(a))                 // 3
+
+    // 在 len 处插入等价于追加（最常用的边界）
+    arrInsert(a, 0, 100)
+    println(a)                      // [100, 3, 1, 2]
+    arrInsert(a, 4, 200)
+    println(a)                      // [100, 3, 1, 2, 200]
+
+    // remove 返回被删掉的元素
+    println(arrRemove(a, 2))        // 1
+    println(a)                      // [100, 3, 2, 200]
+
+    // slice 左闭右开，与 for i in a..b 一致；越界钳制而不报错
+    println(arrSlice(a, 1, 3))      // [3, 2]
+    println(arrSlice(a, -5, 99))    // [100, 3, 2, 200]
+
+    println(arrConcat(mk3(), array(2, 7)))   // [3, 1, 2, 7, 7]
+
+    arrReverse(a)
+    println(a)                      // [200, 2, 3, 100]
+
+    println(arrIndexOf(a, 3))       // 2
+    println(arrIndexOf(a, 12345))   // -1
+    println(arrContains(a, 200))    // true
+    println(arrContains(a, 12345))  // false
+
+    // 排序用跨类型全序：null < Bool < 数值 < String < Array
+    arrSort(a)
+    println(a)                      // [2, 3, 100, 200]
+
+    // copy 是浅拷贝：改副本不影响原数组
+    let b = arrCopy(a)
+    b[0] = -1
+    println(a[0])                   // 2
+    println(b[0])                   // -1
+
+    // fill 原地覆写，返回 null
+    let z = array(3, 0)
+    arrFill(z, 7)
+    println(z)                      // [7, 7, 7]
+
+    // 字符串数组的引用计数：fill/push/slice 各持有一份，
+    // 这里反复操作后若计数错会崩或输出乱码
+    let strs = array(0, "")
+    arrPush(strs, "alpha")
+    arrPush(strs, "beta")
+    arrPush(strs, "gamma")
+    println(strs)                   // [alpha, beta, gamma]
+    println(arrSlice(strs, 1, 3))   // [beta, gamma]
+    println(arrConcat(strs, strs))  // [alpha, beta, gamma, alpha, beta, gamma]
+
+    // 扩容压力：连推 100 个
+    let grow = array(1, 0)
+    for i in 0..100 {
+        arrPush(grow, i * i)
+    }
+    println(len(grow))              // 101
+    println(grow[0])                // 0
+    println(grow[100])              // 9801
+
+    // 空数组的边界
+    let empty = array(0, 0)
+    println(len(empty))             // 0
+    println(arrPop(empty))          // null
+    println(arrSlice(empty, 0, 5))  // []
+}

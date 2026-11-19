@@ -1,0 +1,95 @@
+// tmp_smoke_xboot.xle — xboot 框架冒烟：扫描 / 注入 / 路由扫描 / 按名调用
+//
+// 不起 HTTP 服务（那部分 E2E 再验），只验证框架的编译与核心装配逻辑。
+// aot-skip：容器用 classNew/methodCall 按名实例化与分派，AOT 不支持。
+
+from "../../lib/xboot/xboot.xle" import XBoot, XBOOT_VERSION
+
+@Component
+class GreetService {
+    @Value("greet.prefix", "hello")
+    prefix: String
+
+    fn greet(name: String) -> String {
+        return self.prefix + ", " + name
+    }
+}
+
+@RestController
+@RequestMapping("/api")
+class GreetController {
+    @Autowired
+    svc: GreetService
+
+    @GetMapping("/hello/{name}")
+    fn hello(name: String) -> String {
+        return rOk(self.svc.greet(name))
+    }
+
+    @PostMapping("/echo")
+    fn echo(user: GreetService) -> String {
+        return rOk(user.prefix)
+    }
+}
+
+// 非 Bean 类 —— 不该被扫描进去
+class Plain {
+    fn hi() -> String { return "plain" }
+}
+
+fn main() -> Int {
+    // ── 1. 扫描 ──
+    let c = new Container()
+    let n = c.scan()
+    println("扫描到 Bean 数: " + toString(n))
+    if (n != 2) { fail("期望 2 个 Bean（GreetService + GreetController），实际 " + toString(n)) }
+
+    // ── 2. 实例化 + 注入 ──
+    c.instantiate()
+    let filled = c.inject()
+    println("注入字段数: " + toString(filled))
+    if (filled != 2) { fail("期望注入 2 个字段（prefix + svc），实际 " + toString(filled)) }
+
+    // @Value 默认值生效
+    let svc: GreetService = c.get("greetService")
+    let g = svc.greet("xboot")
+    println("注入调用: " + g)
+    if (g != "hello, xboot") { fail("greet 结果不对: " + g) }
+
+    // 控制器里的 @Autowired 也已填好
+    let ctrl: GreetController = c.get("greetController")
+    let g2 = ctrl.svc.greet("loop")
+    if (g2 != "hello, loop") { fail("控制器注入失败: " + g2) }
+
+    // ── 3. 路由扫描 ──
+    let router = new Router()
+    let rc = scanRoutes(c, router)
+    println("注册路由数: " + toString(rc))
+    if (rc != 2) { fail("期望 2 条路由，实际 " + toString(rc)) }
+    println(router.dumpRoutes())
+
+    // {name} → :name 转换验证
+    let m = router.route("GET", "/api/hello/tom")
+    if (!m.matched) { fail("/api/hello/tom 未命中") }
+    let id = m.paramOf("name", "")
+    if (id != "tom") { fail("路径参数绑定错: " + id) }
+    println("路径参数: name=" + id)
+
+    // ── 4. methodParams 反射 ──
+    let ps = methodParams("GreetController", "hello")
+    // 第 0 行是 self
+    if (len(ps) != 2) { fail("methodParams 应含 self + 1 参数，实际 " + toString(len(ps))) }
+    let row: Array = ps[1]
+    println("参数反射: " + toString(row[0]) + " : " + toString(row[1]))
+    if (toString(row[0]) != "name" || toString(row[1]) != "String") {
+        fail("参数元数据不对")
+    }
+
+    // ── 5. rOk 统一返回体 ──
+    let j = rOk(svc)
+    println("R 包装: " + j)
+    if (!strStarts(j, "{\"code\":0,")) { fail("rOk 形态不对") }
+
+    println("SMOKE OK")
+    return 0
+}

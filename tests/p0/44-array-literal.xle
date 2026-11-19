@@ -1,0 +1,81 @@
+// 44-array-literal.xle — 数组字面量 `[a, b, c]`
+//
+// 之前建数组只有 `array(n, fill)` 加逐下标赋值，写 `[1, 2, 3]` 是不行的。
+// 这在标准库里到处是噪音：`arr = array(3, 0); arr[0] = 1; ...`。
+//
+// ── 降级路径与两个必须记住的坑 ──────────────────────────
+//
+// 不新增指令，用 NEW_ARRAY + 若干 arrPush 拼出来。两个细节：
+//
+//   1. BC_NEW_ARRAY 要**两个**栈值（长度在下、填充值在上），
+//      所以建 0 长数组也要压两个 0。
+//   2. arrPush 是「弹掉数组和值，返回长度」—— 它把数组也弹了。
+//      所以每次 push 前必须 DUP 留住数组，push 后 POP 丢掉长度。
+//      漏了 DUP 的症状极具误导：数组变量变成 null，报错却是
+//      「len 只接受 String 或 Array，实际是 Null」，完全不指向
+//      数组字面量。
+
+fn sum(xs: Array) -> Int {
+    let t = 0
+    let i = 0
+    while i < len(xs) {
+        t = t + xs[i]
+        i = i + 1
+    }
+    return t
+}
+
+fn main() -> Int {
+    // ---- 1. 基本 ----
+    let a = [1, 2, 3]
+    println(len(a))               // 3
+    println(a[0])                 // 1
+    println(a[2])                 // 3
+    println(sum(a))               // 6
+
+    // ---- 2. 空数组 ----
+    let e = []
+    println(len(e))               // 0
+
+    // ---- 3. 单元素 ----
+    let one = [9]
+    println(len(one))             // 1
+    println(one[0])               // 9
+
+    // ---- 4. 表达式元素 ----
+    let n = 10
+    let b = [n, n * 2, n + 5]
+    println(b[1])                 // 20
+    println(b[2])                 // 15
+
+    // ---- 5. 各种元素类型 ----
+    let ss = ["a", "b"]
+    println(ss[1])                // b
+    let ff = [1.5, 2.5]
+    println(ff[0])                // 1.5
+    let bb = [true, false]
+    println(bb[0])                // true
+
+    // ---- 6. 嵌套 ----
+    let nest = [[1, 2], [3, 4]]
+    println(len(nest))            // 2
+    println(nest[1][0])           // 3
+    println(sum(nest[0]))         // 3
+
+    // ---- 7. 混合类型（动态数组允许）----
+    let mix = [1, "x", true]
+    println(len(mix))             // 3
+    println(mix[1])               // x
+
+    // ---- 8. 尾逗号 ----
+    let t = [1, 2, 3,]
+    println(len(t))               // 3
+
+    // ---- 9. 字面量当实参 ----
+    println(sum([1, 2, 3, 4]))    // 10
+
+    // ---- 10. 字面量参与运算 ----
+    println(len([1, 2]) + len([3]))   // 3
+
+    return 0
+}

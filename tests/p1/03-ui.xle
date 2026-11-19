@@ -1,0 +1,6 @@
+fn test()->void{
+     println("fuck you")
+}
+fn main(){
+    test()
+}

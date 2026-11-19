@@ -1,0 +1,245 @@
+// 42-css-style.xle — 样式对象（Style）+ 动画（Anim）+ 12 个绘制原语
+//
+// 这个测试回答一个问题：**开发者能不能像写 CSS 那样描述控件外观**
+// —— 位置、形状、圆角、旋转、缩放、透明度、渐变、动画、颜色。
+//
+// 注意本测试**不**开窗口：所有绘制走窗口运行时的空实现路径，
+// 断言只检查样式求值与几何，不检查像素。像素验收在 demo 里做。
+//
+// 但它**必须**证明一件事：那 12 个新原语在解释档、.xbc 往返、
+// AOT 三个通道上都能被调用而不崩 —— 这才是「底层能力真的存在」，
+// 而不只是「结构体里有这个字段」。
+
+from std.ui import uiHit, uiHitDown, uiTextCenter, uiTextInRect, uiTextLeft, uiButton, uiButtonEx, uiButtonPrimary, uiButtonDanger, uiButtonFlat, uiConsumeClick, uiCheckMark, uiCheck, uiCheckEx, uiRadioGroup, uiSlider, uiSliderLabeled, uiSliderEx, uiField, uiFieldLabeled, uiSeparator, uiPanel, uiPanelTitled, uiProgress, uiProgressLabeled, uiSeparatorEx, uiVRuleEx, uiPanelEx, uiPanelTitledEx, uiProgressEx, uiProgressLabeledEx, uiList, uiListScroll, uiCursor, uiCursorTake, uiModalBg, uiDialog, uiStatus, uiToolbar, uiFixed, Rect, Theme, Style, Anim, Button, Label, Panel, Progress, Cursor, Check, Slider, Frame, Widget, UiLabel, UiButton, UiPanel, UiProgress, UiCheck, UiSlider, UiTree, UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_NONE, UI_BTN_NORMAL, UI_BTN_PRIMARY, UI_BTN_DANGER
+
+fn main() -> Int {
+    // ============================================================
+    // 1. UI_NONE 哨兵：为什么不是 0
+    // ============================================================
+    //
+    // 0x000000 是合法的黑色。如果用它表示「不画」，黑色填充就
+    // 永远画不出来，而且症状是「设了黑色却没效果」—— 看起来像
+    // 圆角或裁剪出了问题，排查方向完全不搭。
+    println(UI_NONE)                    // -1
+    println(UI_NONE == 0x000000)        // false
+    println(Style.plain().fill == UI_NONE)   // true
+
+    // ============================================================
+    // 2. 链式派生：每个方法只改自己那个字段
+    // ============================================================
+    //
+    // 这是整个设计最容易出错的地方 —— 19 个字段，每个派生方法都要
+    // 把另外 18 个原样搬过去。漏一个的症状是「设了 A，B 莫名其妙
+    // 丢了」，而且只有用到 B 的控件才暴露。
+    let s0 = Style.plain()
+    let s1 = s0.fill(0x112233).radius(8).opacity(60)
+
+    println(s1.fill == 0x112233)        // true
+    println(s1.radius)                  // 8
+    println(s1.alpha)                   // 60
+
+    // 没碰过的字段必须保持原值
+    println(s1.border == UI_NONE)       // true
+    println(s1.borderW)                 // 1
+    println(s1.scale)                   // 100
+    println(s1.clip)                    // false
+
+    // 原值不可变：派生返回新值，s0 不受影响
+    println(s0.fill == UI_NONE)         // true
+    println(s0.radius)                  // 0
+    // 注意：结构体是值语义，s1 对 s0 的修改不会回传 —— 这正是
+    // 「样式是值」的表达，也是链式调用能任意顺序的理由。
+
+    // ============================================================
+    // 3. 三态填充的优先级：按下 > 悬停 > 常态
+    // ============================================================
+    //
+    // 所有平台的共同约定。搞反的症状是「按住鼠标时按钮跳回常态色」，
+    // 用户会立刻觉得手感不对但说不清哪不对。
+    let sb = Style.plain().fill(0x100).states(0x200, 0x300)
+    println(Style.fillFor(sb, false, false))   // 256  （0x100 常态）
+    println(Style.fillFor(sb, true,  false))   // 512  （0x200 悬停）
+    println(Style.fillFor(sb, true,  true))    // 768  （0x300 按下）
+
+    // 没设状态色时退回常态，而不是画出「无填充」
+    let sb2 = Style.plain().fill(0x100)
+    println(Style.fillFor(sb2, true, true))    // 256
+
+    // ============================================================
+    // 4. 透明度夹紧
+    // ============================================================
+    //
+    // 夹紧而不是报错：样式派生链上去一点不奇怪，为一个越界值
+    // 中断整个界面渲染没有意义。
+    println(s0.opacity(-20).alpha)      // 0
+    println(s0.opacity(0).alpha)        // 0
+    println(s0.opacity(100).alpha)      // 100
+    println(s0.opacity(250).alpha)      // 100
+
+    // ============================================================
+    // 5. 圆弧半径不会画出怪形状
+    // ============================================================
+    //
+    // radius 在 gui 层按 min(w,h)/2 夹紧（见 gui_win32.c 的
+    // xgui_fill_round）。所以给一个大半径只会变成胶囊，不会反向。
+    // 这里验证半径确实传下去了，夹紧由 AOT/解释两档共同保证。
+    let sr = s0.radius(999)
+    println(sr.radius)                  // 999 —— 值层不夹，夹在绘制层
+
+    // ============================================================
+    // 6. 变换：旋转与缩放
+    // ============================================================
+    let st = s0.rotate(45.0).scaleTo(150)
+    println(st.rotDeg)                  // 45.0
+    println(st.scale)                   // 150
+
+    // ============================================================
+    // 7. 缓动曲线的不变式
+    // ============================================================
+    //
+    // 三条曲线都必须满足 e(0)=0、e(1)=1 —— 这是动画不「跳」的前提。
+    // 任何一条破坏它，动画开头或结尾就会闪一下。
+    println(Anim.easeApply(0, 0.0))     // 0.0
+    println(Anim.easeApply(0, 1.0))     // 1.0
+    println(Anim.easeApply(1, 0.0))     // 0.0
+    println(Anim.easeApply(1, 1.0))     // 1.0
+    println(Anim.easeApply(2, 0.0))     // 0.0
+    println(Anim.easeApply(2, 1.0))     // 1.0
+    println(Anim.easeApply(3, 0.0))     // 0.0
+    println(Anim.easeApply(3, 1.0))     // 1.0
+
+    // 中点：线性 0.5，easeIn 慢起所以低于 0.5，easeOut 高于是 0.5
+    println(Anim.easeApply(0, 0.5))     // 0.5
+    println(Anim.easeApply(1, 0.5))     // 0.25
+    println(Anim.easeApply(2, 0.5))     // 0.75
+    println(Anim.easeApply(3, 0.5))     // 0.5  （分段曲线在中点对称）
+
+    // ============================================================
+    // 8. Anim 的边界行为
+    // ============================================================
+    //
+    // 时长 0 必须立刻完成，而不是除以 0 得到 NaN。
+    // 这是个真实场景：调用方按条件算时长，条件不满足时给 0，
+    // 期望「立刻到位」。
+    let a0 = Anim.at(0.0, 100.0, 0.0)
+    println(a0.progress())              // 1.0
+    println(a0.value())                 // 100.0
+    println(a0.done())                  // true
+
+    // 起止值怎么取：at(a, b, dur) 的 a 是起点、b 是终点
+    let a1 = Anim.at(20.0, 80.0, 0.5)
+    println(a1.a)                       // 20.0
+    println(a1.b)                       // 80.0
+    println(a1.dur)                     // 0.5
+
+    // 改缓动不改起止
+    let a2 = a1.withEase(1)
+    println(a2.ease)                    // 1
+    println(a2.a)                       // 20.0
+    println(a2.b)                       // 80.0
+
+    // 手动推迟开始：t0 改到未来 → progress 夹到 0
+    let a3 = Anim.at(0.0, 10.0, 1.0).startedAt(winTime() + 3600.0)
+    println(a3.progress())              // 0.0
+    println(a3.value())                 // 0.0
+    println(a3.done())                  // false
+
+    // ============================================================
+    // 9. 用动画驱动样式
+    // ============================================================
+    //
+    // 这是 Anim 存在的目的：把 0~1 的插值喂给样式字段。
+    let fade = Anim.at(0.0, 100.0, 0.0)         // 时长为 0 → 立刻到位
+    let sf = s0.animateAlpha(fade)
+    println(sf.alpha)                   // 100
+
+    let spin = Anim.at(0.0, 90.0, 0.0)
+    println(s0.animateRot(spin).rotDeg) // 90.0
+
+    let grow = Anim.at(50.0, 200.0, 0.0)
+    println(s0.animateScale(grow).scale) // 200
+
+    // ============================================================
+    // 10. 12 个绘制原语在 console 下必须能调（不崩）
+    // ============================================================
+    //
+    // 这一段的真正价值是**三档一致性**：解释档、.xbc 往返、AOT
+    // 都要跑过这里。任何一个通道漏了原语绑定，这里就会崩。
+    // 上一轮就吃过这个亏 —— gui_embed.h 没重新生成，解释档能跑、
+    // AOT 编不过，报 implicit declaration。
+    winFillRound(10, 10, 100, 40, 8, 0x3B82F6)
+    winBorderRound(10, 60, 100, 40, 8, 2, 0xFFFFFF)
+    winEllipse(10, 110, 60, 60, 0x22C55E)
+
+    // 路径要的是扁平点表 [x0,y0,x1,y1,...]。P0 没有 [] 字面量，
+    // 所以用 array(n, v) 建再逐位赋 —— 见 16-array 的说明。
+    let pts = array(6, 0)
+    pts[0] = 10
+    pts[1] = 180
+    pts[2] = 50
+    pts[3] = 200
+    pts[4] = 20
+    pts[5] = 230
+    winPath(pts, 0xEF4444)
+
+    winGradient(10, 240, 100, 40, 0x3B82F6, 0x9333EA, true)
+    winGradient(10, 290, 100, 40, 0x3B82F6, 0x9333EA, false)
+    winTextRot(10, 340, "旋转", 0xE8E8F0, 45.0)
+
+    winPushTransform(50.0, 50.0, 30.0, 1.5)
+    winPopTransform()
+
+    winAlpha(0.5)
+    winPopAlpha()
+
+    winClip(0, 0, 200, 200)
+    winUnclip()
+
+    println("primitives ok")
+
+    // ============================================================
+    // 11. Style.draw 跑完一整条绘制链
+    // ============================================================
+    //
+    // 这条路径里裁剪、透明度、阴影、变换、渐变、描边、文字全开，
+    // 是顺序最容易错的地方（阴影画在填充之后会被完全盖掉）。
+    let full = Style.fromTheme(Theme.dark())
+        .fill(0x2A2A33)
+        .states(0x34343F, 0x3E3E4C)
+        .border(0x3F3F4D, 1)
+        .radius(8)
+        .textColor(0xE8E8F0)
+        .gradient(0x3B82F6, 0x9333EA, true)
+        .opacity(85)
+        .rotate(12.0)
+        .scaleTo(120)
+        .withShadow(0x000000, 2, 4)
+
+    let box = Rect { x: 40, y: 40, w: 160, h: 48 }
+    Style.draw(full, box, true, false)
+    Style.render(full, box, "确定", true, false)
+    Style.drawBox(full, box)
+    Style.drawText(full, box, "确定", 8)
+    println("style ok")
+
+    // 空矩形与零尺寸必须直接返回，不进 GDI
+    let empty = Rect { x: 0, y: 0, w: 0, h: 0 }
+    println(empty.isEmpty())            // true
+    Style.draw(full, empty, true, true)
+    Style.render(full, empty, "x", true, true)
+    println("empty ok")
+
+    // ============================================================
+    // 12. 无样式（plain）不该画任何东西
+    // ============================================================
+    let none = Style.plain()
+    println(none.fill == UI_NONE)       // true
+    println(none.border == UI_NONE)     // true
+    println(none.shadow == UI_NONE)     // true
+    println(none.text == UI_NONE)       // true
+    none.render(box, "看不见", false, false)
+    println("plain ok")
+
+    println("css style ok")
+    return 0
+}

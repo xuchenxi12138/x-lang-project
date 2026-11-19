@@ -1,0 +1,284 @@
+// ui/control/searchbox.xle — 搜索框
+//
+// ── 为什么不用一个 Field 加个放大镜图标 ─────────────
+//
+// 因为搜索框有三个 Field 没有的行为：
+//
+//   1. 左侧固定一个放大镜（占位，影响光标起算位置）
+//   2. 右侧「清除」按钮（有内容时才出现，一点就清空）
+//   3. 回车提交（Field 只管字符编辑，不该知道「提交」这回事）
+//
+// 如果直接在 Field 上加这些，Field 就会长出 searchIcon / clearable /
+// onSubmit 这类只有一种控件用得到的字段，而 Field 是所有输入控件
+// 的基础 —— 让它变胖的代价是所有人承担。
+//
+// 所以 SearchBox **持有一个** Field 而不是继承它：这是「组合优于
+// 继承」在这里的具体体现。
+//
+// ── 为什么没有实时搜索 ────────────────────────
+//
+// 因为「每敲一个字就查一次」需要一个 debounce 定时器，而即时模式
+// 下没有可靠的后台计时（只有 winTime）。所以这里只提供「回车提交」
+// 和「点击提交」，防抖交给调用方在主循环里做。
+//
+//     如果 (sb.submitted()) { 执行搜索; sb.consume() }
+//
+// 这比在组件里藏一个定时器更好调试 —— 定时器的生命周期跨帧，
+// 而跨帧状态是即时 UI 里最容易出 bug 的地方。
+
+from "field.xle" import Field, FIELD_PAD
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 左侧图标区宽度。
+const SB_ICON_W = 26
+
+// 右侧清除按钮宽度。
+const SB_CLEAR_W = 24
+
+class SearchBox extends Widget {
+    // 内嵌的输入框。它的 r 由 SearchBox 在 draw/input 时同步。
+    //
+    // ── 为什么要同步而不是让调用方自己排 ─────────────
+    //
+    // 因为输入区的位置取决于「有没有清除按钮」，而那取决于当前
+    // 有没有内容 —— 这是 SearchBox 才知道的信息。让调用方算等于
+    // 把内部规则泄露出去，且每次内容变化都要重算。
+    field: Field,
+
+    // 占位提示。
+    placeholder: String,
+
+    // 是否已经提交（回车或点图标）。
+    //
+    // ── 为什么不给 onSubmit 回调 ───────────────────
+    //
+    // 语言没有闭包，回调只能是函数引用，而函数引用无法捕获「这次
+    // 搜索用哪个数据源」这类上下文。用「提交标志 + 消费」的模型，
+    // 调用方在主循环里读标志，上下文天然就在手边。
+    submittedFlag: Bool,
+
+    constructor(r: Rect, placeholder: String) {
+        self.r             = r
+        self.vis           = true
+        self.enabled       = true
+        self.focused       = false
+        self.hovered       = false
+        self.placeholder   = placeholder
+        self.submittedFlag = false
+        self.style         = Style.plain()
+        self.field         = new Field(self.inputRect(), "")
+        self.field.placeholder = placeholder
+    }
+
+    static fn of(r: Rect, placeholder: String) -> SearchBox {
+        return new SearchBox(r, placeholder)
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    fn iconRect() -> Rect {
+        return rectOf(self.r.x, self.r.y, SB_ICON_W, self.r.h)
+    }
+
+    fn clearRect() -> Rect {
+        let x = self.r.x + self.r.w - SB_CLEAR_W
+        return rectOf(x, self.r.y, SB_CLEAR_W, self.r.h)
+    }
+
+    // 输入区：左边让出图标，右边有内容时让出清除按钮。
+    fn inputRect() -> Rect {
+        let lx = self.r.x + SB_ICON_W
+        var rw = 0
+        if (len(self.text()) > 0) { rw = SB_CLEAR_W }
+        let w = self.r.w - SB_ICON_W - rw
+        if (w < 0) { w = 0 }
+        return rectOf(lx, self.r.y, w, self.r.h)
+    }
+
+    // ── 值 ─────────────────────────────────────
+
+    fn text() -> String {
+        return self.field.value()
+    }
+
+    fn setText(s: String) -> SearchBox {
+        self.field.setValue(s)
+        self.field.cursorEnd()
+        return self
+    }
+
+    fn clear() -> SearchBox {
+        self.setText("")
+        return self
+    }
+
+    fn hasText() -> Bool {
+        return len(self.field.value()) > 0
+    }
+
+    // ── 提交模型 ─────────────────────────────────
+
+    fn submit() -> SearchBox {
+        self.submittedFlag = true
+        return self
+    }
+
+    fn submitted() -> Bool {
+        return self.submittedFlag
+    }
+
+    // 消费掉提交标志。调用方处理完搜索后必须调它，否则每帧都会
+    // 重复搜索 —— 这是「标志 + 消费」模型唯一的纪律要求。
+    fn consume() {
+        self.submittedFlag = false
+    }
+
+    // ── 键盘与鼠标 ────────────────────────────────
+
+    // 输入一个字符。由调用方在键盘事件里转发。
+    fn typeKey(ch: String) -> Bool {
+        let changed = self.field.insert(ch)
+        return changed
+    }
+
+    // 特殊键。返回 true 表示已被消费。
+    fn keyDown(key: String) -> Bool {
+        if (key == "Enter") {
+            self.submit()
+            return true
+        }
+        if (key == "Escape") {
+            if (self.hasText()) {
+                self.clear()
+                return true
+            }
+            return false
+        }
+        if (key == "Backspace") {
+            self.field.backspace()
+            return true
+        }
+        if (key == "Delete") {
+            self.field.deleteForward()
+            return true
+        }
+        if (key == "Left")  { self.field.moveLeft(false);  return true }
+        if (key == "Right") { self.field.moveRight(false); return true }
+        if (key == "Home")  { self.field.moveHome(false);  return true }
+        if (key == "End")   { self.field.moveEnd(false);   return true }
+        return false
+    }
+
+    // 处理一次点击。返回 true 表示已被消费。
+    //
+    // 三块区域的优先级：清除按钮 > 图标（提交）> 输入区。
+    // 先判清除是因为它压在最右边，如果先判输入区，那块区域会
+    // 「点得到清除按钮的边但 Act 成光标定位」。
+    fn click(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+        if (!self.r.contains(mx, my)) { return false }
+
+        if (self.hasText() && self.clearRect().contains(mx, my)) {
+            self.clear()
+            self.focused = true
+            return true
+        }
+
+        if (self.iconRect().contains(mx, my)) {
+            self.submit()
+            self.focused = true
+            return true
+        }
+
+        // 输入区：定位光标。
+        self.focused = true
+        self.field.focused = true
+        self.field.clickAt(mx, my, false)
+        return true
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // ── 1. 外框 ──
+        //
+        // 焦点态用主色边框，和 Field 保持一致 —— 搜索框看起来
+        // 应该就是「一个带装饰的输入框」，而不是另一种东西。
+        var borderC = th.border
+        if (!self.enabled) {
+            borderC = th.border
+        } else if (self.focused) {
+            borderC = th.accent
+        } else if (self.hovered) {
+            borderC = th.surfaceActive
+        }
+
+        var bg = th.surface
+        if (!self.enabled) { bg = th.bg }
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, bg)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, borderC)
+
+        // ── 2. 放大镜 ──
+        //
+        // 圆 + 一根斜柄。不用字符 "🔍"：emoji 在窗口层里能不能
+        // 显示完全不可控，而且宽度是双倍字符宽，会让左侧留白失控。
+        let ir = self.iconRect()
+        let cx = ir.x + ir.w / 2 - 3
+        let cy = ir.y + ir.h / 2 - 3
+        let ic = th.textDim
+        if (self.focused) { ic = th.accent }
+
+        // 圆环：外圆 + 内圆（内圆用底色，形成描边效果）。
+        winEllipse(cx - 4, cy - 4, 9, 9, ic)
+        winEllipse(cx - 3, cy - 3, 7, 7, bg)
+        // 柄：三点四边形，斜向 45°。
+        let pts = [cx + 4, cy + 4,  cx + 6, cy + 2,  cx + 7, cy + 3,  cx + 5, cy + 5]
+        winPath(pts, ic)
+
+        // ── 3. 输入区 ──
+        //
+        // 同步内嵌 Field 的几何与状态，再交给它自己画。
+        // 这是组合的关键：SearchBox 不需要知道怎么画光标、怎么
+        // 画选区，只把矩形算对就行。
+        self.field.r       = self.inputRect()
+        self.field.focused = self.focused
+        self.field.hovered = self.hovered
+        self.field.enabled = self.enabled
+        self.field.draw(th)
+
+        // ── 4. 清除按钮 ──
+        //
+        // 只在有内容时出现。悬停在那块区域时变红，提示「点了会
+        // 丢掉你输的东西」。
+        if (self.hasText()) {
+            let cr = self.clearRect()
+            let mx = winMouseX()
+            let my = winMouseY()
+            let onIt = cr.contains(mx, my)
+            let cc = th.textDim
+            if (onIt) { cc = th.err }
+
+            // 叉：两条对角四边形，交于清除区中心。
+            let ex = cr.x + cr.w / 2
+            let ey = cr.y + cr.h / 2
+            let t = 1
+            let d = 4
+            self.slash(ex - d, ey - d, ex + d, ey + d, t, cc)
+            self.slash(ex - d, ey + d, ex + d, ey - d, t, cc)
+        }
+    }
+
+    // 一条对角斜线（用四边形近似）。和 check.xle 的 thickLine
+    // 同一个思路，只是这里允许斜向任意角度。
+    fn slash(x0: Int, y0: Int, x1: Int, y1: Int, t: Int, c: Int) {
+        let pts = [x0, y0 - t,  x1, y1 - t,  x1, y1 + t,  x0, y0 + t]
+        winPath(pts, c)
+    }
+}

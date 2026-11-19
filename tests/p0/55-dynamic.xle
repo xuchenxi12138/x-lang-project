@@ -1,0 +1,160 @@
+// 55-dynamic.xle — 动态调用：classAll / 按名查注解 / classNew / methodCall
+//
+// aot-skip —— 动态调用指令（BC_NEW_CLASS_NAME / BC_CALL_NAME）与
+// 「按名查注解」目前只在解释器路径实现；AOT 侧需要函数指针表，
+// 是一个独立的工作项（见 codegen_c.c 的 TODO）。
+//
+// ── 这三个能力是给框架用的，测试要按框架的视角写 ────────────
+//
+// 注解驱动的框架（IoC 容器、路由）分三步走：
+//
+//   1. classAll()          拿到全部类名（扫描的起点）
+//   2. anno*(类名, ...)    过滤出带 @Component / @RestController 的类
+//                          —— 只有类名，还没有实例，所以查询必须
+//                          收「类名字符串」这个形态
+//   3. classNew(类名)      命中的才实例化，methodCall(实例, 方法名)
+//                          做运行时分派
+//
+// 第 2 步如果要求先实例化才能查注解，构造函数就会带着尚未注入的
+// 依赖跑起来 —— 顺序整个反了。这就是「为什么除了实例还要收类名」。
+//
+// ── 多态不能因为换了个入口就消失 ───────────────────────────
+//
+// methodCall 与 BC_VIRT_CALL 走同一条派发路径：按接收者的**实际
+// 类**查虚表。容器里存的 bean 类型是接口，分派时必须落到实现类。
+
+@Component
+@Service
+class GreetService {
+    private prefix: String,
+
+    constructor() { self.prefix = "hello" }
+
+    fn greet(name: String) -> String { return self.prefix + ", " + name }
+
+    fn secret() -> String { return "hidden" }
+
+    fn add(a: Int, b: Int) -> Int { return a + b }
+}
+
+@RestController
+class GreetController {
+    svc: GreetService,
+
+    constructor() { self.svc = new GreetService() }
+
+    @GetMapping("/greet")
+    fn greet() -> String { return self.svc.greet("world") }
+
+    fn calc(a: Int) -> Int { return self.svc.add(a, 10) }
+}
+
+class Animal {
+    fn speak() -> String { return "..." }
+}
+
+class Dog extends Animal {
+    fn speak() -> String { return "woof" }
+}
+
+class Cat extends Animal {
+    fn speak() -> String { return "meow" }
+}
+
+// 没有任何注解的类 —— 扫描器应该把它过滤掉
+class NotABean {
+    n: Int,
+
+    constructor() { self.n = 1 }
+}
+
+// 带构造实参的类 —— 验证 classNew 的第二形态
+class Pair {
+    a: Int,
+    b: Int,
+
+    constructor(x: Int, y: Int) {
+        self.a = x
+        self.b = y
+    }
+
+    fn sum() -> Int { return self.a + self.b }
+}
+
+fn main() {
+    // ---- 1. 扫描：classAll + 按名查注解 ----
+    println("-- 扫描 --")
+    let names = classAll()
+    println("class count: " + toString(len(names)))
+
+    let beans = 0
+    for cn in names {
+        if annoHas(cn, "class", "", "Component") {
+            println("bean: " + cn)
+            beans = beans + 1
+        }
+    }
+    println("beans found: " + toString(beans))
+
+    // 按名查到的元数据要和按实例查到的一致
+    let u = new Dog()
+    println("by name  : " + toString(annoHas("Dog", "class", "", "Component")))
+    println("by inst  : " + toString(annoHas(u, "class", "", "Component")))
+    println("name==inst: " + toString(className(u) == "Dog"))
+
+    // 按名查方法注解（路由扫描就是这个姿势）
+    println("greet anno: " + annoGet("GreetController", "method", "greet", "GetMapping"))
+
+    // 按名列方法 / 字段
+    println("methods   : " + classMethods("Animal"))
+    println("fields    : " + classFields("NotABean"))
+
+    // ---- 2. 实例化：classNew ----
+    println("-- 实例化 --")
+    let svc = classNew("GreetService")
+    println("made: " + className(svc))
+    println("greet via fieldGet: " + methodCall(svc, "greet", ["ann"]))
+
+    // 带构造实参（实参数组按元素展开）
+    let p = classNew("Pair", [3, 4])
+    println("pair: " + methodCall(p, "sum", []))
+
+    // 接口不能实例化（如果存在接口的话这里才有效果，
+    // 这个文件没有接口 —— 只验证实例化普通类）
+
+    // ---- 3. 分派：methodCall ----
+    println("-- 分派 --")
+    let a = new Animal()
+    let d = new Dog()
+    let c = new Cat()
+    // 同一个方法名，三个实际类 —— 必须各自落到自己的实现
+    println("animal: " + methodCall(a, "speak", []))
+    println("dog   : " + methodCall(d, "speak", []))
+    println("cat   : " + methodCall(c, "speak", []))
+
+    // 存在「Animal 类型的变量」里时也一样（运行时看实际类）
+    let zoo = [a, d, c]
+    let i = 0
+    while i < len(zoo) {
+        println("zoo[" + toString(i) + "]: " + methodCall(zoo[i], "speak", []))
+        i = i + 1
+    }
+
+    // 带实参的分派
+    println("calc: " + methodCall(new GreetController(), "calc", [5]))
+
+    // ---- 4. 框架式组装：注解 → 实例 → 调用 ----
+    println("-- 组装 --")
+    let ctrlName = ""
+    for cn in names {
+        if annoHas(cn, "class", "", "RestController") {
+            ctrlName = cn
+        }
+    }
+    let ctrl = classNew(ctrlName)
+    println("route: " + annoGet(ctrlName, "method", "greet", "GetMapping")[0]
+            + " -> " + methodCall(ctrl, "greet", []))
+
+    // 按名字调不到不存在的方法（普通报错，不是崩）
+    println("done")
+}

@@ -1,0 +1,314 @@
+// ui/display/stepper.xle — 步骤条
+//
+// ── 步骤条不只是「几个圆圈连起来」 ───────────────────
+//
+// 它要回答三个问题：
+//
+//   1. 我走到第几步了（进度）
+//   2. 每一步叫什么（标签）
+//   3. 哪些步骤失败了（异常态）
+//
+// 前两个是必答项，第三个是加分项 —— 但一个真正可用的步骤条必须
+// 有第三个：审批流程里「第 2 步被驳回」和「第 2 步还没开始」在
+// 视觉上必须能区分，否则用户会以为流程卡住了。
+//
+// ── 三种布局 ───────────────────────────────────
+//
+//   STEP_HORIZONTAL —— 横向（向导、表单分步）
+//   STEP_VERTICAL   —— 纵向（时间线、审批流）
+//
+// 横向适合「步骤少、标签短」，纵向适合「步骤多、标签长」。
+// 用同一个类通过 vertical 切换。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 步骤状态。
+const STEP_DONE    = 0   // 已完成
+const STEP_CURRENT = 1   // 进行中
+const STEP_TODO    = 2   // 未开始
+const STEP_ERROR   = 3   // 失败
+
+// 圆点直径。
+const STEP_DOT = 24
+
+// 横向布局时标签与圆点的垂直间距。
+const STEP_LABEL_GAP = 6
+
+class Stepper extends Widget {
+    // 步骤标签。
+    labels: Array,
+
+    // 每步的状态（STEP_* 值）。
+    states: Array,
+
+    // 是否纵向。
+    vertical: Bool,
+
+    // 圆点之间的连线颜色是否按完成状态变色。
+    colorLine: Bool,
+
+    constructor(r: Rect, labels: Array) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.labels    = labels
+        self.states    = []
+        self.vertical  = false
+        self.colorLine = true
+        self.style     = Style.plain()
+
+        // 默认：全部未开始。
+        let st = []
+        var i = 0
+        while i < len(labels) {
+            arrPush(st, STEP_TODO)
+            i = i + 1
+        }
+        self.states = st
+    }
+
+    static fn of(r: Rect, labels: Array, current: Int) -> Stepper {
+        let s = new Stepper(r, labels)
+        s.setCurrent(current)
+        return s
+    }
+
+    static fn verticalOf(r: Rect, labels: Array, current: Int) -> Stepper {
+        let s = new Stepper(r, labels)
+        s.vertical = true
+        s.setCurrent(current)
+        return s
+    }
+
+    // 把前 current 步标为已完成、第 current 步标为进行中。
+    fn setCurrent(c: Int) -> Stepper {
+        let st = []
+        var i = 0
+        while i < len(self.labels) {
+            if (i < c) {
+                arrPush(st, STEP_DONE)
+            } else if (i == c) {
+                arrPush(st, STEP_CURRENT)
+            } else {
+                arrPush(st, STEP_TODO)
+            }
+            i = i + 1
+        }
+        self.states = st
+        return self
+    }
+
+    // 标记某一步失败。
+    fn setState(i: Int, s: Int) -> Stepper {
+        if (i >= 0 && i < len(self.states)) {
+            self.states[i] = s
+        }
+        return self
+    }
+
+    // ── 状态色 ────────────────────────────────────
+
+    fn stateColor(th: Theme, i: Int) -> Int {
+        if (i < 0 || i >= len(self.states)) { return th.border }
+        let s = toInt(self.states[i])
+        if (s == STEP_DONE)    { return th.ok }
+        if (s == STEP_CURRENT) { return th.accent }
+        if (s == STEP_ERROR)   { return th.err }
+        return th.border
+    }
+
+    // 圆点里显示什么：完成 ✓、失败 ✗、当前数字、未开始数字。
+    fn dotMark(i: Int) -> String {
+        if (i < 0 || i >= len(self.states)) { return "" }
+        let s = toInt(self.states[i])
+        if (s == STEP_DONE)  { return "v" }
+        if (s == STEP_ERROR) { return "x" }
+        return toString(i + 1)
+    }
+
+    // ── 几何 ────────────────────────────────────
+    //
+    // 横向：圆点均匀分布在整个宽度上，标签在圆点下方。
+    // 纵向：圆点在左侧一列，标签在右侧。
+
+    // 第 i 个圆点的中心 x（横向）。
+    fn dotCx(i: Int) -> Int {
+        let n = len(self.labels)
+        if (n <= 0) { return self.r.x }
+        if (n == 1) { return self.r.x + self.r.w / 2 }
+        // 均匀分布：第 i 个在 (i + 0.5) / n 处。
+        //
+        // 用整数算术避免浮点：cx = x + w * (2i+1) / (2n)。
+        return self.r.x + self.r.w * (2 * i + 1) / (2 * n)
+    }
+
+    // 第 i 个圆点的中心 y（纵向）。
+    fn dotCy(i: Int) -> Int {
+        let n = len(self.labels)
+        if (n <= 0) { return self.r.y }
+        if (n == 1) { return self.r.y + STEP_DOT / 2 }
+        return self.r.y + i * (STEP_DOT + 28) + STEP_DOT / 2
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        let n = len(self.labels)
+        if (n <= 0) { return }
+
+        if (self.vertical) {
+            self.drawVertical(th)
+        } else {
+            self.drawHorizontal(th)
+        }
+    }
+
+    fn drawHorizontal(th: Theme) {
+        let n = len(self.labels)
+        let cy = self.r.y + STEP_DOT / 2
+
+        // ── 1. 连线（先画，压在圆点下面）──
+        //
+        // 相邻圆点之间画一条横线。颜色按「左侧那一步是否完成」定。
+        var i = 0
+        while i < n - 1 {
+            let x0 = self.dotCx(i) + STEP_DOT / 2
+            let x1 = self.dotCx(i + 1) - STEP_DOT / 2
+            if (x1 > x0) {
+                var lc = th.border
+                if (self.colorLine && toInt(self.states[i]) == STEP_DONE) {
+                    lc = th.ok
+                }
+                winFillRect(x0, cy - 1, x1 - x0, 2, lc)
+            }
+            i = i + 1
+        }
+
+        // ── 2. 圆点 ──
+        i = 0
+        while i < n {
+            let cx = self.dotCx(i)
+            let ac = self.stateColor(th, i)
+            let done = toInt(self.states[i]) == STEP_DONE
+            let cur = toInt(self.states[i]) == STEP_CURRENT
+
+            if (done || cur) {
+                // 完成/当前：实心圆。
+                winEllipse(cx - STEP_DOT / 2, cy - STEP_DOT / 2,
+                           STEP_DOT, STEP_DOT, ac)
+            } else {
+                // 未开始：空心圆（外圈边框色 + 内填面板色）。
+                winEllipse(cx - STEP_DOT / 2, cy - STEP_DOT / 2,
+                           STEP_DOT, STEP_DOT, th.border)
+                winEllipse(cx - STEP_DOT / 2 + 1, cy - STEP_DOT / 2 + 1,
+                           STEP_DOT - 2, STEP_DOT - 2, th.surface)
+            }
+
+            // 圆点内的标记。
+            let dotR = rectOf(cx - STEP_DOT / 2, cy - STEP_DOT / 2,
+                              STEP_DOT, STEP_DOT)
+            var mc = th.textDim
+            if (done || cur) { mc = th.onAccent }
+            uiTextInRect(dotR, self.dotMark(i), mc)
+
+            // ── 3. 标签（圆点下方）──
+            let lw = self.r.w / n
+            let lr = rectOf(cx - lw / 2, cy + STEP_DOT / 2 + STEP_LABEL_GAP,
+                            lw, winTextHeight() + 4)
+            var label = toString(self.labels[i])
+            if (winTextWidth(label) > lw - 4) {
+                label = uiEllipsize(label, lw - 4)
+            }
+            var lc = th.textDim
+            if (cur) { lc = th.text }
+            if (toInt(self.states[i]) == STEP_ERROR) { lc = th.err }
+            uiTextInRect(lr, label, lc)
+
+            i = i + 1
+        }
+    }
+
+    fn drawVertical(th: Theme) {
+        let n = len(self.labels)
+        let cx = self.r.x + STEP_DOT / 2
+
+        // ── 1. 竖向连线 ──
+        var i = 0
+        while i < n - 1 {
+            let y0 = self.dotCy(i) + STEP_DOT / 2
+            let y1 = self.dotCy(i + 1) - STEP_DOT / 2
+            if (y1 > y0) {
+                var lc = th.border
+                if (self.colorLine && toInt(self.states[i]) == STEP_DONE) {
+                    lc = th.ok
+                }
+                winFillRect(cx - 1, y0, 2, y1 - y0, lc)
+            }
+            i = i + 1
+        }
+
+        // ── 2. 圆点 + 标签 ──
+        i = 0
+        while i < n {
+            let cy = self.dotCy(i)
+            let ac = self.stateColor(th, i)
+            let done = toInt(self.states[i]) == STEP_DONE
+            let cur = toInt(self.states[i]) == STEP_CURRENT
+
+            if (done || cur || toInt(self.states[i]) == STEP_ERROR) {
+                winEllipse(cx - STEP_DOT / 2, cy - STEP_DOT / 2,
+                           STEP_DOT, STEP_DOT, ac)
+            } else {
+                winEllipse(cx - STEP_DOT / 2, cy - STEP_DOT / 2,
+                           STEP_DOT, STEP_DOT, th.border)
+                winEllipse(cx - STEP_DOT / 2 + 1, cy - STEP_DOT / 2 + 1,
+                           STEP_DOT - 2, STEP_DOT - 2, th.surface)
+            }
+
+            let dotR = rectOf(cx - STEP_DOT / 2, cy - STEP_DOT / 2,
+                              STEP_DOT, STEP_DOT)
+            var mc = th.textDim
+            if (done || cur || toInt(self.states[i]) == STEP_ERROR) {
+                mc = th.onAccent
+            }
+            uiTextInRect(dotR, self.dotMark(i), mc)
+
+            // 标签在圆点右侧。
+            let tx = cx + STEP_DOT / 2 + 12
+            let tw = self.r.x + self.r.w - tx - 8
+            if (tw > 0) {
+                let lr = rectOf(tx, cy - winTextHeight() / 2, tw, winTextHeight())
+                var label = toString(self.labels[i])
+                if (winTextWidth(label) > tw) {
+                    label = uiEllipsize(label, tw)
+                }
+                var lc = th.textDim
+                if (cur) { lc = th.text }
+                if (toInt(self.states[i]) == STEP_ERROR) { lc = th.err }
+                uiTextLeft(lr, label, 0, lc)
+            }
+
+            i = i + 1
+        }
+    }
+
+    // 所需的高度（纵向布局时由调用方在布局阶段问）。
+    fn measureH() -> Int {
+        let n = len(self.labels)
+        if (n <= 0) { return 0 }
+        if (!self.vertical) { return STEP_DOT + STEP_LABEL_GAP + winTextHeight() + 8 }
+        return n * (STEP_DOT + 28)
+    }
+
+    fn hit(mx: Int, my: Int) -> Bool {
+        return false
+    }
+}

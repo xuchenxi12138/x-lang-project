@@ -1,0 +1,88 @@
+---- 状态码原因短语 ----
+OK
+Created
+No Content
+Moved Permanently
+Not Found
+Internal Server Error
+Unknown
+---- 请求行解析 ----
+GET
+/hello
+[]
+HTTP/1.1
+a
+---- 查询串 ----
+/api
+x=1&y=2
+4
+1
+2
+def
+---- 查询串细节 ----
+8
+[]
+[]
+1
+1
+---- 查询串整数 ----
+42
+-1
+-1
+-7
+---- 请求头 ----
+POST
+text/plain
+A B
+5
+none
+---- body ----
+hello
+5
+GET
+/n
+0
+0
+!
+---- 分块编码 ----
+[hello world]
+---- URL 解码（ASCII） ----
+[abc]
+[a b]
+[ ]
+[A]
+[%zz]
+---- URL 解码（中文，逐字节） ----
+[张三]
+[中文]
+[a中b]
+---- URL 编码 ----
+abc
+a%20b
+a%26b%3Dc
+%E5%BC%A0%E4%B8%89
+true
+---- 字节互转 ----
+3
+228
+184
+173
+中
+0
+---- 响应解析 ----
+200
+text/plain
+hi
+-1
+true
+---- 路由表 ----
+1
+1
+-1
+2
+3
+-1
+---- 客户端 URL 校验 ----
+-1
+true
+http module ok

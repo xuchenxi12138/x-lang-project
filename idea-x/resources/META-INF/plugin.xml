@@ -1,0 +1,47 @@
+<idea-plugin>
+  <id>com.xlang.idea</id>
+  <name>X Language</name>
+  <version>0.3.3</version>
+  <vendor>x-lang</vendor>
+  <description><![CDATA[
+    X 语言的 IDEA 支持：语法高亮、代码补全、ctrl+点击 / ctrl+B 跳转到定义。
+    <br><br>
+    词表由编译器源码生成（lexer.c / bytecode.c），英文与中文关键字（.xle / .xlc）同时支持。
+  ]]></description>
+
+  <depends>com.intellij.modules.platform</depends>
+  <!-- 手工编译产物固定对 2024.1（241.*）构建，避免平台版本漂移 -->
+  <idea-version since-build="241" until-build="241.*"/>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <!-- 文件类型：.xle 英文源码 / .xlc 中文源码 -->
+    <fileType name="X source"
+              implementationClass="com.xlang.idea.XFileType"
+              fieldName="INSTANCE"
+              language="X"
+              extensions="xle;xlc"/>
+
+    <!-- 平坦 PSI（词法级，见 XParserDefinition 的取舍注释） -->
+    <lang.parserDefinition language="X"
+                           implementationClass="com.xlang.idea.XParserDefinition"/>
+
+    <!-- 语法高亮 -->
+    <lang.syntaxHighlighterFactory language="X"
+                                   implementationClass="com.xlang.idea.XSyntaxHighlighterFactory"/>
+
+    <!-- 颜色设置页（设置 → 编辑器 → 配色方案 → X 语言） -->
+    <colorSettingsPage implementation="com.xlang.idea.XColorSettingsPage"/>
+
+    <!-- 代码补全 -->
+    <completion.contributor language="X"
+                            implementationClass="com.xlang.idea.XCompletionContributor"/>
+
+    <!-- ctrl+点击 / ctrl+B 跳转到定义 -->
+    <psi.referenceContributor language="X"
+                              implementationClass="com.xlang.idea.XReferenceContributor"/>
+
+    <!-- ctrl+/ 行注释开关 -->
+    <lang.commenter language="X"
+                    implementationClass="com.xlang.idea.XCommenter"/>
+  </extensions>
+</idea-plugin>

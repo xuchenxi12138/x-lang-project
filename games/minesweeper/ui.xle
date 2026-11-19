@@ -1,0 +1,519 @@
+// ui.xle — 扫雷的界面与交互层
+//
+// 依赖 board.xle 的全部棋盘逻辑，本文件只负责：
+//   · 画界面
+//   · 处理鼠标
+//   · 胜负与计时
+//   · 重开 / 切难度
+//
+// ── 即时模式（immediate mode）的含义 ──────────────────────
+//
+// 每帧都从零重画：没有控件树、没有「格子对象」、没有回调。
+// 整个程序的状态只活在下面这批数组里，窗口系统那边什么都不存。
+//
+// 这样做的好处是「状态只有一份」。如果按传统控件方式做，窗口里
+// 存一份格子状态、X 语言里再存一份，任何一次漏同步都会表现为
+// 「显示的和实际的不一致」—— 那种 bug 极难复现也极难定位。
+//
+// 代价是每帧都要重新决定「该画什么」。对这个规模完全不是问题：
+// 480 格 × 每格 2 个矩形 = 每帧不到 1000 次 GDI 调用。
+
+from "board.xle" import rng_seed, rng_next, rng_below, board_new, b_idx, b_mine, b_open, b_flag, b_num, b_set_mine, b_set_open, b_set_flag, b_dead, b_inside, board_place_mines, board_count, board_open, board_flag, board_check_win, board_flags_left, board_opened_count, board_state, DIFF_BEGINNER_W, DIFF_BEGINNER_H, DIFF_BEGINNER_M, DIFF_INTER_W, DIFF_INTER_H, DIFF_INTER_M, DIFF_EXPERT_W, DIFF_EXPERT_H, DIFF_EXPERT_M, B_W, B_H, B_MINES, B_MINE, B_OPEN, B_FLAG, B_NUM, B_STATE, B_DEAD, ST_PLAY, ST_WIN, ST_LOSE
+
+// ============================================================
+// 布局常量
+// ============================================================
+
+const CELL     = 26     // 单元格边长（像素）
+const PAD      = 12     // 棋盘四周留白
+const HEADER   = 56     // 顶部信息栏高度
+const MINES_H  = 72     // 窗口高度 = HEADER + 棋盘 + 底部按钮区
+const FOOTER   = 44
+
+// ── 控件尺寸 ────────────────────────────────────────────────
+//
+// 这几个数值同时被「绘制」和「命中判定」使用，所以必须只有一份。
+//
+// 踩过的坑：最初绘制侧写 `bw = 44`、判定侧写 `bw = 40`，都是字面量。
+// 表现是表情按钮右边 4 像素点不动 —— 视觉上按钮就在那儿，点下去
+// 没反应。这类 bug 不会报错，只能靠人试出来，而且一旦有人调了
+// 其中一处的数值就会重新出现。
+//
+// 提成共同的常量之后，「改一处、两边同步」变成编译器保证的事。
+const FACE_W   = 44     // 表情（重开）按钮边长
+const BTN_W    = 78     // 难度按钮宽
+const BTN_H    = 26     // 难度按钮高
+const BTN_GAP  = 8      // 难度按钮间距
+
+// 九种数字的颜色。和主流扫雷的配色一致：
+// 蓝、绿、红、深蓝、棕、青、黑、灰。这些不是随便挑的 ——
+// 玩家多年形成的肌肉记忆值得尊重。
+const C_N1 = 0x3B82F6
+const C_N2 = 0x22C55E
+const C_N3 = 0xEF4444
+const C_N4 = 0x6366F1
+const C_N5 = 0x92400E
+const C_N6 = 0x0891B2
+const C_N7 = 0x111827
+const C_N8 = 0x6B7280
+
+// 界面色板。整体取深色，与窗口默认背景一致，
+// 避免「窗口刷一下深色再刷成浅色」的闪烁感。
+const C_BG        = 0x1E1E24
+const C_PANEL     = 0x2A2A33
+// 格子三态。深浅差要够大才分得清「翻没翻开」，但太大又会显得
+// 棋盘像块电路板 —— 所以取「未翻开明显更亮、已翻开沉下去」这个
+// 关系，同时把两者的色相都压在同一支（蓝灰）上，避免出现
+// 一块偏蓝一块偏灰的跳色。
+const C_CELL_UP   = 0x484858    // 未翻开
+const C_CELL_UP_H = 0x56566A    // 未翻开（悬停）
+const C_CELL_DN   = 0x24242C    // 已翻开
+const C_GRID      = 0x30303A
+const C_TEXT      = 0xE8E8F0
+const C_DIM       = 0x9A9AA8
+const C_RED       = 0xEF4444
+const C_FLAG      = 0xF59E0B
+const C_WIN       = 0x22C55E
+
+// ============================================================
+// 数字颜色
+// ============================================================
+
+fn num_color(n: Int) -> Int {
+    if n == 1 { return C_N1 }
+    if n == 2 { return C_N2 }
+    if n == 3 { return C_N3 }
+    if n == 4 { return C_N4 }
+    if n == 5 { return C_N5 }
+    if n == 6 { return C_N6 }
+    if n == 7 { return C_N7 }
+    return C_N8
+}
+
+// ============================================================
+// 整局状态
+// ============================================================
+//
+// 又是一个「没有结构体」的妥协：整局状态打包进一个数组。
+//
+//   G_BOARD   棋盘（board.xle 的 8 元组）
+//   G_DIFF    当前难度 0/1/2
+//   G_START   开局时刻（-1 表示还没走第一步）
+//   G_ELAPSED 已用时（秒）
+//   G_W       W 列数
+//   G_H       H 行数
+//   G_OVER    是否结束（1 = 结束）
+//   G_SEED    本局种子
+//
+// 为什么 G_START 要单独存在而不是每次用 winTime 算：
+// 计时必须从**第一次点击**开始，不是从开窗开始。玩家开窗后
+// 可能先去泡杯咖啡，那段时间不该算进去。
+
+const G_BOARD   = 0
+const G_DIFF    = 1
+const G_START   = 2
+const G_ELAPSED = 3
+const G_W       = 4
+const G_H       = 5
+const G_OVER    = 6
+const G_SEED    = 7
+
+fn g_new(diff: Int) -> Array {
+    let w = DIFF_BEGINNER_W
+    let h = DIFF_BEGINNER_H
+    let m = DIFF_BEGINNER_M
+    if diff == 1 {
+        w = DIFF_INTER_W
+        h = DIFF_INTER_H
+        m = DIFF_INTER_M
+    }
+    if diff == 2 {
+        w = DIFF_EXPERT_W
+        h = DIFF_EXPERT_H
+        m = DIFF_EXPERT_M
+    }
+
+    let g = array(8, 0)
+    g[G_BOARD]   = board_new(w, h, m)
+    g[G_DIFF]    = diff
+    g[G_START]   = -1
+    g[G_ELAPSED] = 0
+    g[G_W]       = w
+    g[G_H]       = h
+    g[G_OVER]    = 0
+    g[G_SEED]    = 0
+    return g
+}
+
+// ============================================================
+// 布局计算
+// ============================================================
+
+fn board_px_w(g: Array) -> Int {
+    return g[G_W] * CELL
+}
+
+fn board_px_h(g: Array) -> Int {
+    return g[G_H] * CELL
+}
+
+fn win_w(g: Array) -> Int {
+    return board_px_w(g) + PAD * 2
+}
+
+fn win_h(g: Array) -> Int {
+    return HEADER + board_px_h(g) + FOOTER
+}
+
+// 屏幕坐标 → 格子坐标。返回 [x, y]，越界时 x = -1。
+//
+// 为什么用数组返回而不是返回编码后的整数：编码（比如 y*100+x）
+// 在棋盘变大时容易溢出思路，而且读代码的人要反推编码规则。
+// 数组只有两个元素，开销可以忽略。
+fn hit_cell(g: Array, mx: Int, my: Int) -> Array {
+    let out = array(2, -1)
+    let bx = mx - PAD
+    let by = my - HEADER
+    if bx < 0 || by < 0 {
+        return out
+    }
+    let cx = bx / CELL
+    let cy = by / CELL
+    if cx >= g[G_W] || cy >= g[G_H] {
+        return out
+    }
+    out[0] = cx
+    out[1] = cy
+    return out
+}
+
+// ============================================================
+// 绘制
+// ============================================================
+
+// 画一个数字，在格子里居中
+fn draw_num(x: Int, y: Int, n: Int) {
+    let t = toString(n)
+    let tw = winTextWidth(t)
+    let th = winTextHeight()
+    winText(x + (CELL - tw) / 2, y + (CELL - th) / 2, t, num_color(n))
+}
+
+// 画一面旗：三角旗 + 杆
+//
+// 没有画线 API，所以全部用矩形拼。三个不同高度的矩形能拼出一个
+// 像样的三角：宽度不变、高度递减、垂直居中 —— 视觉上就是斜边。
+fn draw_flag(x: Int, y: Int) {
+    let cx = x + CELL / 2
+    // 杆
+    winFillRect(cx - 1, y + 6, 2, 15, C_FLAG)
+    // 三角（从下往上逐行收窄）
+    winFillRect(cx + 1, y + 6,  9, 3, C_FLAG)
+    winFillRect(cx + 1, y + 9,  7, 3, C_FLAG)
+    winFillRect(cx + 1, y + 12, 5, 3, C_FLAG)
+    winFillRect(cx + 1, y + 15, 3, 2, C_FLAG)
+    // 底座
+    winFillRect(cx - 6, y + 21, 13, 2, C_FLAG)
+}
+
+// 画雷
+fn draw_mine(x: Int, y: Int, color: Int) {
+    let cx = x + CELL / 2
+    let cy = y + CELL / 2
+    // 一个十字加一个方块，拼出「雷」的轮廓
+    winFillRect(cx - 7, cy - 2, 14, 4, color)
+    winFillRect(cx - 2, cy - 7, 4, 14, color)
+    winFillRect(cx - 5, cy - 5, 10, 10, color)
+    // 内部挖个深色小方块，让它看起来像个齿轮/球而不是实心块
+    winFillRect(cx - 2, cy - 2, 4, 4, C_CELL_DN)
+}
+
+// 画叉（标记错误的旗）
+fn draw_x(x: Int, y: Int) {
+    let cx = x + CELL / 2
+    let cy = y + CELL / 2
+    winFillRect(cx - 7, cy - 1, 14, 2, C_RED)
+    winFillRect(cx - 1, cy - 7, 2, 14, C_RED)
+    // 两条对角线用错位的小块近似
+    for k in 0..7 {
+        winFillRect(cx - 6 + k, cy - 6 + k, 2, 2, C_RED)
+        winFillRect(cx + 5 - k, cy - 6 + k, 2, 2, C_RED)
+    }
+}
+
+// 顶部信息栏：剩余雷数 + 表情按钮 + 计时
+fn draw_header(g: Array, mx: Int, my: Int) {
+    let W = win_w(g)
+    winFillRect(0, 0, W, HEADER, C_PANEL)
+
+    let b = g[G_BOARD]
+
+    // ---- 剩余雷数 ----
+    let left = board_flags_left(b)
+    let lt = toString(left)
+    if left < 0 {
+        winText(PAD, HEADER / 2 - winTextHeight() / 2, lt, C_RED)
+    } else {
+        winText(PAD, HEADER / 2 - winTextHeight() / 2, lt, C_TEXT)
+    }
+
+    // ---- 计时 ----
+    let secs = g[G_ELAPSED]
+    let tt = toString(secs) + "s"
+    let tw = winTextWidth(tt)
+    winText(W - PAD - tw, HEADER / 2 - winTextHeight() / 2, tt, C_TEXT)
+
+    // ---- 表情按钮（重开）----
+    //
+    // 位置在正中。它是唯一一个「随手点就能重开」的入口，
+    // 所以必须足够大、位置符合直觉。
+    let bw = FACE_W
+    let bx = (W - bw) / 2
+    let by = (HEADER - bw) / 2
+    let hover = mx >= bx && mx < bx + bw && my >= by && my < by + bw
+    if hover {
+        winFillRect(bx, by, bw, bw, 0x3A3A46)
+    }
+    winBorderRect(bx, by, bw, bw, 1, 0x50505E)
+
+    // 图标用**真居中**，不是固定偏移。
+    //
+    // 原来是 `winText(bx + 12, by + 10, ...)`，那是按 40px 按钮里
+    // 两个字符宽（约 16px）估出来的。三个字符的 `:|` 放进去就贴到
+    // 右边框上了，而 `:)` 和 `:(` 又偏左 —— 三个状态的中心对不齐，
+    // 切换表情时图标会左右跳。用 winTextWidth 算实际宽度最稳。
+    //
+    // ── 为什么是这三个符号 ──────────────────────────────────
+    //
+    // `:|` 在微软雅黑里是「冒号 + 竖线」，冒号的点只有 2px 高，
+    // 缩到 15px 字号后基本看不见，视觉上只剩一根竖条 —— 看起来
+    // 像光标而不是表情。换成闭合的圆括号组合，三个状态都有明确
+    // 的「脸」轮廓，而且宽度接近，居中时不会左右跳。
+    let st = board_state(b)
+    let face = ":-|"
+    let col = C_TEXT
+    if st == ST_WIN {
+        face = ":-)"
+        col = C_WIN
+    } else if st == ST_LOSE {
+        face = ":-("
+        col = C_RED
+    }
+    let fw = winTextWidth(face)
+    let fh = winTextHeight()
+    winText(bx + (bw - fw) / 2, by + (bw - fh) / 2, face, col)
+}
+
+// 画棋盘
+fn draw_board(g: Array, mx: Int, my: Int) {
+    let b = g[G_BOARD]
+    let w = g[G_W]
+    let h = g[G_H]
+    let st = board_state(b)
+    let over = st != ST_PLAY
+    // 踩中的那颗雷的下标。提到循环外取一次：480 格 × 每格一次
+    // 数组取值在这个规模无所谓，但「不变的东西不放进循环」是
+    // 让读者一眼分清「哪些量每格都变」的最便宜的办法。
+    let dead = b_dead(b)
+
+    for y in 0..h {
+        for x in 0..w {
+            let px = PAD + x * CELL
+            let py = HEADER + y * CELL
+
+            let opened = b_open(b, x, y) == 1
+            let flagged = b_flag(b, x, y) == 1
+            let has_mine = b_mine(b, x, y) == 1
+
+            if opened {
+                // 已翻开：深色底
+                winFillRect(px, py, CELL, CELL, C_CELL_DN)
+                if has_mine {
+                    // 踩到的那一格用红底强调
+                    winFillRect(px, py, CELL, CELL, 0x5A2028)
+                    draw_mine(px, py, C_RED)
+                } else {
+                    let n = b_num(b, x, y)
+                    if n > 0 {
+                        draw_num(px, py, n)
+                    }
+                }
+            } else {
+                // 未翻开
+                let hover = (mx >= px && mx < px + CELL &&
+                             my >= py && my < py + CELL && !over)
+                if hover {
+                    winFillRect(px, py, CELL, CELL, C_CELL_UP_H)
+                } else {
+                    winFillRect(px, py, CELL, CELL, C_CELL_UP)
+                }
+
+                // 踩中的那颗雷：红底 + 红雷。
+                //
+                // 这一格和下面「输了之后显示所有雷」的格子都未翻开、
+                // 都是雷，唯一的区别就是「是不是玩家点的那一颗」。
+                // 不单独标的话，满屏白雷里看不出自己错在哪儿 ——
+                // 而复盘价值恰恰就在这一格上。
+                if over && dead >= 0 && b_idx(b, x, y) == dead {
+                    winFillRect(px, py, CELL, CELL, 0x5A2028)
+                    draw_mine(px, py, C_RED)
+                } else if flagged {
+                    // 输了之后，插在非雷格上的旗要打叉 —— 这是给玩家的
+                    // 复盘信息：你哪里判断错了。
+                    if over && st == ST_LOSE && !has_mine {
+                        draw_flag(px, py)
+                        draw_x(px, py)
+                    } else {
+                        draw_flag(px, py)
+                    }
+                } else if over && has_mine {
+                    // 输了之后把所有没插旗的雷显示出来
+                    draw_mine(px, py, 0xE8E8F0)
+                }
+            }
+
+            // 网格线。只在格子的上边和左边画一条，
+            // 这样相邻格子共用一条线，不会出现双线。
+            winFillRect(px, py, CELL, 1, C_GRID)
+            winFillRect(px, py, 1, CELL, C_GRID)
+        }
+    }
+
+    // 棋盘右下角补两条边，否则外框缺右边和下边
+    let bw = w * CELL
+    let bh = h * CELL
+    winFillRect(PAD + bw, HEADER, 1, bh + 1, C_GRID)
+    winFillRect(PAD, HEADER + bh, bw, 1, C_GRID)
+}
+
+// 底部：难度按钮
+fn draw_footer(g: Array, mx: Int, my: Int) {
+    let W = win_w(g)
+    let y = HEADER + board_px_h(g)
+    winFillRect(0, y, W, FOOTER, C_PANEL)
+
+    let btn_w = BTN_W
+    let btn_h = BTN_H
+    let by = y + (FOOTER - btn_h) / 2
+    let total = btn_w * 3 + BTN_GAP * 2
+    var bx = (W - total) / 2
+
+    let labels = array(3, "")
+    labels[0] = "初级"
+    labels[1] = "中级"
+    labels[2] = "高级"
+
+    for i in 0..3 {
+        let hover = mx >= bx && mx < bx + btn_w && my >= by && my < by + btn_h
+        let active = g[G_DIFF] == i
+
+        if active {
+            winFillRect(bx, by, btn_w, btn_h, 0x3A5A8A)
+            winBorderRect(bx, by, btn_w, btn_h, 1, 0x6A9AE0)
+        } else if hover {
+            winFillRect(bx, by, btn_w, btn_h, 0x3A3A46)
+            winBorderRect(bx, by, btn_w, btn_h, 1, 0x50505E)
+        } else {
+            winBorderRect(bx, by, btn_w, btn_h, 1, 0x3A3A46)
+        }
+
+        let t = labels[i]
+        let tw = winTextWidth(t)
+        let th = winTextHeight()
+        let tc = C_TEXT
+        if active { tc = 0xFFFFFF }
+        else if !hover { tc = C_DIM }
+        winText(bx + (btn_w - tw) / 2, by + (btn_h - th) / 2, t, tc)
+
+        bx += btn_w + BTN_GAP
+    }
+}
+
+// 结束横幅
+fn draw_banner(g: Array) {
+    let st = board_state(g[G_BOARD])
+    if st == ST_PLAY {
+        return
+    }
+    let W = win_w(g)
+    let cy = HEADER + board_px_h(g) / 2
+
+    let msg = "全部排出"
+    let hint = "按表情重开"
+    let col = C_WIN
+    if st == ST_LOSE {
+        msg = "踩到雷了"
+        hint = "按表情重开"
+        col = C_RED
+    }
+
+    let tw = winTextWidth(msg)
+    let hw = winTextWidth(hint)
+    let inner = tw
+    if hw > tw {
+        inner = hw          // 取两者较宽者为内容宽
+    }
+    let th = winTextHeight()
+
+    let bw = inner + 48
+    let bh = th * 2 + 34
+    let bx = (W - bw) / 2
+    let by = cy - bh / 2
+
+    // 半透明不行（没有 alpha 混合），所以用「比棋盘更深的底色」+
+    // 双线边框制造「浮起」的层次。直接叠一个平色的块会显得像贴上去
+    // 的补丁，加一圈内描边之后才像张卡片。
+    winFillRect(bx, by, bw, bh, 0x101016)
+    winFillRect(bx + 1, by + 1, bw - 2, bh - 2, 0x16161E)
+    winBorderRect(bx, by, bw, bh, 2, col)
+
+    winText(bx + (bw - tw) / 2, by + 10, msg, col)
+    winText(bx + (bw - hw) / 2, by + 12 + th, hint, C_DIM)
+}
+
+// ============================================================
+// 交互
+// ============================================================
+
+fn do_reveal(g: Array, cx: Int, cy: Int) {
+    let b = g[G_BOARD]
+    if board_state(b) != ST_PLAY {
+        return
+    }
+
+    // 第一次点击：现在才布雷。
+    //
+    // ── 为什么不能开局就布雷 ────────────────────────────────
+    //
+    // 布雷需要知道首点位置（首点及其邻域必须无雷）。若开局就布，
+    // 首点只能靠「重新布一次」来满足规则 —— 那会浪费一次布雷，
+    // 而且种子的推进顺序变得依赖点击位置，难以复现。
+    //
+    // 延迟到第一次点击时布雷，一处解决：种子固定 → 首点固定 →
+    // 局面完全确定。调试时「用同样的点击序列必然得到同样局面」
+    // 这条性质很有用。
+    if g[G_START] < 0 {
+        g[G_START] = winTime()
+        g[G_SEED] = toInt(winTime() * 1000.0)
+        board_place_mines(b, cx, cy, g[G_SEED])
+        board_count(b)
+    }
+
+    board_open(b, cx, cy)
+
+    if board_state(b) == ST_LOSE {
+        g[G_OVER] = 1
+    } else if board_check_win(b) {
+        g[G_OVER] = 1
+    }
+}
+
+fn do_flag(g: Array, cx: Int, cy: Int) {
+    let b = g[G_BOARD]
+    if board_state(b) != ST_PLAY {
+        return
+    }
+    // 第一次点击前插旗：不布雷，也不计时。
+    // 玩家可以先思考再动手，插旗不该算「开始」。
+    board_flag(b, cx, cy)
+}

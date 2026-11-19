@@ -1,0 +1,101 @@
+// controller/user_controller.xle — 用户 REST 接口
+//
+// ── 注解驱动的路由：这个类没有任何「注册路由」的代码 ──────
+//
+// 每个接口方法 = 注解（HTTP 方法 + 路径）+ 返回值。路由表由 xboot
+// 在启动期扫描生成（scanRoutes），运行期按 methodParams 反射绑定
+// 参数（wbBindArgs）。对比 blog demo 的手工 dispatch match（两百行
+// if 链），这里是「加一个接口 = 写一个方法」，解耦的意义就在这里。
+//
+// ── 方法声明顺序 = 无所谓 ────────────────────────────────
+//
+// scanRoutes 会把扫描出的路由按**参数段数升序**排序后注册（静态
+// 路径优先于 {var} 路径，见 web.xle 的排序说明），所以本文件里
+// /count 和 /{id} 的声明先后不影响路由优先级 —— 想怎么排就怎么排，
+// 靠的是框架的确定性规则，不是「记得把静态路径写前面」的纪律。
+//
+// ── 返回值即响应体 ────────────────────────────────────────
+//
+// 方法返回 String（rOk/rFail/rPage 的 JSON），dispatchRequest 原样
+// 写入 200 —— code 承载业务成败，HTTP 状态码保持 200（统一返回体
+// 约定）。需要精确 HTTP 语义的场合，方法第一个参数声明 ctx: Context
+// 自己写响应并 return null（逃逸舱口，见 web.xle 的分派说明）。
+
+import "../../../../lib/xboot/web.xle"
+import "../entity/user.xle"
+import "../service/user_service.xle"
+
+@RestController
+@RequestMapping("/api/users")
+class UserController {
+    @Autowired
+    svc: UserService
+
+    // ── 静态路径（优先级高，先声明）──────────────────
+
+    @GetMapping("")
+    fn list() -> String {
+        let users = self.svc.listAll()
+        return rPage(users, len(users))
+    }
+
+    @GetMapping("/count")
+    fn count() -> String {
+        return rOk(self.svc.count())
+    }
+
+    @GetMapping("/status/{s}")
+    fn byStatus(s: Int) -> String {
+        return rPage(self.svc.listByStatus(s),
+                     len(self.svc.listByStatus(s)))
+    }
+
+    @GetMapping("/search")
+    fn search(name: String) -> String {
+        let users = self.svc.searchByName(name)
+        return rPage(users, len(users))
+    }
+
+    @PostMapping("")
+    fn create(u: User) -> String {
+        if (len(u.username) == 0) {
+            return rFail(400, "username 不能为空")
+        }
+        self.svc.create(u)
+        return rOkMsg(u, "创建成功")
+    }
+
+    // ── 变量路径（优先级低，后声明）──────────────────
+
+    @GetMapping("/{id}")
+    fn detail(id: Int) -> String {
+        let u = self.svc.getById(id)
+        if (typeOf(u) == "Null") {
+            return rFail(404, "用户不存在: id=" + toString(id))
+        }
+        return rOk(u)
+    }
+
+    @PutMapping("/{id}")
+    fn update(id: Int, u: User) -> String {
+        if (len(u.username) == 0) {
+            return rFail(400, "username 不能为空")
+        }
+        let exist = self.svc.getById(id)
+        if (typeOf(exist) == "Null") {
+            return rFail(404, "用户不存在: id=" + toString(id))
+        }
+        u.id = id
+        self.svc.update(u)
+        return rOkMsg(self.svc.getById(id), "更新成功")
+    }
+
+    @DeleteMapping("/{id}")
+    fn remove(id: Int) -> String {
+        let n = self.svc.remove(id)
+        if (n == 0) {
+            return rFail(404, "用户不存在: id=" + toString(id))
+        }
+        return rOkMsg(n, "删除成功")
+    }
+}

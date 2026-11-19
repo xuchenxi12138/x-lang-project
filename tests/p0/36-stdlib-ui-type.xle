@@ -1,0 +1,145 @@
+// 36-stdlib-ui-type.xle — 类型层组件库（纯计算部分）
+//
+// games/settings/demo.xle 需要开窗、截图，不适合放进主回归。
+// 这里测的是同一个库在**不开窗**时也能验证的部分：
+//
+//   1. Rect 的全部几何方法
+//   2. Theme 是值（换主色不影响其他字段）
+//   3. 控件描述的状态字段
+//   4. Frame 的点击归属语义 —— 这是类型层存在的核心理由
+//   5. Slider 的值换算（整数域，不经过 Float 再回来）
+//
+// 凡是需要 winOpen 的都不在这里测。绘制正确性由 demo 的截图做基线。
+
+from std.ui import uiHit, uiHitDown, uiTextCenter, uiTextInRect, uiTextLeft, uiButton, uiButtonEx, uiButtonPrimary, uiButtonDanger, uiButtonFlat, uiConsumeClick, uiCheckMark, uiCheck, uiCheckEx, uiRadioGroup, uiSlider, uiSliderLabeled, uiSliderEx, uiField, uiFieldLabeled, uiSeparator, uiPanel, uiPanelTitled, uiProgress, uiProgressLabeled, uiSeparatorEx, uiVRuleEx, uiPanelEx, uiPanelTitledEx, uiProgressEx, uiProgressLabeledEx, uiList, uiListScroll, uiCursor, uiCursorTake, uiModalBg, uiDialog, uiStatus, uiToolbar, uiFixed, Rect, Theme, Style, Anim, Button, Label, Panel, Progress, Cursor, Check, Slider, Frame, Widget, UiLabel, UiButton, UiPanel, UiProgress, UiCheck, UiSlider, UiTree, UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_NONE, UI_BTN_NORMAL, UI_BTN_PRIMARY, UI_BTN_DANGER
+from std.conv import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+fn main() -> Int {
+    // ---- 1. Rect 几何 ----
+    let r = Rect { x: 10, y: 20, w: 200, h: 60 }
+    println(r.right())
+    println(r.bottom())
+    println(r.area())
+    println(r.cx())
+    println(r.cy())
+    println(r.isEmpty())
+    println(Rect { w: 0, h: 5 }.isEmpty())
+
+    // 命中判定：左闭右开。右边界 (210) 不属于矩形。
+    println(r.contains(10, 20))
+    println(r.contains(209, 79))
+    println(r.contains(210, 79))
+    println(r.contains(9, 20))
+
+    // 切分与偏移
+    println(r.inset(5))
+    println(r.offset(3, 4))
+    println(r.inOf(8))
+    println(r.stripTop(20))
+    println(r.stripBottom(16))
+    println(r.below(10, 6))
+    println(r.leftPct(30))
+    println(r.rightOf(30))
+
+    // 切分后必须仍在原矩形内（算术自洽）
+    println(r.leftPct(30).w + r.rightOf(30).w == r.w)
+
+    // ---- 2. Theme 是值 ----
+    let dark = Theme.dark()
+    let light = Theme.light()
+    println(dark.accent)
+    println(light.accent)
+    // 深浅主题的前景色必须不同，否则「换主题」是假的
+    println(dark.text != light.text)
+    println(dark.bg != light.bg)
+
+    let red = dark.withAccent(0xFF0000)
+    println(red.accent)
+    // 派生只改一个字段，其余必须原样
+    println(red.text == dark.text)
+    println(red.bg == dark.bg)
+
+    // ---- 3. 控件描述 ----
+    let btn = Button.of(r, "确定")
+    println(btn.label)
+    println(btn.kind)
+    println(btn.enabled)
+    println(btn.disabled().enabled)
+    println(Button.primary(r, "提交").kind)
+    println(Button.danger(r, "删除").kind)
+    println(Button.flat(r, "取消").kind)
+
+    let lb = Label.of(r, "居中")
+    println(lb.text)
+    println(lb.align)
+    println(Label.left(r, "左").align)
+
+    println(Panel.of(r, "设置", dark).title)
+    println(Progress.of(r, 0.5).ratio)
+    println(Progress.of(r, 0.5).label)
+    println(Progress.of(r, 0.5).withLabel().label)
+
+    let c = Cursor.at(20, 40)
+    println(c.row(300, 32))
+    println(c.advance(32, 8).y)
+    println(c.indent(16).x)
+
+    // ---- 4. Frame 的点击归属 ----
+    //
+    // 没有真实点击时，一切都是否。begin() 读的是 winPollClick，
+    // 不开窗时返回 Null，正好用来验证「没点击」这条路径。
+    let rA = Rect { x: 10, y: 10, w: 100, h: 30 }
+    let rB = Rect { x: 10, y: 50, w: 100, h: 30 }
+
+    let f = Frame.begin()
+    println(f.has)
+    println(f.hit(rA))
+    println(f.pending())
+
+    // 构造一个「有点击」的 Frame 来验证 claim 语义。
+    // 这才是真正要保证的：claim 之后，别的控件拿不到。
+    let fA = Frame { cx: 20, cy: 20, button: 0, has: true, claimed: false }
+    println(fA.hit(rA))
+    println(fA.hit(rB))
+    let fB = fA.claim(rA)
+    println(fB.hit(rA))
+    println(fB.hit(rB))
+    println(fB.pending())
+
+    // 点在 B 上：A 不再命中，B 命中
+    let fC = Frame { cx: 20, cy: 60, button: 0, has: true, claimed: false }
+    println(fC.hit(rA))
+    println(fC.hit(rB))
+    let fD = fC.claim(rB)
+    println(fD.hit(rA))
+    println(fD.hit(rB))
+
+    // 非左键不命中
+    let fR = Frame { cx: 20, cy: 20, button: 1, has: true, claimed: false }
+    println(fR.hit(rA))
+
+    // ---- 5. Slider 换算 ----
+    let sl = Slider.of(Rect { x: 0, y: 0, w: 101, h: 12 }, 0, 100)
+    println(sl.ratio(0))
+    println(sl.ratio(50))
+    println(sl.ratio(100))
+    // 越界必须被夹住，不能回绕
+    println(sl.ratio(-50))
+    println(sl.ratio(150))
+
+    println(sl.valueAt(0))
+    println(sl.valueAt(50))
+    println(sl.valueAt(100))
+    println(sl.valueAt(-10))
+    println(sl.valueAt(999))
+
+    // 值域退化时不能除零
+    let sz = Slider.of(Rect { x: 0, y: 0, w: 10, h: 12 }, 50, 50)
+    println(sz.ratio(50))
+
+    // track 比 rect 高，为了好按
+    println(sl.track())
+
+    println("ui-type ok")
+    return 0
+}

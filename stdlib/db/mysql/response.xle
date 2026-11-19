@@ -1,0 +1,150 @@
+// db/mysql/response.xle — 客户端 Handshake Response 41
+//
+// ── 这个包在协议里的位置 ──────────────────────────
+//
+// 服务端发 Initial Handshake（handshake.xle 解析的那个）→ 客户端
+// 发 Handshake Response 41 → 服务端回 OK / ERR / Auth Switch。
+//
+// 包名里的 "41" 指 MySQL 4.1 引入的格式（带 23 字节填充、能力标志
+// 用 4 字节、认证响应长度前缀）。之前的 320 格式早就没人用了。
+//
+// ── 字节布局 ────────────────────────────────────
+//
+//   [4]    能力标志（小端 32 位）
+//   [4]    最大包长（0 表示用默认）
+//   [1]    字符集
+//   [23]   保留全 0
+//   [NUL]  用户名
+//   [lenenc] 认证响应
+//   [NUL]  数据库名（仅当声明 CLIENT_CONNECT_WITH_DB）
+//   [NUL]  认证插件名（仅当声明 CLIENT_PLUGIN_AUTH）
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "packet.xle" import myReadPacket, myWritePacket, myReadLenEnc, myWriteLenEnc, myWriteLenEncStr, myWriteLenEncBytes, myReadLenEncBytes, myReadLenEncStr, myReadNulStr, myReadNulBytes, myIsErrPacket, myIsOkPacket, myIsEofPacket, myParseErrPacket, myParseOkPacket, myArrBool, myArrBytes, MY_MAX_PAYLOAD
+from "handshake.xle" import myClientCaps, myParseHandshake, myReadHandshake, HandshakeInfo, MY_CAP_LONG_PASSWORD, MY_CAP_FOUND_ROWS, MY_CAP_LONG_FLAG, MY_CAP_CONNECT_WITH_DB, MY_CAP_PROTOCOL_41, MY_CAP_TRANSACTIONS, MY_CAP_SECURE_CONN, MY_CAP_MULTI_RESULTS, MY_CAP_PLUGIN_AUTH
+
+// 客户端默认字符集：utf8mb4_general_ci = 45。
+//
+// ── 为什么不用 8 (latin1) ────────────────────────
+//
+// 用 latin1 时中文会以 mojibake 形式存进去，且后续查询要每次
+// SET NAMES。45 是 MySQL 5.5+ 的 utf8mb4，能和绝大多数现代
+// 服务端直接对上。
+const MY_CHARSET_UTF8MB4 = 45
+
+// 构造 Handshake Response 41 的负载。
+//
+// ── 为什么能力标志要和握手包做「与」 ────────────────
+//
+// 客户端只能声明「双方都支持」的能力。单方面声明了服务端不具备的
+// 能力，服务端会直接断开（或行为未定义）。所以这里先与一下，再
+// 确保几个必需位在。
+fn myBuildHandshakeResponse(info: HandshakeInfo, user: String,
+                            password: String, database: String) -> Array {
+    let caps = myClientCaps() & info.caps
+    // 协议 4.1 是硬要求：没有它连用户名都发不出去。
+    caps = caps | MY_CAP_PROTOCOL_41
+    if (len(database) > 0) {
+        caps = caps | MY_CAP_CONNECT_WITH_DB
+    }
+
+    let auth = myAuthResponse(info.plugin, password, info.salt)
+
+    let buf = []
+    bbPutU32LE(buf, caps)
+    bbPutU32LE(buf, 0)                 // 最大包长，0 = 默认
+    bbPutU8(buf, MY_CHARSET_UTF8MB4)
+    var i = 0
+    while i < 23 {
+        bbPut(buf, 0)                  // 23 字节保留
+        i = i + 1
+    }
+    // 用户名（NUL 结尾，UTF-8）
+    bbPutUtf8(buf, user)
+    bbPut(buf, 0)
+
+    // 认证响应。
+    //
+    // ── 为什么要区分 SECURE_CONN / 老格式 ────────────
+    //
+    // 声明了 CLIENT_SECURE_CONN 时，响应前面有 1 字节长度（值最大
+    // 255，够放 32 字节的 SHA-256 应答）。没声明时是 NUL 结尾字符串，
+    // 而应答里可能有 0x00 字节，会被截断 —— 所以老格式只适用于
+    // 8 字节的旧口令。现代服务端都支持 SECURE_CONN。
+    if ((caps & MY_CAP_SECURE_CONN) != 0) {
+        bbPutU8(buf, len(auth))
+        bbPutBytes(buf, auth)
+    } else {
+        bbPutBytes(buf, auth)
+        bbPut(buf, 0)
+    }
+
+    // 数据库名
+    if ((caps & MY_CAP_CONNECT_WITH_DB) != 0) {
+        bbPutUtf8(buf, database)
+        bbPut(buf, 0)
+    }
+
+    // 插件名
+    if ((caps & MY_CAP_PLUGIN_AUTH) != 0) {
+        bbPutUtf8(buf, info.plugin)
+        bbPut(buf, 0)
+    }
+
+    return buf
+}
+
+// 构造「切换认证插件」的应答（Auth Switch Response）。
+//
+// ── 什么时候需要这个包 ────────────────────────────
+//
+// 服务端可能要求换成另一个插件。典型场景：握手包里声明的是
+// caching_sha2_password，但账号实际配的是 mysql_native_password
+// （或者反过来）—— 服务端会发 Auth Switch Request，里面有新插件名
+// 和**新的盐**，客户端必须用新盐重新算应答。
+//
+// ── 为什么盐可能变 ────────────────────────────
+//
+// 因为切换插件是服务端单方面决定的安全策略（比如检测到账号需要
+// 升级认证方式）。它不信任第一次的挑战，所以给一个新的。
+fn myBuildAuthSwitch(plugin: String, password: String, salt: Array) -> Array {
+    return myAuthResponse(plugin, password, salt)
+}
+
+// 解析 Auth Switch Request 包，返回 [插件名, 盐]。
+//
+//   [1]     0xFE
+//   [NUL]   插件名
+//   [...]   盐（NUL 结尾，但也可能不带结尾的 0）
+fn myParseAuthSwitch(p: Array) -> Array {
+    if (len(p) < 2 || bbAt(p, 0) != 0xFE) { return ["", []] }
+    let nameR = myReadNulStr(p, 1)
+    let plugin = toString(nameR[0])
+    let pos = toInt(nameR[1])
+    let saltR = myReadNulBytes(p, pos)
+    return [plugin, saltR[0]]
+}
+
+// 服务端要求「完整认证」的信号包：0x01 0x04。
+//
+// caching_sha2_password 的 fast path 失败时，服务端发两个字节
+// 0x01 0x04，然后等客户端用 RSA 公钥加密口令发过来。
+//
+// ── 为什么单独给一个判定函数 ──────────────────────
+//
+// 因为 0x01 是「认证更多数据」的通用前缀，后面跟的字节说明具体
+// 要什么。把它和 OK / ERR 混在一起判断会让 driver 的分支难以阅读。
+fn myIsMoreDataPacket(p: Array) -> Bool {
+    return len(p) >= 2 && bbAt(p, 0) == 0x01
+}
+
+// 从 More Data 包里读子命令：0x03 = fast auth success，0x04 = full auth。
+//
+// ── 为什么 0x03 也算「有消息」──────────────────────
+//
+// 0x03 表示「跳过完整认证，直接发 OK」，也就是说紧接着还会有一个
+// OK 包。调用方看到 0x03 要继续读一个包，而不是以为已经成功。
+fn myMoreDataKind(p: Array) -> Int {
+    if (len(p) >= 2 && bbAt(p, 0) == 0x01) { return bbAt(p, 1) }
+    return 0 - 1
+}

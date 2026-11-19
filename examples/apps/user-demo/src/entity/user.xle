@@ -1,0 +1,29 @@
+// entity/user.xle — 用户实体
+//
+// ── 与团队实体约定的对应关系 ──────────────────────────────
+//
+// User extends Entity：id 等基础字段来自基类（BaseEntity 约定），
+// 业务字段写在子类。@Table 显式指定表名 —— user 在 MySQL 里是
+// 内置函数名（USER()），用 t_user 避开歧义；列名缺省走「驼峰转
+// 下划线」（email/age/status 本身就是全小写，原样映射）。
+//
+// 构造函数必须无参 —— 容器与参数绑定都走 classNew(类名, [])，
+// 默认值在这里给齐（status 缺省 1 = 启用，是业务约定不是零值）。
+
+from "../../../../../lib/xboot/data.xle" import entityMetaOf, fillEntity, sqlValueOf, dataSourceFrom, Entity, EntityField, EntityMeta, QueryWrapper, BaseMapper
+
+@Table("t_user")
+class User extends Entity {
+    username: String
+    email: String
+    age: Int
+    status: Int
+
+    constructor() {
+        self.id       = 0
+        self.username = ""
+        self.email    = ""
+        self.age      = 0
+        self.status   = 1
+    }
+}

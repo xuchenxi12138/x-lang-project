@@ -1,0 +1,326 @@
+// ui/control/colorpicker.xle — 颜色选择器
+//
+// ── 颜色选择的三种做法 ──────────────────────────
+//
+//   1. RGB 三滑块 —— 精确，但要懂三色原理
+//   2. 色板（预设若干格）—— 快，但选项有限
+//   3. 色相环 + 明度/饱和度 —— 直观，但要画渐变环
+//
+// 窗口层的能力边界决定了只能做 1 和 2：色相环需要「圆弧渐变」，
+// 而 winGradient 只能画矩形渐变。
+//
+// 所以这里做「色板为主 + RGB 滑块为辅」的两段式：
+//
+//   上半是 N 个预设色块（点一下就用）
+//   下半是 R/G/B 三个滑块（微调）
+//
+// 这个组合在小尺寸面板里是够用的，而且没有实现不了的形状。
+//
+// ── 色板的颜色从哪来 ─────────────────────────
+//
+// 不用「16 色 VGA 调色板」那种按位组合的色板，因为那些颜色在
+// 现代 UI 里几乎没人用。改用「几组有语义的主题色」：灰阶 8 级 +
+// 常用彩色 8 个。这样选出来的颜色能直接用在界面上。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../layout/layout.xle" import layoutFrame, layoutRaw, layoutColumn, layoutRow, layoutNext, layoutAdvance, layoutNextCol, layoutAdvanceCol, layoutSplit, layoutSplitV, layoutAt, layoutPlace, layoutCenter, layoutHCenter, layoutInset, layoutPadLeft, layoutPadRight, layoutPadTop, layoutPadBottom, layoutPadH, layoutPadV, layoutRemainder, layoutSpacer, Cursor, ALIGN_START, ALIGN_CENTER, ALIGN_END, ALIGN_STRETCH
+from "slider.xle" import Slider, SL_TRACK_H, SL_KNOB_W, SL_KNOB_H
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 预设色板。分两行：灰阶 + 彩色。
+//
+// ── 为什么灰阶单独一行 ────────────────────────
+//
+// 因为「灰」在 UI 里是独立的一族（背景、边框、次要文字都用它），
+// 而彩色是「强调」用的。分开放比混在一起更容易选到想要的。
+// ── 为什么色板是函数而不是 const ─────────────
+//
+// 顶层 `const` 的初始值必须是标量字面量，数组不行（P0 不做常量
+// 表达式折叠，也不支持 const 数组）。所以改成返回数组的函数。
+//
+// 代价是每帧调用都新建一个 8 元素数组 —— 但在 60fps 下这是每帧
+// 8 次分配，相比绘制本身的成本可以忽略。
+//
+// ── 为什么写成一行 ──────────────────────────
+//
+// 数组字面量不支持跨行。8 个值还能忍；如果要 64 色板，就该改成
+// 「在函数体里用 arrPush 填」了。
+fn colorGraySwatches() -> Array {
+    return [0x111111, 0x333333, 0x555555, 0x777777, 0x999999, 0xBBBBBB, 0xDDDDDD, 0xFFFFFF]
+}
+
+fn colorHueSwatches() -> Array {
+    return [0xEF4444, 0xF97316, 0xF59E0B, 0x22C55E, 0x14B8A6, 0x3B82F6, 0x6366F1, 0xA855F7]
+}
+
+// 色块的边长。
+const CP_SWATCH = 24
+
+// 色块之间的间隙。
+const CP_GAP = 4
+
+class ColorPicker extends Widget {
+    // 当前颜色的三个通道。
+    //
+    // ── 为什么不叫 r/g/b ──────────────────────
+    //
+    // 基类 Widget 已经有一个字段 `r: Rect`（几何），而类字段
+    // 名必须全局唯一（含继承）。用 r/g/b 会和矩形撞名，编译器
+    // 直接拒绝。
+    //
+    // 这个限制其实是对的：如果允许遮蔽，`self.r` 在 ColorPicker
+    // 里是红色的 Int、在 Widget 的方法是 Rect，读代码的人会疯。
+    chR: Int,
+    chG: Int,
+    chB: Int,
+
+    // 最近点击的色板下标。-1 表示没点。
+    picked: Int,
+
+    // 是否显示 RGB 滑块区。
+    showSliders: Bool,
+
+    // ── 构造参数为什么叫 rect 而不是 r ────────────
+    //
+    // 因为 `r` 在这个类里已经被基类的矩形字段占用了。参数名可以
+    // 和字段重名（它们是不同的命名空间），但那样 self.r = r 读
+    // 起来会以为是「矩形等于矩形」，而实际发生的是「几何字段
+    // 等于传进来的矩形」。叫 rect 让赋值意图清楚。
+    constructor(rect: Rect, color: Int) {
+        self.r           = rect
+        self.vis         = true
+        self.enabled     = true
+        self.focused     = false
+        self.hovered     = false
+        self.chR         = (color >> 16) & 0xFF
+        self.chG         = (color >> 8) & 0xFF
+        self.chB         = color & 0xFF
+        self.picked      = 0 - 1
+        self.showSliders = true
+        self.style       = Style.plain()
+    }
+
+    static fn of(rect: Rect, color: Int) -> ColorPicker {
+        return new ColorPicker(rect, color)
+    }
+
+    // ── 颜色存取 ──────────────────────────────────
+
+    fn color() -> Int {
+        return (self.chR << 16) | (self.chG << 8) | self.chB
+    }
+
+    fn setColor(c: Int) -> ColorPicker {
+        self.chR = (c >> 16) & 0xFF
+        self.chG = (c >> 8) & 0xFF
+        self.chB = c & 0xFF
+        return self
+    }
+
+    // 十六进制字符串，用于显示 / 复制。
+    fn hex() -> String {
+        return "#" + hex2(self.chR) + hex2(self.chG) + hex2(self.chB)
+    }
+
+    // ── 几何 ────────────────────────────────────
+    //
+    // 两行色块：灰阶在 y，彩色在 y + (SWATCH + GAP)。
+
+    fn swatchRect(row: Int, col: Int) -> Rect {
+        let x = self.r.x + col * (CP_SWATCH + CP_GAP)
+        let y = self.r.y + row * (CP_SWATCH + CP_GAP)
+        return rectOf(x, y, CP_SWATCH, CP_SWATCH)
+    }
+
+    // 色板区高度（两行）。
+    fn swatchesH() -> Int {
+        return CP_SWATCH * 2 + CP_GAP
+    }
+
+    // 滑块区起始 y。
+    fn slidersTop() -> Int {
+        return self.r.y + self.swatchesH() + 12
+    }
+
+    // 第 k 个滑块（0=R 1=G 2=B）的矩形。
+    fn sliderRect(k: Int) -> Rect {
+        let y = self.slidersTop() + k * 26
+        return rectOf(self.r.x + 18, y, self.r.w - 18, 22)
+    }
+
+    // 总需要的高度。
+    fn measureH() -> Int {
+        if (!self.showSliders) { return self.swatchesH() }
+        return self.swatchesH() + 12 + 3 * 26
+    }
+
+    // ── 交互 ────────────────────────────────────
+
+    // 命中判定的色板项。返回 [row, col] 或空数组。
+    fn swatchAt(mx: Int, my: Int) -> Array {
+        var row = 0
+        while row < 2 {
+            var col = 0
+            while col < 8 {
+                let sr: Rect = self.swatchRect(row, col)
+                if (sr.contains(mx, my)) { return [row, col] }
+                col = col + 1
+            }
+            row = row + 1
+        }
+        return []
+    }
+
+    // 处理色板点击。返回颜色是否变化。
+    fn clickSwatch(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+        let hit = self.swatchAt(mx, my)
+        if (len(hit) != 2) { return false }
+
+        let row = toInt(hit[0])
+        let col = toInt(hit[1])
+        var c = 0
+        if (row == 0) {
+            c = toInt(colorGraySwatches()[col])
+        } else {
+            c = toInt(colorHueSwatches()[col])
+        }
+
+        let old = self.color()
+        self.setColor(c)
+        self.picked = row * 8 + col
+        return self.color() != old
+    }
+
+    // 处理滑块拖动。
+    //
+    // 每个滑块的值域 0-255，映射到横向位置。滑块的绘制也在这里
+    // 完成（不用 Slider 类，因为那是 0-100 的比例语义，而通道
+    // 值是 0-255，直接用会更绕）。
+    fn dragChannel(k: Int, mx: Int, pressed: Bool) -> Bool {
+        if (!pressed) { return false }
+        let sr: Rect = self.sliderRect(k)
+        // 判定范围放大一点，方便按。
+        let area = Rect.inset(sr, 0 - 4)
+        if (!area.contains(mx, winMouseY())) { return false }
+
+        let span = sr.w - 1
+        if (span <= 0) { return false }
+        var t = toFloat(mx - sr.x) / toFloat(span)
+        if (t < 0.0) { t = 0.0 }
+        if (t > 1.0) { t = 1.0 }
+        let v = toInt(t * 255.0 + 0.5)
+
+        let old = self.color()
+        if (k == 0) { self.chR = v }
+        if (k == 1) { self.chG = v }
+        if (k == 2) { self.chB = v }
+        return self.color() != old
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // ── 1. 色板 ──
+        var row = 0
+        var col = 0
+        while row < 2 {
+            col = 0
+            while col < 8 {
+                let sr: Rect = self.swatchRect(row, col)
+                var c = 0
+                if (row == 0) { c = toInt(colorGraySwatches()[col]) }
+                else { c = toInt(colorHueSwatches()[col]) }
+
+                winFillRound(sr.x, sr.y, sr.w, sr.h, 4, c)
+
+                // 选中的那一格加白/黑双环 —— 单色环在同色块上看不见。
+                let idx = row * 8 + col
+                if (idx == self.picked) {
+                    winBorderRound(sr.x - 1, sr.y - 1, sr.w + 2, sr.h + 2,
+                                   5, 2, th.text)
+                    winBorderRound(sr.x - 2, sr.y - 2, sr.w + 4, sr.h + 4,
+                                   6, 1, th.bg)
+                } else {
+                    // 浅色块（白色）需要边框才看得见轮廓。
+                    winBorderRound(sr.x, sr.y, sr.w, sr.h, 4, 1, th.border)
+                }
+                col = col + 1
+            }
+            row = row + 1
+        }
+
+        if (!self.showSliders) { return }
+
+        // ── 2. 当前色预览 ──
+        let py = self.slidersTop() - 2
+        // 预览放在滑块区右上角（不占单独一行）。
+        // 这里先画滑块，最后在右上角画预览块。
+
+        // ── 3. 三个通道滑块 ──
+        var k = 0
+        while k < 3 {
+            let sr: Rect = self.sliderRect(k)
+            var label = "R"
+            var value = self.chR
+            var chColor = 0xEF4444
+            if (k == 1) {
+                label = "G"
+                value = self.chG
+                chColor = 0x22C55E
+            }
+            if (k == 2) {
+                label = "B"
+                value = self.chB
+                chColor = 0x3B82F6
+            }
+
+            // 通道字母。
+            winText(self.r.x - 6, sr.y + (sr.h - winTextHeight()) / 2,
+                    label, chColor)
+
+            // 轨道。
+            winFillRound(sr.x, sr.y + 8, sr.w, 6, 3, th.track)
+
+            // 已填充部分。
+            let t = toFloat(value) / 255.0
+            let fw = toInt(t * toFloat(sr.w))
+            if (fw > 0) {
+                winFillRound(sr.x, sr.y + 8, fw, 6, 3, chColor)
+            }
+
+            // 把手。
+            let kx = sr.x + fw - 6
+            winFillRound(kx, sr.y + 5, 12, 12, 6, th.surface)
+            winBorderRound(kx, sr.y + 5, 12, 12, 6, 1, chColor)
+
+            // 数值。
+            winText(sr.x + sr.w + 6, sr.y + (sr.h - winTextHeight()) / 2,
+                    toString(value), th.textDim)
+
+            k = k + 1
+        }
+
+        // ── 4. 当前色预览（右上）+ 十六进制值 ──
+        let preview = rectOf(self.r.x + self.r.w - 60, py - 24, 24, 20)
+        winFillRound(preview.x, preview.y, preview.w, preview.h, 4, self.color())
+        winBorderRound(preview.x, preview.y, preview.w, preview.h, 4, 1, th.border)
+    }
+}
+
+// 两位十六进制。私有于本文件（命名带前缀避免合并后冲突）。
+fn hex2(n: Int) -> String {
+    let digits = "0123456789ABCDEF"
+    var v = n
+    if (v < 0) { v = 0 }
+    if (v > 255) { v = 255 }
+    let hi = v / 16
+    let lo = v % 16
+    return strSub(digits, hi, hi + 1) + strSub(digits, lo, lo + 1)
+}

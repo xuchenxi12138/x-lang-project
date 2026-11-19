@@ -1,0 +1,205 @@
+// db/redis/resp.xle — RESP 协议编解码
+//
+// ── RESP 是什么 ────────────────────────────────
+//
+// Redis Serialization Protocol。所有 Redis 命令和响应都是它。设计
+// 目标很明确：人可读、好解析、前缀单字节区分类型。
+//
+// ── 五种类型 ──────────────────────────────────
+//
+//   +简单字符串\r\n        "+OK\r\n"                  → "OK"
+//   -错误\r\n              "-ERR unknown command\r\n"  → 错误
+//   :整数\r\n              ":1000\r\n"                → 1000
+//   $批量字符串\r\n<data>\r\n  "$5\r\nhello\r\n"       → "hello"
+//   *数组\r\n<元素…>       "*2\r\n$3\r\nfoo\r\n..."    → 数组
+//
+// ── 为什么要区分「简单字符串」和「批量字符串」────────
+//
+// 简单字符串不含二进制、不用转义，适合状态回复（+OK）。批量字符串
+// 带长度前缀，可以装任意字节（包括 \r\n）。二者不能混用：用简单
+// 字符串返回二进制数据会在第一个 \r\n 处被截断。
+//
+// ── 请求格式为什么统一成数组 ─────────────────────
+//
+// 客户端发出的命令一律是「批量字符串组成的数组」（inline 命令除外）。
+// 这样服务端解析规则只需要一套，而参数里有什么字节都不影响。
+
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// RESP 的换行。Redis 规定是 \r\n，只发 \n 会被拒绝。
+const RESP_CRLF = "\r\n"
+
+// ── 编码请求 ────────────────────────────────────
+
+// 把命令和参数编码成一个 RESP 数组请求。
+//
+// 例如 respCommand("SET", ["k", "v"]) →
+//   *3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n
+fn respCommand(args: Array) -> Array {
+    let out = []
+    bbPut(out, 0x2A)                       // '*'
+    bbPutUtf8(out, toString(len(args)))
+    bbPutUtf8(out, RESP_CRLF)
+    var i = 0
+    while i < len(args) {
+        let a = toString(args[i])
+        let bytes = bbFromUtf8(a)
+        bbPut(out, 0x24)                   // '$'
+        bbPutUtf8(out, toString(len(bytes)))
+        bbPutUtf8(out, RESP_CRLF)
+        bbPutBytes(out, bytes)
+        bbPutUtf8(out, RESP_CRLF)
+        i = i + 1
+    }
+    return out
+}
+
+// 二进制安全的参数编码：参数已经是字节数组。
+fn respCommandRaw(args: Array) -> Array {
+    let out = []
+    bbPut(out, 0x2A)
+    bbPutUtf8(out, toString(len(args)))
+    bbPutUtf8(out, RESP_CRLF)
+    var i = 0
+    while i < len(args) {
+        let bytes = args[i]
+        bbPut(out, 0x24)
+        bbPutUtf8(out, toString(len(bytes)))
+        bbPutUtf8(out, RESP_CRLF)
+        bbPutBytes(out, bytes)
+        bbPutUtf8(out, RESP_CRLF)
+        i = i + 1
+    }
+    return out
+}
+
+// ── 解码响应 ────────────────────────────────────
+
+// 读一个 RESP 值，返回 [类型, 值]。
+//
+// 类型字符串（而不是枚举数字）便于调试打印：
+//   "simple"  简单字符串，值为 String
+//   "error"   错误，值为错误消息 String
+//   "int"     整数，值为 Int
+//   "bulk"    批量字符串，值为 String（可能是 ""）
+//   "nil"     nil（$-1 或 *-1），值为 null
+//   "array"   数组，值为 Array（元素也是 [类型, 值] 结构）
+//
+// ── 为什么返回类型标签而不是直接返回值 ─────────────
+//
+// 因为 "+OK" 和 "$2\r\nOK" 的值都是 "OK"，但前者是状态、后者是数据。
+// 调用方有时需要区分（比如判断 SET 是否成功要看 simple 是不是 "OK"）。
+// 全用值判断会把这个区别抹掉。
+fn respRead(c: Conn) -> Array {
+    let r = c.readN(1)
+    if (!myBool(r, 0)) { return ["eof", ""] }
+    let tag = bbAt(r[1], 0)
+
+    if (tag == 0x2B) {                     // '+'
+        return ["simple", c.readTextLine()]
+    }
+    if (tag == 0x2D) {                     // '-'
+        return ["error", c.readTextLine()]
+    }
+    if (tag == 0x3A) {                     // ':'
+        let s = c.readTextLine()
+        return ["int", strParseInt(s)]
+    }
+    if (tag == 0x24) {                     // '$'
+        let lenStr = c.readTextLine()
+        let n = strParseInt(lenStr)
+        if (n < 0) { return ["nil", ""] }   // $-1 表示 nil
+        let body = c.readN(n)
+        if (!myBool(body, 0)) { return ["eof", ""] }
+        // 读掉尾部的 \r\n
+        c.readN(2)
+        return ["bulk", bbToText(body[1])]
+    }
+    if (tag == 0x2A) {                     // '*'
+        let lenStr = c.readTextLine()
+        let n = strParseInt(lenStr)
+        if (n < 0) { return ["nil", ""] }   // *-1 表示空数组
+        let items = []
+        var i = 0
+        while i < n {
+            let v = respRead(c)
+            arrPush(items, v)
+            // 遇到 EOF 就停，避免协议错位时无限读
+            if (toString(v[0]) == "eof") { break }
+            i = i + 1
+        }
+        return ["array", items]
+    }
+
+    // 不认识的类型字节：返回错误，让上层能报出原始字节
+    return ["error", "未知 RESP 类型字节 0x" + toHex(tag)]
+}
+
+// 把 respRead 的结果简化成「业务值」：
+//
+//   数组 → 递归简化后的 Array
+//   nil  → null（用 "" 代替，因为语言里 null 放进数组会污染类型推断）
+//   其余 → String
+//
+// ── 为什么 nil 不用 null ──────────────────────
+//
+// 实测过：数组里放一个 null 会让整个数组的元素类型推断失效，进而
+// 在**别处**报「宿主是 Null」之类的诡异错误。用 "" 表示 nil，
+// 配合 ResultSet 的 nulls 表来区分「空串」和「不存在」。
+fn respValue(r: Array) -> String {
+    let t = toString(r[0])
+    if (t == "bulk" || t == "simple" || t == "error") { return toString(r[1]) }
+    if (t == "int") { return toString(r[1]) }
+    return ""
+}
+
+// 取数组里的第 i 项并转成字符串值。
+fn respItem(items: Array, i: Int) -> String {
+    if (i < 0 || i >= len(items)) { return "" }
+    let r = items[i]
+    return respValue(r)
+}
+
+// 把嵌套数组拍平成「行 × 列」的二维字符串数组（用于 ResultSet）。
+//
+// ── 为什么需要拍平 ────────────────────────────
+//
+// MGET / HGETALL / LRANGE 的返回是扁平数组，而 SMEMBERS、
+// ZRANGE WITHSCORES 是「数组套数组」或「键值交替」。统一拍平成
+// 二维表能让上层用同一套取值代码。
+fn respFlatten(items: Array) -> Array {
+    let rows = []
+    var i = 0
+    while i < len(items) {
+        let v = items[i]
+        if (toString(v[0]) == "array") {
+            let inner = v[1]
+            let cells = []
+            var k = 0
+            while k < len(inner) {
+                arrPush(cells, respItem(inner, k))
+                k = k + 1
+            }
+            arrPush(rows, cells)
+        } else {
+            let one = []
+            arrPush(one, respValue(v))
+            arrPush(rows, one)
+        }
+        i = i + 1
+    }
+    return rows
+}
+
+// 安全地从 [Bool, bytes] 形状的返回里读 Bool。
+//
+// ── 为什么不直接 `if (r[0])` ──────────────────────
+//
+// 数组元素没有静态类型追踪，直接把 r[0] 当条件会报「无法确定宿主
+// 类型」。显式与 true 比较能让类型推断落地。
+fn myBool(r: Array, idx: Int) -> Bool {
+    if (idx < 0 || idx >= len(r)) { return false }
+    if (r[idx] == true) { return true }
+    return false
+}

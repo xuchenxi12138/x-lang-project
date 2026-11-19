@@ -1,0 +1,382 @@
+// main/main.xle — 应用入口
+//
+// ── 这个文件就是「Spring Boot 的 main 方法」────────────
+//
+// Spring Boot 的入口只有一行 `SpringApplication.run(App.class, args)`，
+// 因为框架把「配置 → 容器 → Web 服务器 → 事件循环」全部封装了。
+//
+// 本文件的结构刻意对应那个顺序，每一段对应框架的一层：
+//
+//   [1] 启动应用（配置、必需项校验、监听、生命周期）
+//   [2] 建容器 + 注册 Bean（相当于 @Component 扫描的结果）
+//   [3] 按计划造实例（相当于 Bean 初始化）
+//   [4] 注册路由（相当于 @RequestMapping）
+//   [5] 中间件（相当于 Filter / HandlerInterceptor）
+//   [6] 事件循环（相当于内嵌 Tomcat 的 accept 循环）
+//   [7] 优雅关停（相当于 @PreDestroy + shutdown hook）
+//
+// ── 为什么 [2] 到 [5] 不能自动化 ─────────────────
+//
+// 因为没有反射。Spring 能扫注解是因为它能在运行时读类的元数据并
+// new 出实例。本语言只能显式写。所以本文件要 100 行左右的装配
+// 代码 —— 这换来的是「整个应用的依赖关系在这一屏里可见」。
+
+from "../../../../../stdlib/web/core/application.xle" import AppOptions, Application
+from "../../../../../stdlib/web/core/container.xle" import Bean, Container
+from "../../../../../stdlib/net/http/server.xle" import hsHttpDateNow, Context, HttpServer
+from "../../../../../stdlib/net/http/router.xle" import rnNormalizePattern, rnMatchPattern, rnSplitSegs, arrHas, Route, Match, Router
+from "../../../../../stdlib/net/http/status.xle" import hsCommonCodes, hsReason, hsClass, hsHasNoBody, hsAdvice
+from "../../../../../stdlib/service/lifecycle.xle" import lcStateName, lcStateInit, lcStateStarting, lcStateRunning, lcStateStopping, lcStateStopped, lcStateFailed, Component, Lifecycle
+from "../../../../../stdlib/service/health.xle" import hqJson, CheckResult, HealthChecker
+
+from "../config/app_config.xle" import AppConfig
+from "../model/post.xle" import postJsonStr, Post
+from "../repository/post_repo.xle" import postHasTag, PostRepository
+from "../service/post_service.xle" import PostService
+from "../controller/post_controller.xle" import jsonGetStr, jsonGetStrArray, PostController
+from "../middleware/pipeline.xle" import Middleware, Pipeline
+
+fn main() {
+    // ── 端口来源 ───────────────────────────
+    //
+    // 本语言没有「读命令行参数」的内建（P0 没有）。所以端口只能从
+    // 配置文件来。为了让示例在任何环境下都能跑，这里默认用 8080；
+    // 端口被占用时 prepare() 会返回明确错误（而不是静默失败）。
+    //
+    // 真实项目可以在 conf/application.properties 里改 server.port。
+    let cliPort = 8080
+
+    // ══════════════════════════════════════════
+    // [1] 启动应用
+    // ══════════════════════════════════════════
+    let app = Application.builder()
+    app.bindTo("0.0.0.0", cliPort)
+    // 配置文件（存在则加载；不存在会报错，所以这里先判断）
+    let cfgCandidate = "apps/blog/conf/application.properties"
+    if (fsExists(cfgCandidate)) {
+        app.withConfigFile(cfgCandidate)
+    }
+    app.stopAfter(500)
+    app.setAccessLog(true)
+
+    let prep = app.prepare()
+    if (prep[0] != true) {
+        println("启动失败：" + toString(prep[1]))
+        return
+    }
+
+    // 从 Config 装载类型化配置，并校验
+    let appCfg = AppConfig.fromConfig(app.config)
+    appCfg.port = cliPort
+    let cfgProblems = appCfg.validate()
+    if (len(cfgProblems) > 0) {
+        println("配置校验失败：")
+        var i = 0
+        while i < len(cfgProblems) {
+            println("  - " + toString(cfgProblems[i]))
+            i = i + 1
+        }
+        app.server.listener.close()
+        return
+    }
+
+    // ══════════════════════════════════════════
+    // [2] 建容器 + 注册 Bean
+    // ══════════════════════════════════════════
+    //
+    // 注册顺序 = 依赖顺序（见 container.xle 的说明）。
+    //   repo  不依赖任何东西
+    //   svc   依赖 repo
+    //   ctrl  依赖 svc + cfg
+    let repo         = new PostRepository()
+    let svc          = new PostService(repo)
+    let ctrl         = new PostController(svc, appCfg)
+    let middleware   = new Pipeline()
+
+    let c = app.container
+    c.register("postRepository", "new")
+    c.register("postService", "new")
+    c.register("postController", "new")
+
+    // ══════════════════════════════════════════
+    // [3] 造实例并挂进容器
+    // ══════════════════════════════════════════
+    //
+    // ── 为什么要「挂实例」这一步 ────────────────
+    //
+    // 因为容器不能自己 new（语言没有反射）。所以容器只记录「已就绪」，
+    // 实例真实存在哪由应用自己管。
+    //
+    // 这里传给 attach 的是「实例池下标」，而实际的实例在闭包里 ——
+    // 实际上本示例的实例直接就是 repo/svc/ctrl 三个局部变量，容器
+    // 里的下标只是序号。真实项目里应该用实例池数组持有它们。
+    c.attach("postRepository", 0)
+    c.attach("postService", 1)
+    c.attach("postController", 2)
+
+    svc.controllerReady()       // 标记服务已装配完成
+
+    // 生命周期组件标记为已启动
+    markComponent(app.lifecycle, "storage", true)
+    markComponent(app.lifecycle, "cache", true)
+    markComponent(app.lifecycle, "services", true)
+
+    // ══════════════════════════════════════════
+    // [4] 注册路由
+    // ══════════════════════════════════════════
+    //
+    // ── 注册顺序就是匹配优先级 ────────────────
+    //
+    // `/api/posts/status/:s` 必须在 `/api/posts/:id` **之前**，
+    // 否则 `/api/posts/status` 会被 `:id` 匹配走，然后 `id="status"`
+    // 变成一个非法整数，返回 400 —— 而真正的路由永远命中不了。
+    //
+    // 这是「注册顺序 = 优先级」带来的代价，也是它最需要被记住的
+    // 地方。所以顺序在这里刻意从「具体」排到「泛化」。
+    let R = app.server.router
+    R.get("/", "home")
+    R.get("/api/posts", "listPosts")
+    R.get("/api/posts/status/:s", "listByStatus")
+    R.get("/api/posts/tag/:t", "listByTag")
+    R.get("/api/posts/:id", "getPost")
+    R.post("/api/posts", "createPost")
+    R.put("/api/posts/:id", "updatePost")
+    // ── 方法名不能叫 delete ──────────────────
+    //
+    // `delete` 是运算符关键字（用于 arrRemove 之类的语义），不能当
+    // 方法名。Router 上对应的方法叫 del()。
+    R.del("/api/posts/:id", "deletePost")
+    R.get("/api/audit", "audit")
+    R.get("/api/health", "healthDetail")
+
+    // 健康端点（框架提供）
+    app.registerHealthEndpoint()
+
+    // ══════════════════════════════════════════
+    // [5] 中间件
+    // ══════════════════════════════════════════
+    middleware.use("accessLog", 10)
+    middleware.use("requestId", 20)
+    middleware.use("rateLimit", 30)
+    middleware.use("auth", 40)
+    middleware.use("cors", 70)
+    if (appCfg.enableAccessLog) {
+        // 关闭时只是不执行动作，声明保留（便于对比诊断输出）
+    }
+
+    markComponent(app.lifecycle, "http", true)
+    app.lifecycle.markRunning()
+
+    // ══════════════════════════════════════════
+    // [6] 事件循环
+    // ══════════════════════════════════════════
+    println("=========================================")
+    println(" blog 应用已启动")
+    println("=========================================")
+    println(appCfg.describe())
+    println("")
+    println(app.describe())
+    println(c.dump())
+    println("")
+    println(middleware.dump())
+    println("")
+    println(R.dumpRoutes())
+    println("")
+    println("示例数据：")
+    seed(repo, svc)
+    println("  " + repo.describe())
+    println("")
+    println("监听 http://127.0.0.1:" + toString(app.port()))
+    println("按 Ctrl+C 或等待 " + toString(app.options.stopAfterRequests) + " 个请求后退出")
+    println("")
+
+    let handled = 0
+    var running = true
+    while running {
+        let ra = app.server.listener.acceptWithin(1000)
+        if (ra[0] != true) {
+            // 超时：没有新连接。这里可以做事（比如检查停止条件）。
+            //
+            // ── 为什么不当成错误 ─────────────────
+            //
+            // 因为单线程服务在空闲时本来就没有连接。把它当错误退出
+            // 会让服务「一没有流量就死」，这是最糟的行为。
+            continue
+        }
+        let sock: TcpStream = ra[1]
+
+        // 每请求重置中间件状态
+        middleware.reset()
+        let ok = middleware.markRan("accessLog")
+        if (ok) { middleware.markRan("requestId") }
+
+        let ctx = app.server.handleOne(sock)
+
+        // 健康端点由框架处理，优先级高于业务路由
+        let healthHandled = app.handleHealth(ctx)
+        if (!healthHandled) {
+            dispatch(ctx, ctrl, appCfg)
+        }
+
+        app.server.finish(ctx, sock)
+        sock.close()
+
+        // 计数与停止条件
+        let n = app.server.servedCount
+        if (app.options.stopAfterRequests > 0 && n >= app.options.stopAfterRequests) {
+            running = false
+        }
+    }
+
+    // ══════════════════════════════════════════
+    // [7] 关停（顺序与服务启动相反）
+    // ══════════════════════════════════════════
+    println("")
+    println("=========================================")
+    println(" 开始关停（按 phase 降序）")
+    println("=========================================")
+    let stopOrder = app.lifecycle.stopOrder()
+    var si = 0
+    while si < len(stopOrder) {
+        let idx: Int = stopOrder[si]
+        let comp: Component = app.lifecycle.components[idx]
+        println("  停止 " + comp.name + " (phase=" + toString(comp.phase) + ")")
+        comp.started = false
+        si = si + 1
+    }
+    app.lifecycle.beginStop()
+    app.server.listener.close()
+    app.lifecycle.markStopped()
+
+    println("")
+    println("已处理 " + toString(app.server.servedCount) + " 个请求，" +
+            toString(app.server.errorCount) + " 个错误")
+    println("审计记录 " + toString(len(svc.auditLines())) + " 条")
+    println("最终状态：" + lcStateName(app.lifecycle.state))
+}
+
+// ── 路由分派 ──────────────────────────────────
+//
+// ── 这就是「注解驱动路由」在本语言里的替代品 ─────────
+//
+// Spring 用 @GetMapping("/api/posts") 把方法挂到路径上，运行时反射
+// 调用。这里用一个显式函数按 handlerName 分派 —— 效果相同，代价是
+// 多写一个 match，收益是「哪个路径对应哪个方法」在这一屏里全部可见
+// （而注解分散在十几个文件里，需要 IDE 才能看清全貌）。
+fn dispatch(ctx: Context, ctrl: PostController, cfg: AppConfig) {
+    if (!ctx.routing.matched) {
+        // handleOne 已经填了 404 或 405
+        return
+    }
+    let rt: Route = ctx.routing.route
+    let h = rt.handlerName
+
+    if (h == "home") {
+        ctx.html(200, "<h1>blog 服务</h1>" +
+                 "<p>接口见 <a href=\"/api/posts\">/api/posts</a></p>")
+        return
+    }
+    if (h == "listPosts") {
+        ctrl.list(ctx)
+        return
+    }
+    if (h == "getPost") {
+        ctrl.detail(ctx)
+        return
+    }
+    if (h == "createPost") {
+        ctrl.create(ctx)
+        return
+    }
+    if (h == "updatePost") {
+        ctrl.update(ctx)
+        return
+    }
+    if (h == "deletePost") {
+        ctrl.remove(ctx)
+        return
+    }
+    if (h == "listByStatus") {
+        let st = ctx.param("s", "")
+        let items = ctrl.svc.listByStatus(st)
+        ctx.json(200, postsToJson(items))
+        return
+    }
+    if (h == "listByTag") {
+        let t = ctx.param("t", "")
+        let items = ctrl.svc.listByTag(t)
+        ctx.json(200, postsToJson(items))
+        return
+    }
+    if (h == "audit") {
+        ctrl.audit(ctx)
+        return
+    }
+    if (h == "healthDetail") {
+        let report = appHealthReport(ctrl)
+        ctx.json(200, report)
+        return
+    }
+}
+
+// 把文章数组序列化成 JSON。
+fn postsToJson(items: Array) -> String {
+    var json = "{\"total\":" + toString(len(items)) + ",\"items\":["
+    var i = 0
+    while i < len(items) {
+        if (i > 0) { json = json + "," }
+        let p: Post = items[i]
+        json = json + p.toJson()
+        i = i + 1
+    }
+    json = json + "]}"
+    return json
+}
+
+// 标记生命周期组件状态。
+fn markComponent(lc: Lifecycle, name: String, up: Bool) {
+    let c = lc.find(name)
+    if (len(c.name) > 0) {
+        c.started = up
+    }
+}
+
+// 健康详情。
+fn appHealthReport(ctrl: PostController) -> String {
+    let total = ctrl.svc.repo.count()
+    return "{\"status\":\"ok\",\"posts\":" + toString(total) +
+           ",\"audit\":" + toString(len(ctrl.svc.auditLines())) + "}"
+}
+
+// 示例数据。
+//
+// ── 为什么示例数据写在 main 里而不是单独的文件 ────────
+//
+// 因为它是「这个示例的一次性装饰」，不是业务逻辑。放进 repository
+// 会让「仓储」这个概念带上「造测试数据」的职责，而那是不该有的。
+// 真实项目用迁移脚本或者单独的 seed 工具。
+fn seed(repo: PostRepository, svc: PostService) {
+    let tags1 = ["架构", "分层"]
+    let r1 = svc.create("为什么业务代码要分层",
+                        "因为改一处不该动十处。分层让变更的影响面可预测。",
+                        "徐辰曦", tags1, "published")
+    let tags2 = ["网络", "HTTP"]
+    let r2 = svc.create("HTTP 报文边界为什么容易写错",
+                        "因为 TCP 是字节流，一次 recv 不等于一条消息。",
+                        "徐辰曦", tags2, "published")
+    let tags3 = ["草稿"]
+    let r3 = svc.create("未完成的第三篇",
+                        "", "徐辰曦", tags3, "draft")
+    if (r1[0] == true) {
+        let p: Post = r1[1]
+        println("  " + p.describe())
+    }
+    if (r2[0] == true) {
+        let p: Post = r2[1]
+        println("  " + p.describe())
+    }
+    if (r3[0] == true) {
+        let p: Post = r3[1]
+        println("  " + p.describe())
+    }
+}

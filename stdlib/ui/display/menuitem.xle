@@ -1,0 +1,72 @@
+// ui/display/menuitem.xle — 菜单项的字符串约定与解析
+//
+// ── 菜单项的表示 ─────────────────────────────
+//
+// 用「约定好的字符串格式」而不是结构体数组：
+//
+//   "打开"              —— 普通项
+//   "-"                 —— 分隔线
+//   "!删除"             —— 禁用项（前缀 !）
+//   "*新建   Ctrl+N"    —— 带快捷键（两个空格分隔）
+//
+// ── 为什么用字符串而不是结构体 ───────────────────
+//
+// 因为语言没有结构体数组字面量（`[{a:1},{a:2}]` 能写但取字段
+// 要下标，很别扭）。而菜单项几乎总是**静态**的（写死在代码里），
+// 用字符串字面量最舒服：
+//
+//     menubar.items = ["文件", "编辑", "视图"]
+//     menu.items    = ["打开", "保存", "-", "!删除"]
+//
+// 代价是解析开销 —— 每帧解析一次数组。对 10 个菜单项来说，
+// 每帧 10 次字符串操作可以接受（微秒级），而换来的可读性是
+// 每次读代码都受益的。
+//
+// ── 为什么单独一个文件 ────────────────────────
+//
+// 这四个函数被 MenuBar 和 Menu 同时用。如果放进其中任何一个类
+// 的文件里，另一个就得反向 import，依赖方向就乱了。放独立文件
+// 之后两者都单向依赖它。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 是否为分隔线。
+fn menuIsSep(s: String) -> Bool {
+    return s == "-"
+}
+
+// 是否为禁用项。
+fn menuIsDisabled(s: String) -> Bool {
+    if (len(s) == 0) { return false }
+    return strSub(s, 0, 1) == "!"
+}
+
+// 取显示文字（去掉 ! 前缀、去掉快捷键部分）。
+fn menuLabel(s: String) -> String {
+    var t = s
+    if (menuIsDisabled(t)) {
+        t = strSub(t, 1, len(t))
+    }
+    // 两个空格之后是快捷键。
+    let k = strFind(t, "  ")
+    if (k >= 0) {
+        return strSub(t, 0, k)
+    }
+    return t
+}
+
+// 取快捷键文字。「  」之后的部分。
+fn menuShortcut(s: String) -> String {
+    var t = s
+    if (menuIsDisabled(t)) {
+        t = strSub(t, 1, len(t))
+    }
+    let k = strFind(t, "  ")
+    if (k < 0) { return "" }
+    return strSub(t, k + 2, len(t))
+}

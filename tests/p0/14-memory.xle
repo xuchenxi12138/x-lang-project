@@ -1,0 +1,68 @@
+// 14-memory.x — 内存与引用计数
+//
+// P0 用的是「最小可行 ARC」：字符串带引用计数，其余类型全是值。
+// 这个文件验证三件事：
+//   1. 大量临时字符串不泄漏（进程 RSS 不涨）
+//   2. 字符串在赋值 / 传参 / 返回时正确 retain/release（不提前释放导致 use-after-free）
+//   3. 深递归不崩（帧在值栈上，靠 FRAME_MAX 兜底）
+
+println("=== 字符串所有权：传参 ===")
+fn show(s: String) -> String {
+    // 参数是借用语义还是所有权转移？P0 的做法是：调用时 reatin，
+    // 返回时把引用转移给调用方。用户看不见差别。
+    return s + "!"
+}
+
+let orig = "hello"
+let r1 = show(orig)
+println(r1)             // hello!
+println(orig)           // hello（原值仍可用）
+
+println("=== 字符串所有权：赋值链 ===")
+let a = "abc"
+let b = a
+let c = b
+println(a)              // abc
+println(b)              // abc
+println(c)              // abc
+
+println("=== 大量临时字符串（引用计数压力） ===")
+// 每一次循环产生 3 个 XStr：t1 = acc + "x"，acc 释放旧值，t1 存回。
+// 若有泄漏，10000 轮会产生 2 万个 32 字节对象，RSS 涨约 640KB，
+// 肉眼看不出来——所以这里用 100000 轮放大到 6MB 级。
+var acc = ""
+var i = 0
+while i < 100000 {
+    acc = acc + "x"
+    i += 1
+}
+println(len(acc))       // 100000
+
+println("=== 字符串在循环里不断被覆盖 ===")
+// 这个模式最容易暴露 release 漏掉：每轮把变量指向新字符串，
+// 旧字符串必须被释放，否则整轮跑完泄漏 10000 个。
+var s = "start"
+var k = 0
+while k < 10000 {
+    s = toString(k)
+    k += 1
+}
+println(s)              // 9999
+
+println("=== 深递归（帧深度上限） ===")
+fn countdown(n: Int) -> Int {
+    if n == 0 {
+        return 0
+    }
+    return countdown(n - 1) + 1
+}
+println(countdown(2000))    // 2000
+
+println("=== 递归里创建字符串 ===")
+fn build(n: Int) -> String {
+    if n == 0 {
+        return ""
+    }
+    return build(n - 1) + "a"
+}
+println(len(build(500)))    // 500

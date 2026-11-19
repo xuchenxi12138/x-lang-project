@@ -1,0 +1,431 @@
+// db/sqlite/driver.xle — SQLite 驱动
+//
+// ── 一个必须一开始就说清楚的边界 ────────────────────────
+//
+// 本驱动是一个**只读的文件读取器 + 极简查询引擎**，不是完整的
+// SQLite 实现。它做的是：
+//
+//   ✓ 解析文件头、页表、B-tree、记录编码
+//   ✓ 读 sqlite_master，列出表/索引/视图
+//   ✓ SELECT 的三种形态：全表扫描、WHERE 等值/比较过滤、LIMIT
+//   ✓ 支持聚合：COUNT(*) / SUM / AVG / MIN / MAX
+//   ✓ 从 CREATE TABLE 里恢复列名与类型名
+//
+// 它**不做**：
+//
+//   ✗ 写入（INSERT/UPDATE/DELETE/DDL）—— 写要处理 freelist、页分裂、
+//     事务日志、WAL checkpoint，那是几万行的工程量
+//   ✗ 索引加速 —— 只做全表扫描。SQLite 的索引 B-tree 结构不同（叶子
+//     cell 是索引键+rowid），能读但要额外一层
+//   ✗ JOIN / 子查询 / GROUP BY / HAVING / ORDER BY / DISTINCT
+//   ✗ WAL 模式（遇到明确报错，不静默读旧数据）
+//   ✗ 表达式求值（`WHERE age + 1 > 20` 这类）
+//
+// ── 为什么只读也值得写 ──────────────────────────────
+//
+// 因为「打开一个 SQLite 文件看看里面有什么」是最常见的需求之一：
+// 日志归档、桌面应用的本地库、移动端的同步文件、测试夹具。而这些
+// 场景全都是只读。相比之下 MySQL / Postgres 的驱动能读写是因为
+// 写操作的复杂度在服务端，客户端只是发报文；SQLite 的客户端**就是
+// 服务端**，写操作的全部复杂度都落在客户端。
+//
+// 这个边界在各方法的注释里重复写明，不让人误以为能写入。
+
+from "../core/datasource.xle" import sqlBind, execAll, DataSource
+from "../core/result.xle" import ResultSet
+from "../core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "format.xle" import sqliteParseHeader, sqlitePageKindName, sqlitePageBytes, sqlitePageHdrBase, sqliteParsePage, sqliteCellOffset, sqliteAllPages, SqliteHeader, SqlitePage, SQLITE_MAGIC, SQLITE_PAGE_INTERIOR_INDEX, SQLITE_PAGE_INTERIOR_TABLE, SQLITE_PAGE_LEAF_INDEX, SQLITE_PAGE_LEAF_TABLE, SQLITE_FILE_HEADER_SIZE, SQLITE_ENC_UTF8, SQLITE_ENC_UTF16LE, SQLITE_ENC_UTF16BE, SQLITE_LEAF_HDR, SQLITE_INNER_HDR
+from "varint.xle" import svReadInt, svWriteInt, svWriteInt64, svPutInt, svReadMany
+from "record.xle" import svSerialKind, svSerialBytes, svReadRecord, svReadSignedBE, svReadDoubleBE, svRecordColCount, SvValue, SV_NULL, SV_INT, SV_FLOAT, SV_TEXT, SV_BLOB
+from "btree.xle" import svReadCell, svCollectOverflow, svScanTable, svScanInto, svInspectTree, svInspectInto, SvCell, SvTreeInfo
+from "schema.xle" import svSchemaFromPayloads, svValText, svValInt, svTableConstraintKeywords, svColumnsFromCreate, svIsTableConstraint, svStartsWithCi, svMatchParen, svSkipQuoted, svSplitTop, svFirstIdent, svReadQuotedName, svTableNameFromCreate, svSkipSpaces, svSkipKeyword, svReadQualifiedName, svFindTopDot, svUnquote, svIsRowidAlias, svRowidAliasIndex, SvSchemaEntry, SV_MASTER_COLS
+from "select.xle" import svParseSelect, svCollapseWs, svFindKeyword, svIdentEnd, svNormProjection, svParseCondition, svFindOperator, svNormLiteral, SvQuery
+from "execute.xle" import svRowMatches, svColIndex, svCompareValue, svAsFloat, svParseNumber, svCmpFloat, svCmpText, svProject, svAggregate, svNumText
+
+// sqlite_master 的根页号。规范和实现里都是硬编码的 1。
+const SV_MASTER_ROOT = 1
+
+// 文件大小上限。全读进内存的实现，必须有个上限，否则一次误操作
+// 就把进程 OOM 掉。256MB 覆盖了绝大多数「桌面应用本地库 / 日志归档」
+// 的场景，超出时给明确报错而不是慢慢卡死。
+const SV_MAX_FILE_BYTES = 268435456
+
+class SqliteDataSource extends DataSource {
+    // 数据库文件路径。
+    path: String,
+
+    // 整个文件的字节（读一次，后续所有页都从这里切）。
+    file: Array,
+
+    // 解析出的文件头。
+    header: SqliteHeader,
+
+    constructor(path: String) {
+        // SQLite 没有网络端点，但 DataSource 要求一个 ep。用一个
+        // 占位端点，host 放文件所在目录，port 放 0 —— 这样
+        // describe() 打印出来还是有用的（能看出文件在哪）。
+        self.ep        = endpointOf("file", 0)
+        self.path      = path
+        self.dialect   = dialectOf(DB_SQLITE)
+        self.connected = false
+        self.lastError = ""
+        self.file      = []
+        let h = new SqliteHeader()
+        self.header    = h
+    }
+
+    static fn ofFile(path: String) -> SqliteDataSource {
+        return new SqliteDataSource(path)
+    }
+
+    // ── 连接 = 打开并解析文件头 ────────────────────
+
+    fn connect() -> Bool {
+        self.lastError = ""
+
+        if (!fsExists(self.path)) {
+            self.lastError = "文件不存在：" + self.path
+            return false
+        }
+
+        let size = fsSize(self.path)
+        if (size == 0) {
+            self.lastError = "文件是空的：" + self.path
+            return false
+        }
+        if (size > SV_MAX_FILE_BYTES) {
+            self.lastError = "文件 " + toString(size) + " 字节，超过 " +
+                             toString(SV_MAX_FILE_BYTES) + " 的上限" +
+                             "（本驱动会把整个文件读进内存）"
+            return false
+        }
+
+        // ── 读文件并转成字节数组 ─────────────────────
+        //
+        // fsRead 返回 String，而 String 的 len / strSub 按**码点**工作
+        // （见 codec/bytes.xle 文件头那段论证）。所以必须立刻用
+        // strBytes 转成字节数组，后续所有解析都在 Array 上做。
+        //
+        // 直接拿 String 去 bbU16BE 会读到错的偏移 —— 一个含中文的
+        // SQLite 文件里，文本列的字节数和码点数完全不同，偏移一错
+        // 就全盘皆错，而且不报错。
+        let raw = fsRead(self.path)
+        self.file = strBytes(raw)
+
+        if (len(self.file) < 100) {
+            self.lastError = "文件不足 100 字节，不是合法的 SQLite 数据库"
+            return false
+        }
+
+        let h = sqliteParseHeader(bbSlice(self.file, 0, 100))
+        self.header = h
+        if (!h.valid) {
+            self.lastError = h.error
+            return false
+        }
+
+        // WAL 模式：明确拒绝。
+        //
+        // ── 为什么不能「尽力而为」 ────────────────────────
+        //
+        // WAL 模式下，最近的写入在 `<db>-wal` 文件里，主文件里的页
+        // 还是旧的。只读主文件会得到「几分钟前的数据」—— 而它看起来
+        // 完全正常（能读出表、能查出旧行），用户根本不会怀疑。
+        //
+        // 所以宁可直接报错。可操作的修复办法写在错误信息里。
+        if (h.wal) {
+            self.lastError = "数据库处于 WAL 模式，本驱动不支持（会把旧数据当成最新数据读出）。" +
+                             "请先在另一个连接里执行 `PRAGMA journal_mode=DELETE;` 并断开，再重试。"
+            return false
+        }
+
+        // 页数一致性检查。文件头里的 pageCount 在正常关闭时是准的；
+        // 被强杀进程留下时可能偏小。这里以**实际文件长度**为准，
+        // 因为全读实现本来就按长度切页。
+        let actualPages = len(self.file) / h.pageSize
+        if (actualPages == 0) {
+            self.lastError = "文件长度 " + toString(len(self.file)) +
+                             " 不足一页（页大小 " + toString(h.pageSize) + "）"
+            return false
+        }
+
+        self.connected = true
+        return true
+    }
+
+    fn close() {
+        self.file      = []
+        self.connected = false
+    }
+
+    fn ping() -> Bool {
+        if (!self.connected) { return false }
+        // 文件系统层面的存活判断：文件还在、长度没变。
+        if (!fsExists(self.path)) { return false }
+        return fsSize(self.path) == len(self.file)
+    }
+
+    // ── 元数据 ──────────────────────────────────
+
+    // 读 sqlite_master，返回所有对象。
+    fn schema() -> Array {
+        if (!self.connected) { return [] }
+        let ps = self.header.pageSize
+        let cells = svScanTable(self.file, SV_MASTER_ROOT, ps)
+        let payloads = []
+        var i = 0
+        while (i < len(cells)) {
+            let c: SvCell = cells[i]
+            arrPush(payloads, c.payload)
+            i = i + 1
+        }
+        return svSchemaFromPayloads(payloads)
+    }
+
+    // 只取用户表（排除 sqlite_ 开头的内部表）。
+    fn tables() -> Array {
+        let all = self.schema()
+        let out = []
+        var i = 0
+        while (i < len(all)) {
+            let e: SvSchemaEntry = all[i]
+            if (e.objType == "table" && !svStartsWithCi(e.name, "sqlite_")) {
+                arrPush(out, e.name)
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // 查某个表的元数据。找不到返回空的 SvSchemaEntry（name 为空）。
+    fn tableEntry(name: String) -> SvSchemaEntry {
+        let all = self.schema()
+        var i = 0
+        while (i < len(all)) {
+            let e: SvSchemaEntry = all[i]
+            if (e.name == name && e.objType == "table") { return e }
+            i = i + 1
+        }
+        return new SvSchemaEntry()
+    }
+
+    // ── 执行 ────────────────────────────────────
+    //
+    // query 支持一个小得多的 SQL 子集。必须是 SELECT，否则明确报错。
+    fn query(sql: String) -> ResultSet {
+        return self.runSelect(sql)
+    }
+
+    // 写入一律拒绝。
+    //
+    // ── 为什么不返回「成功但 0 行」 ─────────────────────
+    //
+    // 因为那会让 `execute("INSERT ...")` 看起来成功了。业务代码
+    // 通常写 `if (rs.affected > 0) { 成功 }`，affected=0 会被当成
+    // 「条件不匹配」，于是静默丢数据。明确失败比假成功好。
+    fn execute(sql: String) -> ResultSet {
+        let rs = ResultSet.empty()
+        rs.ok = false
+        rs.error = "SQLite 驱动是只读的，不支持写入：" + sqlHead(sql, 40) +
+                   "（写要处理 freelist / 页分裂 / 事务日志 / WAL，不在 P0 范围）"
+        return rs
+    }
+
+    // ── SELECT ──────────────────────────────────
+
+    fn runSelect(sql: String) -> ResultSet {
+        if (!self.connected) {
+            let rs = ResultSet.empty()
+            rs.ok = false
+            rs.error = "未连接（先调 connect()）"
+            return rs
+        }
+
+        let q = svParseSelect(sql)
+        if (!q.ok) {
+            let rs = ResultSet.empty()
+            rs.ok = false
+            rs.error = q.error
+            return rs
+        }
+
+        // 定位表
+        let entry = self.tableEntry(q.tableName)
+        if (len(entry.name) == 0) {
+            let rs = ResultSet.empty()
+            rs.ok = false
+            rs.error = "没有表 `" + q.tableName + "`。" + self.tableHint()
+            return rs
+        }
+        if (entry.rootPage == 0) {
+            let rs = ResultSet.empty()
+            rs.ok = false
+            rs.error = "表 `" + q.tableName + "` 没有 root page（可能是虚拟表）"
+            return rs
+        }
+
+        let cols = svColumnsFromCreate(entry.sql)
+        if (len(cols) == 0) {
+            let rs = ResultSet.empty()
+            rs.ok = false
+            rs.error = "无法从建表语句解析列名：`" + sqlHead(entry.sql, 60) + "`"
+            return rs
+        }
+
+        // 扫全表（P0 没有索引加速）
+        let cells = svScanTable(self.file, entry.rootPage, self.header.pageSize)
+
+        // 逐行解码 + 过滤 + 投影 / 聚合。
+        //
+        // 这三步都在 execute.xle 里实现，本函数只负责「把页变成行」。
+        // 分开的好处：execute 层完全不依赖文件和页，可以用构造的
+        // 行数组单测；driver 层改页处理不用动查询语义。
+        //
+        // ── rowid 别名列要回填 ───────────────────────────
+        //
+        // `INTEGER PRIMARY KEY` 那一列在 payload 里是 NULL（serial
+        // type 0），真实值在同一条 cell 的 rowid 上。不回填的症状是
+        // id 列全读成 NULL —— 而其他列、行数、列数全对，极难发现。
+        let rowidCol = svRowidAliasIndex(entry.sql, cols)
+
+        let kept = []
+        var i = 0
+        while (i < len(cells)) {
+            let c: SvCell = cells[i]
+            let r = svReadRecord(c.payload, 0)
+            let vals = r[0]
+            if (len(vals) > 0) {
+                if (rowidCol >= 0 && rowidCol < len(vals)) {
+                    let rv: SvValue = vals[rowidCol]
+                    // 只在它为 NULL 时回填 —— 有些库（WITHOUT ROWID
+                    // 或显式写了值）会在 payload 里存真实值，那种
+                    // 情况应保留原值。
+                    if (rv.kind == SV_NULL) {
+                        rv.kind = SV_INT
+                        rv.i    = c.rowid
+                    }
+                }
+                if (svRowMatches(vals, cols, q)) {
+                    arrPush(kept, vals)
+                }
+            }
+            i = i + 1
+        }
+
+        // WHERE 用到了不存在的列时，svRowMatches 一律返回 false，
+        // 结果是「0 行且无声」。这里补一条可操作的错误。
+        if (q.hasWhere && len(kept) == 0 && svColIndex(cols, q.whereCol) < 0) {
+            let rs = ResultSet.empty()
+            rs.ok = false
+            rs.error = "WHERE 里的列 `" + q.whereCol + "` 不存在。" + svColHint(cols)
+            return rs
+        }
+
+        // 聚合
+        if (q.isAggregate()) {
+            return svAggregate(kept, cols, q)
+        }
+
+        // 投影 + LIMIT
+        return svProject(kept, cols, q)
+    }
+
+    // 表名提示，用于「没有表 x」这类错误。
+    fn tableHint() -> String {
+        let ts = self.tables()
+        if (len(ts) == 0) { return "这个文件里没有用户表。" }
+        var s = "现有表："
+        var i = 0
+        while (i < len(ts) && i < 10) {
+            if (i > 0) { s = s + ", " }
+            s = s + toString(ts[i])
+            i = i + 1
+        }
+        return s
+    }
+
+    // ── 诊断 ────────────────────────────────────
+
+    fn describe() -> String {
+        var state = "未打开"
+        if (self.connected) { state = "已打开" }
+        var s = "SQLite @" + self.path + " [" + state + "]"
+        if (self.header.valid) {
+            s = s + " page=" + toString(self.header.pageSize) +
+                " pages=" + toString(len(self.file) / self.header.pageSize)
+        }
+        return s
+    }
+
+    fn kind() -> Int {
+        return DB_SQLITE
+    }
+
+    fn name() -> String {
+        return "sqlite"
+    }
+
+    // 结构自检：文件头 + sqlite_master + 每张表的 B-tree 统计。
+    fn inspect() -> String {
+        if (!self.connected) { return "未打开：" + self.path }
+        var s = "文件 " + self.path + "\n"
+        s = s + "  页大小 " + toString(self.header.pageSize) +
+                "，共 " + toString(len(self.file) / self.header.pageSize) + " 页" +
+                "，编码 " + svEncodingName(self.header.encoding) + "\n"
+        s = s + "  schema 格式 " + toString(self.header.schemaFormat) +
+                "，库版本 " + toString(self.header.libVersion) + "\n"
+
+        let info = svInspectTree(self.file, SV_MASTER_ROOT, self.header.pageSize)
+        s = s + "  sqlite_master " + info.describe() + "\n"
+
+        let all = self.schema()
+        var i = 0
+        while (i < len(all)) {
+            let e: SvSchemaEntry = all[i]
+            s = s + "  " + e.objType + " `" + e.name + "` root=" + toString(e.rootPage)
+            if (e.objType == "table" && e.rootPage > 0 && len(e.sql) > 0) {
+                let cols = svColumnsFromCreate(e.sql)
+                s = s + " 列(" + toString(len(cols)) + ")："
+                var k = 0
+                while (k < len(cols)) {
+                    if (k > 0) { s = s + ", " }
+                    s = s + toString(cols[k])
+                    k = k + 1
+                }
+                let ti = svInspectTree(self.file, e.rootPage, self.header.pageSize)
+                s = s + "  " + ti.describe()
+            }
+            s = s + "\n"
+            i = i + 1
+        }
+        return s
+    }
+}
+
+fn svEncodingName(e: Int) -> String {
+    if (e == SQLITE_ENC_UTF8)    { return "UTF-8" }
+    if (e == SQLITE_ENC_UTF16LE) { return "UTF-16LE" }
+    if (e == SQLITE_ENC_UTF16BE) { return "UTF-16BE" }
+    return "未知(" + toString(e) + ")"
+}
+
+// 列名提示，用于「WHERE 里的列不存在」。
+fn svColHint(cols: Array) -> String {
+    var s = "现有列："
+    var i = 0
+    while (i < len(cols) && i < 12) {
+        if (i > 0) { s = s + ", " }
+        s = s + toString(cols[i])
+        i = i + 1
+    }
+    return s
+}
+
+// 取 SQL 的前 n 个字符，用于错误信息里回显。
+fn sqlHead(sql: String, n: Int) -> String {
+    let t = strTrim(sql)
+    if (len(t) <= n) { return t }
+    return strSub(t, 0, n) + "…"
+}

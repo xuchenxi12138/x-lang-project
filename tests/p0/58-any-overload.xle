@@ -1,0 +1,51 @@
+// 58 — Any 类型与函数重载（compile.c 的 resolve_overload）
+//
+// 两个语言特性（04 §3 的 L2 别名包因此从「取舍」变成「能力」）：
+//
+//   Any（任意）参数：调用点不查该参数的类型，函数体拿到运行时真实值；
+//   Any（任意）返回：透传函数体的返回值 —— 运行时是 Int 就是 Int，
+//   是 Float 就是 Float。「返回类型保持输入」的函数（abs/min/max/
+//   arrPop）从此包得住，不再只能用英文原名。
+//
+//   重载：同名不同签名并存，调用点按实参类型挑选（精确匹配 >
+//   数值放行 > 通配），打分并列时报歧义而不是猜。
+//
+// 本文件锁定三件事：
+//   1. 重载按实参类型正确分派（String 版与 Array 版同名共存）
+//   2. Any 返回把 Int / Float 原样透传，不改值、不丢类型
+//   3. Any 参数显式声明多态（不再依赖「参数不注解」的隐式行为）
+//
+// 注意：本文件刻意不测「歧义报错」—— 那是负向用例，断言错误文案
+// 的活归 tools/check_compile_diagnostics.sh 的场景集。
+
+fn 查找(s: String, 子: String) -> Int {
+    return strFind(s, 子)
+}
+
+fn 查找(xs: Array, v: Any) -> Int {
+    return arrIndexOf(xs, v)
+}
+
+fn 绝对值(x: Any) -> Any {
+    return math(abs, x)
+}
+
+fn 首个(xs: Array) -> Any {
+    return xs[0]
+}
+
+fn main() -> Int {
+    println(查找("中文编程", "编程"))
+
+    let xs = array(4, 0)
+    xs[2] = 9
+    println(查找(xs, 9))
+
+    // 同一个 Any 返回函数，Int 与 Float 各透传一次
+    println(绝对值(-7))
+    println(绝对值(-2.5))
+
+    println(首个(xs))
+    println("any-overload ok")
+    return 0
+}

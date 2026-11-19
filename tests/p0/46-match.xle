@@ -1,0 +1,108 @@
+// 46-match.xle — match 表达式
+//
+// ── 降级成一条比较链，不加新指令 ────────────────────
+//
+// 被匹配值先 STORE_LOCAL 到临时槽（它只能求值一次，可能是函数调用），
+// 然后每个分支：
+//
+//     LOAD tmp; <模式值>; EQ;      JUMP_IF_FALSE next
+//     LOAD tmp; <lo>; GE_NUM;      JUMP_IF_FALSE next       ← 范围下界
+//     LOAD tmp; <hi>; LE_NUM;      JUMP_IF_FALSE next       ← 范围上界
+//     <body>; JUMP end
+//   next:
+//
+// 汇合处压 null（不可达，但保证字节码栈平衡）。
+//
+// ── 为什么用 *_NUM 而不是 *_I64 ─────────────────
+// 范围端点可能是小数（`0.0..1.0`），*_NUM 会按运行期实际类型选
+// Int 还是 Float 比较。用 *_I64 的话小数端点会被当成整数位模式。
+//
+// ── 为什么强制要求 `_` 分支 ─────────────────────
+// 让「漏了某个值」在写代码时就必须回答，而不是运行时拿到 null。
+// 与 01 §12「无隐式可选值」是同一条原则。裸标识符绑定（`x if ...`）
+// 也算穷尽 —— 因为它匹配任何值都成功。
+
+struct P { x: Int, tag: String }
+
+fn classify(n: Int) -> String {
+    return match n {
+        0             => "零",
+        1..=9         => "一位数",
+        v @ 10..=99   => "两位数:{v}",
+        _             => "大数",
+    }
+}
+
+fn described(v: Int) -> String {
+    return match v {
+        x if x > 100  => "很大",
+        x if x < 0    => "负数",
+        _             => "中等",
+    }
+}
+
+fn main() -> Int {
+    // ---- 1. 字面量 + 范围 + 绑定 + 通配 ----
+    println(classify(0))          // 零
+    println(classify(5))          // 一位数
+    println(classify(42))         // 两位数:42
+    println(classify(700))        // 大数
+
+    // ---- 2. guard ----
+    println(described(500))       // 很大
+    println(described(-5))        // 负数
+    println(described(50))        // 中等
+
+    // ---- 3. 字符串匹配 ----
+    let s = match "b" {
+        "a" => 1,
+        "b" => 2,
+        _   => 0,
+    }
+    println(s)                    // 2
+
+    // ---- 4. 布尔与 null 匹配 ----
+    // 注意：即使 true/false 两支都写了，仍要 `_`。穷尽性检查是
+    // 语法级的（「有没有 `_` 或裸绑定」），不做值域推理 —— 因为
+    // 对字符串、任意 Int 根本推不出来，而「有时候能推有时候不能」
+    // 比「永远要求写」更难记。这里 `_` 不可达，纯粹是规则的代价。
+    let b = match true {
+        true  => "真",
+        false => "假",
+        _     => "?",
+    }
+    println(b)                    // 真
+
+    // ---- 5. 被匹配值只求值一次 ----
+    let n = 7
+    println(match n + 1 { 8 => "八", _ => "非八" })   // 八
+
+    // ---- 6. 分支值参与运算 ----
+    let total = 0
+    let i = 0
+    while i < 4 {
+        total = total + match i { 0 => 10, 1 => 20, _ => 1 }
+        i = i + 1
+    }
+    println(total)                // 32
+
+    // ---- 7. 半开区间 `..` ----
+    println(match 5 { 0..5 => "内", _ => "外" })      // 外
+    println(match 4 { 0..5 => "内", _ => "外" })      // 内
+
+    // ---- 8. 小数范围 ----
+    println(match 0.5 { 0.0..=1.0 => "单位内", _ => "外部" })   // 单位内
+
+    // ---- 9. 嵌套 match ----
+    let deep = match 3 {
+        1 => match 1 { 1 => "a", _ => "b" },
+        _ => match 9 { 9 => "z", _ => "y" },
+    }
+    println(deep)                 // z
+
+    // ---- 10. 结构体字段当被匹配值 ----
+    let p = P { x: 5, tag: "t" }
+    println(match p.x { 5 => "五", _ => "其它" })     // 五
+
+    return 0
+}

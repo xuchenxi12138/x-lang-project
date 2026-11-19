@@ -1,0 +1,136 @@
+// config/app_config.xle — 应用配置
+//
+// ── 为什么配置要有一个「类型化的门脸」 ─────────────
+//
+// 直接用 Config（键值对）读配置的话，业务代码里到处是
+//
+//     let port = cfg.getInt("server.port", 8080)
+//     let maxLen = cfg.getInt("post.titleMaxLen", 200)
+//
+// 问题有两个：
+//   1. 键名字符串散落各处，改一个键名要全局搜索
+//   2. 默认值也散落各处，同一个键在两个地方可能用了不同的默认值
+//
+// 所以这里做一层「读一次、存成字段」的门脸。业务代码用 appCfg.port，
+// 键名和默认值只在这个文件里出现一次。
+//
+// ── 为什么不用静态方法直接读 ───────────────────
+//
+// 因为静态方法每次调用都要查一次键值表。虽然键值表很小，但更重要
+// 的是：字段化的配置可以在启动时**一次性校验完**所有值，而懒读取
+// 会把错误推迟到第一次用到它的时候。
+
+import "../../../../stdlib/service/config.xle"
+
+class AppConfig {
+    // HTTP
+    bind: String
+    port: Int
+    requestTimeoutMs: Int
+    maxBodyBytes: Int
+
+    // 业务
+    postTitleMaxLen: Int
+    postListDefaultLimit: Int
+    postListMaxLimit: Int
+
+    // 功能开关
+    enableAccessLog: Bool
+    enableHealthEndpoint: Bool
+    enableCors: Bool
+
+    // CORS 允许的来源（"*" 表示任意）
+    corsAllowOrigin: String
+
+    constructor() {
+        self.bind                 = "0.0.0.0"
+        self.port                 = 8080
+        self.requestTimeoutMs     = 15000
+        self.maxBodyBytes         = 8388608
+        self.postTitleMaxLen      = 200
+        self.postListDefaultLimit = 20
+        self.postListMaxLimit     = 100
+        self.enableAccessLog      = true
+        self.enableHealthEndpoint = true
+        self.enableCors           = true
+        self.corsAllowOrigin      = "*"
+    }
+
+    // 从 Config 加载（带默认值）。
+    //
+    // ── 为什么默认值写在这里而不是 Config 里 ─────────
+    //
+    // 因为默认值是**应用的知识**，不是配置框架的知识。配置框架
+    // 只知道「有没有这个键」，它不知道 8080 是不是一个合理的默认
+    // 端口 —— 那是应用的事。
+    static fn fromConfig(cfg: Config) -> AppConfig {
+        let a = new AppConfig()
+        a.bind                 = cfg.getOr("server.bind", "0.0.0.0")
+        a.port                 = cfg.getInt("server.port", 8080)
+        a.requestTimeoutMs     = cfg.getInt("server.timeoutMs", 15000)
+        a.maxBodyBytes         = cfg.getInt("server.maxBodyBytes", 8388608)
+        a.postTitleMaxLen      = cfg.getInt("post.titleMaxLen", 200)
+        a.postListDefaultLimit = cfg.getInt("post.listDefaultLimit", 20)
+        a.postListMaxLimit     = cfg.getInt("post.listMaxLimit", 100)
+        a.enableAccessLog      = cfg.getBool("feature.accessLog", true)
+        a.enableHealthEndpoint = cfg.getBool("feature.healthEndpoint", true)
+        a.enableCors           = cfg.getBool("feature.cors", true)
+        a.corsAllowOrigin      = cfg.getOr("cors.allowOrigin", "*")
+        return a
+    }
+
+    // 合理性校验。返回问题列表（空 = 通过）。
+    //
+    // ── 为什么校验在启动时做而不是使用时做 ──────────
+    //
+    // 因为「端口 70000」这种错误，用的时候才暴露意味着服务已经
+    // 在 RUNNING 状态了 —— 编排系统会认为它健康。启动时校验能让
+    // 它直接起不来，这是更安全的方向。
+    fn validate() -> Array {
+        let problems = []
+        if (self.port < 0 || self.port > 65535) {
+            arrPush(problems, "server.port 超出范围：" + toString(self.port) +
+                    "（应为 0~65535，0 表示让系统分配）")
+        }
+        if (self.requestTimeoutMs < 100) {
+            arrPush(problems, "server.timeoutMs 太小：" + toString(self.requestTimeoutMs) +
+                    "（至少 100ms，否则正常请求都会超时）")
+        }
+        if (self.maxBodyBytes < 1024) {
+            arrPush(problems, "server.maxBodyBytes 太小：" + toString(self.maxBodyBytes))
+        }
+        if (self.postTitleMaxLen < 1) {
+            arrPush(problems, "post.titleMaxLen 必须 >= 1")
+        }
+        // ── 这组检查最容易漏，但它会造成真实问题 ────────
+        //
+        // 如果 defaultLimit > maxLimit，那么「不传 limit」的请求会
+        // 拿到超过上限的条数 —— 上限形同虚设，而不会有任何报错。
+        if (self.postListDefaultLimit > self.postListMaxLimit) {
+            arrPush(problems, "post.listDefaultLimit(" + toString(self.postListDefaultLimit) +
+                    ") 不能大于 post.listMaxLimit(" + toString(self.postListMaxLimit) + ")")
+        }
+        if (self.postListMaxLimit < 1) {
+            arrPush(problems, "post.listMaxLimit 必须 >= 1")
+        }
+        if (self.postListDefaultLimit < 1) {
+            arrPush(problems, "post.listDefaultLimit 必须 >= 1")
+        }
+        return problems
+    }
+
+    fn describe() -> String {
+        var out = "AppConfig"
+        out = out + "\n  server  " + self.bind + ":" + toString(self.port) +
+              "  timeout=" + toString(self.requestTimeoutMs) + "ms" +
+              "  maxBody=" + toString(self.maxBodyBytes) + "B"
+        out = out + "\n  post    titleMax=" + toString(self.postTitleMaxLen) +
+              "  listDefault=" + toString(self.postListDefaultLimit) +
+              "  listMax=" + toString(self.postListMaxLimit)
+        out = out + "\n  feature accessLog=" + boolToString(self.enableAccessLog) +
+              "  health=" + boolToString(self.enableHealthEndpoint) +
+              "  cors=" + boolToString(self.enableCors) +
+              "  origin=" + self.corsAllowOrigin
+        return out
+    }
+}

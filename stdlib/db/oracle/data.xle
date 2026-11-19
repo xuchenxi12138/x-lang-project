@@ -1,0 +1,254 @@
+// db/oracle/data.xle — DATA 包（SQL 与结果）
+//
+// ── DATA 包的嵌套层级 ───────────────────────────────
+//
+//   TNS DATA 包（8 字节头 + 负载）
+//     └─ 数据标志（2 字节）
+//          └─ 函数码（1 字节）—— 这是真正的「命令」
+//               └─ 函数自己的负载
+//
+// 函数码是本层最重要的概念。常见值：
+//
+//   0x01  OSQL     打开游标 + 执行 SQL（最常用）
+//   0x02  OEXFCX   取行（P0 用的简化版是 0x03）
+//   0x03  OFETCH   取行
+//   0x05  OCLOSE   关闭游标
+//   0x06  OLOGOFF  登出
+//   0x08  OOPEN
+//   0x09  OPARSE
+//   0x0B  OEXEC
+//   0x11  OLOGON   认证（O5LOGON / O3LOGON 都在这里）
+//   0x13  OALL7    
+//   0x1A  OKEYVAL
+//   0x4E  OSESSION
+//   0x67  OPING    心跳
+//   0x76  OEND     结束会话
+//
+// ── 数据标志（2 字节） ───────────────────────────────
+//
+//   0x0000  普通
+//   0x2000  结果的最后一行（服务端用）
+//   0x3000  需要客户端回响应
+//
+// ── 为什么 Oracle 「取行」要发多个包 ───────────────────
+//
+// 因为结果可能是几百万行，不可能一次发完。协议是：客户端发 OFETCH
+// 请求「给我 N 行」，服务端回若干个 DATA 包，最后一行带 0x2000 标志。
+// 客户端要循环读到「行数满足或遇到结束标志」为止。
+//
+// ── P0 范围 ────────────────────────────────────────
+//
+// 只实现：OOPEN(0x08) / OPARSE(0x09) / OEXEC(0x0B) / OFETCH(0x03) /
+// OCLOSE(0x05) / OLOGOFF(0x06) / OPING(0x67)。
+// 不实现 OLOGON（见 auth.xle 的说明），所以连上后只能用「已经
+// 通过外部方式认证」的会话 —— 实际上这等于不能连真实的 Oracle。
+//
+// 这一点在 driver.xle 里明确写出来。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "tns.xle" import tnsConnectFlags, tnsTypeName, tnsBuild, tnsRead, tnsParseRefuse, tnsRefuseReason, TnsPacket, TNS_HDR, TNS_PKT_CONNECT, TNS_PKT_ACCEPT, TNS_PKT_ACK, TNS_PKT_REFUSE, TNS_PKT_REDIRECT, TNS_PKT_DATA, TNS_PKT_MARKER, TNS_PKT_ATTEST, TNS_PKT_CONTROL, TNS_PKT_RESEND, TNS_VERSION_11_2, TNS_VERSION_12_1
+
+// 数据类型标记。Oracle 的类型码和前面几种库都不同。
+const ORA_TYPE_VARCHAR   = 1
+const ORA_TYPE_NUMBER    = 2
+const ORA_TYPE_LONG      = 8
+const ORA_TYPE_VARCHAR2  = 9
+const ORA_TYPE_ROWID     = 11
+const ORA_TYPE_DATE      = 12
+const ORA_TYPE_RAW       = 23
+const ORA_TYPE_LONG_RAW  = 24
+const ORA_TYPE_CHAR      = 96
+const ORA_TYPE_BINARY_F  = 100
+const ORA_TYPE_BINARY_D  = 101
+const ORA_TYPE_CLOB      = 112
+const ORA_TYPE_BLOB      = 113
+const ORA_TYPE_TIMESTAMP = 180
+const ORA_TYPE_TIMESTAMPTZ = 181
+const ORA_TYPE_INTERVAL_YM = 182
+const ORA_TYPE_INTERVAL_DS = 183
+
+// 函数码。
+const ORA_FUNC_OSQL   = 0x01
+const ORA_FUNC_OEXFCX = 0x02
+const ORA_FUNC_OFETCH = 0x03
+const ORA_FUNC_OCLOSE = 0x05
+const ORA_FUNC_OLOGOFF = 0x06
+const ORA_FUNC_OOPEN  = 0x08
+const ORA_FUNC_OPARSE = 0x09
+const ORA_FUNC_OEXEC  = 0x0B
+const ORA_FUNC_OLOGON = 0x11
+const ORA_FUNC_OPING  = 0x67
+const ORA_FUNC_OEND   = 0x76
+
+// 数据标志。
+const ORA_FLAG_NORMAL = 0x0000
+const ORA_FLAG_MORE   = 0x2000
+const ORA_FLAG_EOF    = 0x2000
+
+fn oraFuncName(f: Int) -> String {
+    if (f == ORA_FUNC_OSQL)    { return "OSQL" }
+    if (f == ORA_FUNC_OEXFCX)  { return "OEXFCX" }
+    if (f == ORA_FUNC_OFETCH)  { return "OFETCH" }
+    if (f == ORA_FUNC_OCLOSE)  { return "OCLOSE" }
+    if (f == ORA_FUNC_OLOGOFF) { return "OLOGOFF" }
+    if (f == ORA_FUNC_OOPEN)   { return "OOPEN" }
+    if (f == ORA_FUNC_OPARSE)  { return "OPARSE" }
+    if (f == ORA_FUNC_OEXEC)   { return "OEXEC" }
+    if (f == ORA_FUNC_OLOGON)  { return "OLOGON" }
+    if (f == ORA_FUNC_OPING)   { return "OPING" }
+    if (f == ORA_FUNC_OEND)    { return "OEND" }
+    return "func-0x" + tnsHex(f)
+}
+
+fn tnsHex(v: Int) -> String {
+    let digits = "0123456789ABCDEF"
+    if (v == 0) { return "00" }
+    var out = ""
+    var n = v
+    while (n > 0) {
+        let d = n % 16
+        out = strAt(digits, d) + out
+        n = n / 16
+    }
+    if (len(out) == 1) { out = "0" + out }
+    return out
+}
+
+fn oraTypeName(t: Int) -> String {
+    if (t == ORA_TYPE_VARCHAR)     { return "VARCHAR" }
+    if (t == ORA_TYPE_NUMBER)      { return "NUMBER" }
+    if (t == ORA_TYPE_LONG)        { return "LONG" }
+    if (t == ORA_TYPE_VARCHAR2)    { return "VARCHAR2" }
+    if (t == ORA_TYPE_ROWID)       { return "ROWID" }
+    if (t == ORA_TYPE_DATE)        { return "DATE" }
+    if (t == ORA_TYPE_RAW)         { return "RAW" }
+    if (t == ORA_TYPE_LONG_RAW)    { return "LONG RAW" }
+    if (t == ORA_TYPE_CHAR)        { return "CHAR" }
+    if (t == ORA_TYPE_BINARY_F)    { return "BINARY_FLOAT" }
+    if (t == ORA_TYPE_BINARY_D)    { return "BINARY_DOUBLE" }
+    if (t == ORA_TYPE_CLOB)        { return "CLOB" }
+    if (t == ORA_TYPE_BLOB)        { return "BLOB" }
+    if (t == ORA_TYPE_TIMESTAMP)   { return "TIMESTAMP" }
+    if (t == ORA_TYPE_TIMESTAMPTZ) { return "TIMESTAMP WITH TZ" }
+    if (t == ORA_TYPE_INTERVAL_YM) { return "INTERVAL YEAR TO MONTH" }
+    if (t == ORA_TYPE_INTERVAL_DS) { return "INTERVAL DAY TO SECOND" }
+    return "type-" + toString(t)
+}
+
+// 一个 DATA 包。
+//
+// ── 为什么要把 dataFlags 和 func 分开存 ──────────────
+//
+// 因为它们在同一层但是**语义独立**：flags 说的是「这个包在整条
+// 响应里的位置」（是否最后一行、是否要回执），func 说的是「这是
+// 什么命令的响应」。混成一个字段就无法表达「OFETCH 的最后一个包」。
+class OraDataPacket {
+    // 数据标志（0x0000 / 0x2000）。
+    dataFlags: Int,
+
+    // 函数码。
+    func: Int,
+
+    // 函数负载（已跳过 flags + func）。
+    body: Array,
+
+    // 解析失败原因。
+    error: String,
+
+    constructor() {
+        self.dataFlags = 0
+        self.func      = 0
+        self.body      = []
+        self.error     = ""
+    }
+
+    fn isLast() -> Bool {
+        return (self.dataFlags & ORA_FLAG_EOF) != 0
+    }
+
+    fn describe() -> String {
+        var f = "last"
+        if (!self.isLast()) { f = "more" }
+        return "DATA [" + f + "] " + oraFuncName(self.func) + " " +
+               toString(len(self.body)) + "B"
+    }
+}
+
+// 组装一个 DATA 包的负载（不含 TNS 头）。
+fn oraBuildData(func: Int, body: Array) -> Array {
+    var b = []
+    b = bbPutU16BE(b, ORA_FLAG_NORMAL)
+    b = bbPut(b, func)
+    var i = 0
+    while (i < len(body)) {
+        b = bbPut(b, bbAt(body, i))
+        i = i + 1
+    }
+    return b
+}
+
+// 解析一个 DATA 包（传入的是 TNS 负载）。
+fn oraParseData(payload: Array) -> OraDataPacket {
+    let p = new OraDataPacket()
+    if (len(payload) < 3) {
+        p.error = "DATA 负载不足 3 字节（" + toString(len(payload)) + "B）"
+        return p
+    }
+    p.dataFlags = bbU16BE(payload, 0)
+    p.func      = bbU8(payload, 2)
+    p.body      = bbSlice(payload, 3, len(payload))
+    return p
+}
+
+// ── 错误解析 ────────────────────────────────────────
+//
+// Oracle 的错误响应格式很特别：它是一个「由 Oracle 类型系统编码的
+// 结构」，而不是文本。要做到「把 ORA-00942 读出来」必须先解出
+// NUMBER 类型 —— 而 NUMBER 是 Oracle 自己的十进制浮点格式：
+//
+//   首字节：符号 + 指数（excess-65）
+//   后续字节：每字节两位十进制数（+1 偏移）
+//
+// ── 为什么 NUMBER 编码是「两位十进制挤一字节」 ──────────
+//
+// 因为 NUMBER 要精确表示任意精度十进制（金额！），用二进制浮点会
+// 丢精度。所以 Oracle 直接存十进制数字，每字节塞两位，首字节存
+// 指数。这样 123.45 存成 `C2 02 18 2E`（指数 2、数字 1,2,3,4,5）。
+//
+// 解它的难度是「首字节的指数要减 65，且负数要按补码反向处理」。
+// 本函数只用于**错误码**（总是正整数、最多 5 位），所以简化成
+// 「按正数解」。
+fn oraDecodeNumber(b: Array) -> Int {
+    if (len(b) == 0) { return 0 }
+    let b0 = bbU8(b, 0)
+    // 0x80 是 Oracle 表示「零」的特殊编码。
+    if (b0 == 0x80) { return 0 }
+    // 首字节高 1 位是符号（1 = 正）。
+    let positive = (b0 & 0x80) != 0
+    let exp = (b0 & 0x7F) - 65
+    var digits = ""
+    var i = 1
+    while (i < len(b) && i < 8) {
+        let v = bbU8(b, i) - 1
+        // 每字节两位十进制（+1 偏移，所以 0xFF 表示「本字节无数据」）
+        let hi = v / 10
+        let lo = v % 10
+        digits = digits + toString(hi) + toString(lo)
+        i = i + 1
+    }
+    if (len(digits) == 0) { return 0 }
+    // 小数点位置由 exp 决定；错误码都是整数，所以直接取前 exp+1 位
+    var take = exp + 1
+    if (take < 1) { take = 1 }
+    if (take > len(digits)) { take = len(digits) }
+    let intPart = strSub(digits, 0, take)
+    var v = 0
+    var k = 0
+    while (k < len(intPart)) {
+        let d = strParseInt(strAt(intPart, k))
+        v = v * 10 + d
+        k = k + 1
+    }
+    if (!positive) { v = 0 - v }
+    return v
+}

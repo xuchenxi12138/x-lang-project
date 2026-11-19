@@ -1,0 +1,28 @@
+name   : Point
+parent : []
+is Point : true
+is Point3D: false
+3d name : Point3D
+3d parent: Point
+3d is Point : true
+3d is Point3D: true
+p fields : [[x, Int, public, false], [y, Int, public, false]]
+q fields : [[x, Int, public, false], [y, Int, public, false], [z, Int, public, false]]
+p methods: [[sum, public], [scale, public]]
+has x     : true
+has z     : false
+has sum   : true
+has scale : true
+has nope  : false
+get x     : 3
+after set : 34
+-- 类内反射 private：允许 --
+own private via reflect : 7
+after reflect write     : 99
+-- 子类反射 protected：允许 --
+parent protected via reflect : 6
+-- dump Point3D --
+  x : Int (public)
+  y : Int (public)
+  z : Int (public)
+field count: 3

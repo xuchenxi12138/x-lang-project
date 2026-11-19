@@ -1,0 +1,341 @@
+// controller/post_controller.xle — 文章接口
+//
+// ── Controller 的职责边界（严格）────────────────────
+//
+// 它只做四件事：
+//   1. 从 Context 里取出参数（路径/查询/body）
+//   2. 调 Service
+//   3. 把结果或错误映射成 HTTP 状态码 + JSON
+//   4. 设置响应头
+//
+// 它**不做**：业务校验（Service 做）、数据访问（Repository 做）、
+// 格式化输出细节（有 json 辅助函数）。
+//
+// ── 为什么状态码映射要写在这个文件里 ─────────────
+//
+// 因为「业务错误 → HTTP 状态码」是**接口约定**，属于 Controller
+// 的知识。Service 只回答「成功/失败 + 原因」，它不该知道 404 是
+// 什么东西 —— 那样 Service 就绑死在 HTTP 上了（换成 CLI 或 RPC
+// 时要改 Service）。
+//
+// ── 本示例的接口清单 ────────────────────────
+//
+//   GET    /api/posts            列表（分页）
+//   GET    /api/posts/:id        单篇
+//   POST   /api/posts            创建
+//   PUT    /api/posts/:id        更新
+//   DELETE /api/posts/:id        删除
+//   GET    /api/posts/status/:s  按状态过滤
+//   GET    /api/posts/tag/:t     按标签过滤
+//   GET    /api/audit            审计日志
+
+import "../../../../stdlib/net/http/server.xle"
+import "../../../../stdlib/net/http/status.xle"
+import "../config/app_config.xle"
+import "../service/post_service.xle"
+import "../model/post.xle"
+
+// ── 简易 JSON 读取 ─────────────────────────────
+//
+// ── 为什么手写而不是 import stdlib/json ─────────
+//
+// 因为这里只需要「从一个扁平 JSON 对象里取字符串/字符串数组」。
+// 完整 JSON 解析器有几条它自己的规则（嵌套、转义、数字精度），
+// 而本示例的请求体形状是固定的。
+//
+// 真实项目应该用完整解析器 —— 但那样示例就变成「怎么用 JSON 库」
+// 而不是「怎么组织分层」了。所以这里用一个明确标注了局限性的
+// 极简实现，并给出局限性说明。
+
+// 从一个 JSON 对象文本里取某个键的字符串值。找不到返回 def。
+//
+// 局限性（明确声明）：
+//   · 只找「顶层」的 `"key": "value"`，不进嵌套对象
+//   · 值里含 `\"` 时不处理转义（会截断）
+//   · 不支持数字/布尔（用 jsonGetNum / jsonGetBool）
+fn jsonGetStr(text: String, key: String, def: String) -> String {
+    let needle = "\"" + key + "\""
+    let at = strFind(text, needle)
+    if (at < 0) { return def }
+    let n = len(text)
+
+    // 1. 从 key 之后找冒号。遇到 , 或 } 说明这个 key 没有值。
+    var k = at + len(needle)
+    var colon = 0 - 1
+    while k < n {
+        let c = strAt(text, k)
+        if (c == ":") {
+            colon = k
+            break
+        }
+        if (c == "," || c == "}") { return def }
+        k = k + 1
+    }
+    if (colon < 0) { return def }
+
+    // 2. 跳过冒号后的空白，定位值的首字符。
+    var v = colon + 1
+    while v < n {
+        let c = strAt(text, v)
+        if (c != " " && c != "\t" && c != "\n" && c != "\r") { break }
+        v = v + 1
+    }
+    if (v >= n) { return def }
+
+    // 3a. 字符串值：找配对的后引号。
+    if (strAt(text, v) == "\"") {
+        var endAt = v + 1
+        while endAt < n {
+            if (strAt(text, endAt) == "\"") { break }
+            endAt = endAt + 1
+        }
+        return strSub(text, v + 1, endAt)
+    }
+
+    // 3b. 非字符串值（数字/布尔/null）：读到分隔符为止。
+    var stop = v
+    while stop < n {
+        let c = strAt(text, stop)
+        if (c == "," || c == "}" || c == " " || c == "\n" || c == "\r") { break }
+        stop = stop + 1
+    }
+    let raw = strSub(text, v, stop)
+    if (raw == "null") { return def }
+    return raw
+}
+
+// 从 JSON 对象里取一个字符串数组。找不到返回空数组。
+//
+// 形如：`"tags": ["a","b"]`
+fn jsonGetStrArray(text: String, key: String) -> Array {
+    let out = []
+    let needle = "\"" + key + "\""
+    let at = strFind(text, needle)
+    if (at < 0) { return out }
+
+    // 找 `[`
+    let open = strFindFrom(text, "[", at)
+    if (open < 0) { return out }
+    let close = strFindFrom(text, "]", open)
+    if (close < 0) { return out }
+
+    let inner = strSub(text, open + 1, close)
+    let parts = strSplit(inner, ",")
+    var i = 0
+    while i < len(parts) {
+        var p = strTrim(parts[i])
+        if (len(p) >= 2) {
+            if (strStarts(p, "\"") && strEnds(p, "\"")) {
+                p = strSub(p, 1, len(p) - 1)
+            }
+        }
+        if (len(p) > 0) { arrPush(out, p) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Controller ────────────────────────────────
+
+class PostController {
+    svc: PostService
+    cfg: AppConfig
+
+    constructor(svc: PostService, cfg: AppConfig) {
+        self.svc = svc
+        self.cfg = cfg
+    }
+
+    // 列表。GET /api/posts?offset=0&limit=20&status=draft&tag=rust
+    fn list(ctx: Context) {
+        let offset = ctx.query("offset", "0")
+        let limit  = ctx.query("limit", toString(self.cfg.postListDefaultLimit))
+        let off = toIntOr(offset, 0)
+        var lim = toIntOr(limit, self.cfg.postListDefaultLimit)
+
+        // ── 上限钳制而不是报错 ──────────────────
+        //
+        // 因为「要 10000 条」是一个合理的（虽然贪心的）请求，直接
+        // 拒绝会让客户端不知道该怎么办。钳到上限并如实返回实际条数
+        // 是更友好的做法。
+        //
+        // 注意负数要归零 —— 负数 offset 会让循环行为异常。
+        if (off < 0) { ctx.badRequest("offset 不能为负"); return }
+        if (lim <= 0) { lim = self.cfg.postListDefaultLimit }
+        if (lim > self.cfg.postListMaxLimit) { lim = self.cfg.postListMaxLimit }
+
+        // 过滤条件（status 优先于 tag）
+        let status = ctx.query("status", "")
+        let tag    = ctx.query("tag", "")
+
+        var items = []
+        if (len(status) > 0) {
+            items = self.svc.listByStatus(status)
+        } else if (len(tag) > 0) {
+            items = self.svc.listByTag(tag)
+        } else {
+            let page = self.svc.list(off, lim)
+            items = page[0]
+        }
+
+        let total = len(items)
+        var json = "{\"total\":" + toString(total) +
+                   ",\"offset\":" + toString(off) +
+                   ",\"limit\":" + toString(lim) + ",\"items\":["
+        var i = 0
+        while i < len(items) {
+            if (i > 0) { json = json + "," }
+            let p: Post = items[i]
+            json = json + p.toJson()
+            i = i + 1
+        }
+        json = json + "]}"
+        ctx.json(200, json)
+    }
+
+    // 单篇。GET /api/posts/:id
+    fn detail(ctx: Context) {
+        let id = self.parseId(ctx)
+        if (id <= 0) { return }
+        let p = self.svc.findById(id)
+        if (p.id == 0) {
+            // ── 404 的响应体形状要和成功时一致 ──────
+            //
+            // 因为客户端通常只有一个解析函数。错误响应如果是纯文本
+            // 而成功是 JSON，客户端会解析失败 —— 于是真正的错误
+            // （404）被掩盖成「parse error」。
+            ctx.json(404, "{\"error\":\"文章 #" + toString(id) + " 不存在\"}")
+            return
+        }
+        ctx.json(200, p.toJson())
+    }
+
+    // 创建。POST /api/posts
+    fn create(ctx: Context) {
+        let body = ctx.bodyText()
+        if (len(strTrim(body)) == 0) {
+            ctx.badRequest("请求体不能为空"); return
+        }
+        // ── Content-Type 检查 ─────────────────
+        //
+        // 不检查的话，一个表单提交（a=1&b=2）会被当 JSON 解析，
+        // 得到全空字段，然后返回一个含糊的「标题不能为空」。而真实
+        // 原因（发错了格式）完全看不出来。
+        let ct = strLower(ctx.header("Content-Type"))
+        if (strFind(ct, "json") < 0) {
+            ctx.json(415, "{\"error\":\"需要 Content-Type: application/json，实际是 `" +
+                     ctx.header("Content-Type") + "`\"}")
+            return
+        }
+
+        let title  = jsonGetStr(body, "title", "")
+        let text   = jsonGetStr(body, "body", "")
+        let author = jsonGetStr(body, "author", "")
+        let status = jsonGetStr(body, "status", "draft")
+        let tags   = jsonGetStrArray(body, "tags")
+
+        let r = self.svc.create(title, text, author, tags, status)
+        if (r[0] != true) {
+            ctx.json(422, "{\"error\":" + postJsonStr(toString(r[2])) + "}")
+            return
+        }
+        let p: Post = r[1]
+        ctx.json(201, p.toJson())
+        // 201 应带 Location 指向新资源。
+        ctx.setHeader("Location", "/api/posts/" + toString(p.id))
+    }
+
+    // 更新。PUT /api/posts/:id
+    fn update(ctx: Context) {
+        let id = self.parseId(ctx)
+        if (id <= 0) { return }
+        let body = ctx.bodyText()
+        let ct = strLower(ctx.header("Content-Type"))
+        if (strFind(ct, "json") < 0) {
+            ctx.json(415, "{\"error\":\"需要 Content-Type: application/json\"}")
+            return
+        }
+
+        // ── PUT 的语义是「完整替换」────────────
+        //
+        // 所以缺失的字段用空值而不是「保留原值」。这与 PATCH 不同
+        // （PATCH 是部分更新）。混用两者的行为是经典 API 设计错误：
+        // 客户端只想改标题，结果正文被清空了。
+        let title  = jsonGetStr(body, "title", "")
+        let text   = jsonGetStr(body, "body", "")
+        let author = jsonGetStr(body, "author", "")
+        let status = jsonGetStr(body, "status", "draft")
+        let tags   = jsonGetStrArray(body, "tags")
+
+        let r = self.svc.update(id, title, text, author, tags, status)
+        if (r[0] != true) {
+            let why = toString(r[2])
+            if (strFind(why, "不存在") >= 0) {
+                ctx.json(404, "{\"error\":" + postJsonStr(why) + "}")
+            } else {
+                ctx.json(422, "{\"error\":" + postJsonStr(why) + "}")
+            }
+            return
+        }
+        let p: Post = r[1]
+        ctx.json(200, p.toJson())
+    }
+
+    // 删除。DELETE /api/posts/:id
+    fn remove(ctx: Context) {
+        let id = self.parseId(ctx)
+        if (id <= 0) { return }
+        let r = self.svc.remove(id)
+        if (r[0] != true) {
+            ctx.json(404, "{\"error\":" + postJsonStr(toString(r[1])) + "}")
+            return
+        }
+        // ── 删除成功用 204 而不是 200 + body ─────
+        //
+        // 因为「删掉了」这件事没有可返回的内容。200 + `{"ok":true}`
+        // 也行，但 204 更精确 —— 而且它强制客户端不要期待 body
+        // （避免客户端写一个永远拿不到内容的解析逻辑）。
+        ctx.status(204)
+        ctx.resp.body = []
+    }
+
+    // 审计日志。GET /api/audit
+    fn audit(ctx: Context) {
+        let lines = self.svc.auditLines()
+        var json = "{\"total\":" + toString(len(lines)) + ",\"items\":["
+        var i = 0
+        while i < len(lines) {
+            if (i > 0) { json = json + "," }
+            let l: String = lines[i]
+            json = json + postJsonStr(l)
+            i = i + 1
+        }
+        json = json + "]}"
+        ctx.json(200, json)
+    }
+
+    // 解析路径里的 id。失败时已写好 400 响应，返回 -1。
+    //
+    // ── 为什么把「写响应」放进解析函数 ─────────────
+    //
+    // 因为 id 不合法时每个调用点都要写同一段 400 响应。集中在一处
+    // 能保证格式一致 —— 而格式不一致会让客户端的多份错误处理逻辑
+    // 中有一部分失效。
+    fn parseId(ctx: Context) -> Int {
+        let raw = ctx.param("id", "")
+        if (len(raw) == 0) {
+            ctx.json(400, "{\"error\":\"缺少路径参数 id\"}")
+            return 0 - 1
+        }
+        if (!strIsInt(raw)) {
+            ctx.json(400, "{\"error\":\"id 必须是整数，实际是 `" + raw + "`\"}")
+            return 0 - 1
+        }
+        let id = toIntOr(raw, 0 - 1)
+        if (id <= 0) {
+            ctx.json(400, "{\"error\":\"id 必须为正整数\"}")
+            return 0 - 1
+        }
+        return id
+    }
+}

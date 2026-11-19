@@ -1,0 +1,218 @@
+// service/health.xle — 健康检查
+//
+// ── 健康检查不只是「返回 200」 ─────────────────────
+//
+// 生产环境里它至少有三层语义，混淆它们会造成真实事故：
+//
+// 【1】liveness（存活）：进程还在跑吗？
+//   失败 → 编排系统**重启**容器。
+//   所以这个检查必须极轻：只回答「事件循环还能转吗」。
+//   如果它在里面查数据库，那么数据库抖一下 → 所有容器被重启 →
+//   重启之后数据库压力更大 → 雪崩。
+//
+// 【2】readiness（就绪）：能接受流量吗？
+//   失败 → 从负载均衡摘掉，但**不重启**。
+//   这个可以查依赖（数据库连得上吗、必需的预热数据加载完了吗）。
+//
+// 【3】startup（启动完成）：启动期结束了吗？
+//   在它通过之前，liveness 不生效（否则启动慢的服务会被反复重启）。
+//
+// 这三者的差别全在「失败后果」上。本文件把三者的判断逻辑和失败
+// 后果都写清楚，而不是给一个含糊的 `/health` 返回 200。
+
+from "lifecycle.xle" import lcStateName, lcStateInit, lcStateStarting, lcStateRunning, lcStateStopping, lcStateStopped, lcStateFailed, Component, Lifecycle
+
+// 一项检查结果。
+class CheckResult {
+    // 检查名。
+    name: String
+
+    // 是否通过。
+    ok: Bool
+
+    // 不通过的原因（通过时为空）。
+    detail: String
+
+    // 这项检查的耗时（毫秒）。0 表示未测。
+    //
+    // ── 为什么耗时也要报出来 ────────────────────
+    //
+    // 因为「检查通过但花了 2 秒」是一个警告信号：它在变慢，很快
+    // 就会变成超时失败。只报 ok/not-ok 会让这个趋势完全不可见。
+    elapsedMs: Int
+
+    constructor(name: String, ok: Bool, detail: String) {
+        self.name      = name
+        self.ok        = ok
+        self.detail    = detail
+        self.elapsedMs = 0
+    }
+
+    fn describe() -> String {
+        var s = "FAIL"
+        if (self.ok) { s = "PASS" }
+        var out = "  [" + s + "] " + self.name
+        if (len(self.detail) > 0) { out = out + " — " + self.detail }
+        if (self.elapsedMs > 0) { out = out + " (" + toString(self.elapsedMs) + "ms)" }
+        return out
+    }
+}
+
+// 检查集合。
+class HealthChecker {
+    // 检查名列表。
+    names: Array
+
+    // 每项检查的描述（用于 /health 输出的可读信息）。
+    descriptions: Array
+
+    // 是否属于 readiness 检查（否则只算信息性）。
+    required: Array
+
+    constructor() {
+        self.names        = []
+        self.descriptions = []
+        self.required     = []
+    }
+
+    // 注册一项检查。
+    //
+    // isRequired 为 true 表示「这项不通过则 readisness 失败」。
+    // 为 false 表示「只报告，不影响结论」（比如「磁盘剩余空间」
+    // 这种长期趋势指标 —— 它不该让整个实例被摘流量）。
+    fn add(name: String, desc: String, isRequired: Bool) {
+        arrPush(self.names, name)
+        arrPush(self.descriptions, desc)
+        arrPush(self.required, isRequired)
+    }
+
+    fn count() -> Int {
+        return len(self.names)
+    }
+
+    // ── 三个面向不同后果的判定 ────────────────────
+
+    // liveness：只检查「进程内还能做事」。
+    //
+    // ── 故意不查任何外部依赖 ────────────────────
+    //
+    // 这是本文件最重要的一条设计决定。见文件头【1】。
+    // 唯一该做的检查是「分配一小块内存 + 做一次简单运算」——
+    // 如果这都失败，进程确实已经不可用了。
+    static fn live() -> CheckResult {
+        let probe = []
+        var i = 0
+        var acc = 0
+        while i < 16 {
+            arrPush(probe, i * 2)
+            acc = acc + i
+            i = i + 1
+        }
+        // 断言运算结果，防止「分配成功但算错了」这种更隐蔽的故障。
+        let ok = len(probe) == 16 && acc == 120
+        if (!ok) {
+            return new CheckResult("liveness",
+                false, "内存分配或基本运算失败（进程状态不可信）")
+        }
+        return new CheckResult("liveness", true, "")
+    }
+
+    // readiness：所有 required 检查都通过。
+    //
+    // results 是每项检查的 CheckResult（由调用方实际执行后传入）。
+    //
+    // ── 为什么由调用方执行而不是这里执行 ─────────────
+    //
+    // 因为检查内容依赖应用（数据库、缓存、消息队列各不相同），
+    // 而健康检查库不该知道这些东西。它只负责「判定规则 + 输出格式」。
+    fn readiness(results: Array) -> Array {
+        let failed = []
+        let all = []
+        var i = 0
+        while i < len(results) {
+            let r: CheckResult = results[i]
+            arrPush(all, r)
+            if (!r.ok) {
+                // 只有 required 的失败才影响结论
+                let req = self.isRequired(r.name)
+                if (req) { arrPush(failed, r.name) }
+            }
+            i = i + 1
+        }
+        let ok = len(failed) == 0
+        return [ok, failed, all]
+    }
+
+    fn isRequired(name: String) -> Bool {
+        var i = 0
+        while i < len(self.names) {
+            let n: String = self.names[i]
+            if (n == name) {
+                let r: Bool = self.required[i]
+                return r
+            }
+            i = i + 1
+        }
+        // 未注册的检查默认算 required —— 因为「注册了检查却忘了
+        // 标 required」比「标错了」更常见，而前者按 required 处理
+        // 是安全的方向（宁可摘流量，不可带病接流量）。
+        return true
+    }
+
+    // 生成 /health 的 JSON 响应体。
+    //
+    // ── 为什么输出 JSON 而不是纯文本 ──────────────
+    //
+    // 因为健康检查的消费者是**程序**（负载均衡、K8s、监控系统），
+    // 不是人。JSON 让它们能读到「哪一项失败」并据此做差异化处理
+    // （比如「数据库挂了」和「缓存挂了」的告警分级不同）。
+    //
+    // 纯文本 `OK` 只能表达二元状态，信息全丢了。
+    fn toJson(stateName: String, results: Array) -> String {
+        var out = "{\"status\":" + hqJson(stateName) +
+                  ",\"checks\":["
+        var i = 0
+        while i < len(results) {
+            let r: CheckResult = results[i]
+            if (i > 0) { out = out + "," }
+            var st = "fail"
+            if (r.ok) { st = "pass" }
+            out = out + "{\"name\":" + hqJson(r.name) +
+                  ",\"status\":" + hqJson(st) +
+                  ",\"detail\":" + hqJson(r.detail) +
+                  ",\"required\":" + boolToString(self.isRequired(r.name)) + "}"
+            i = i + 1
+        }
+        out = out + "]}"
+        return out
+    }
+}
+
+// 把字符串转成 JSON 字面量。
+//
+// 与 server.xle 的 jsonQuote 重复了 —— 但这里不能 import server
+// （会形成 service → net/http → service 的循环依赖）。十几行的
+// 重复代码换取单向依赖，值得。
+fn hqJson(s: String) -> String {
+    var out = "\""
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let c = strAt(s, i)
+        if (c == "\"") {
+            out = out + "\\\""
+        } else if (c == "\\") {
+            out = out + "\\\\"
+        } else if (c == "\n") {
+            out = out + "\\n"
+        } else if (c == "\r") {
+            out = out + "\\r"
+        } else if (c == "\t") {
+            out = out + "\\t"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out + "\""
+}

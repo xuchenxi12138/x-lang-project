@@ -1,0 +1,75 @@
+// 03-control.x — 控制流
+//
+// 验证点：
+//   1. if / else / else if
+//   2. while + break + continue
+//   3. loop（无限循环 + break）
+//   4. 嵌套循环里的 break 只跳出内层（P0 暂不支持标签，靠嵌套层次判断）
+
+println("=== if / else ===")
+let n = 42
+if n > 100 {
+    println("big")
+} else if n > 10 {
+    println("medium")
+} else {
+    println("small")
+}
+
+println("=== while 累加 ===")
+var i = 1
+var sum = 0
+while i <= 10 {
+    sum += i
+    i += 1
+}
+println(sum)        // 55
+
+println("=== while + break ===")
+var j = 0
+while true {
+    j += 1
+    if j == 5 {
+        break
+    }
+}
+println(j)          // 5
+
+println("=== while + continue ===")
+// 求 1..10 里奇数的和 = 25
+var k = 0
+var odd_sum = 0
+while k < 10 {
+    k += 1
+    if k % 2 == 0 {
+        continue
+    }
+    odd_sum += k
+}
+println(odd_sum)    // 25
+
+println("=== loop ===")
+var m = 0
+loop {
+    m += 1
+    if m >= 3 {
+        break
+    }
+}
+println(m)          // 3
+
+println("=== 嵌套循环 ===")
+var outer = 0
+var total = 0
+while outer < 3 {
+    outer += 1
+    var inner = 0
+    while inner < 3 {
+        inner += 1
+        if inner == 2 {
+            break
+        }
+        total += 1
+    }
+}
+println(total)      // 3（每轮外层只加 1 次）

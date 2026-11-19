@@ -1,0 +1,149 @@
+// ============================================================
+// 文件内建 —— 读写 / 追加 / 原子替换 / 目录
+// ============================================================
+//
+// 这个测试**真的读写磁盘**，用一个自己的临时目录，跑完清理。
+//
+// ── 为什么文件测试值得单独一个用例 ──────────────────────────
+//
+// 它跨了两条最容易漂移的路径：
+//   1. 解释器调 platform.c 的实现
+//   2. AOT 产物用内嵌在生成 C 里的另一份实现
+//
+// 两处代码逻辑相同但**是两份**，任何一处漏改都会让「解释跑得好、
+// --emit=exe 行为不同」。四档一致性检查就是钉住这件事的。
+//
+// ── 路径为什么用相对路径 ────────────────────────────────────
+//
+// 与 run_tests.sh 的工作目录约定一致（从仓库根跑）。用绝对路径
+// 会把「这台机器的目录结构」写进测试，换机器就红。
+// 而 C:\xtmp 这个临时根在 run_tests.sh 里已经固定了。
+
+fn p(name: String) -> String {
+    return "C:/xtmp/xtest/fs/" + name
+}
+
+fn main() -> Void {
+    let dir = "C:/xtmp/xtest/fs"
+    fsMkdir(dir)
+
+    println("---- 基本读写 ----")
+    // 写
+    println(fsWrite(p("a.txt"), "hello"))          // true
+    println(fsExists(p("a.txt")))                  // true
+    println(fsSize(p("a.txt")))                    // 5
+    // 读回来
+    println(fsRead(p("a.txt")))                    // hello
+    // 覆盖写
+    println(fsWrite(p("a.txt"), "hi"))             // true
+    println(fsRead(p("a.txt")))                    // hi
+    println(fsSize(p("a.txt")))                    // 2
+
+    println("---- 追加 ----")
+    fsWrite(p("b.txt"), "line1")
+    println(fsAppend(p("b.txt"), "\nline2"))       // true
+    println(fsAppend(p("b.txt"), "\nline3"))       // true
+    println(fsRead(p("b.txt")))                    // line1\nline2\nline3
+
+    println("---- 空文件 vs 打不开 ----")
+    // 空文件必须能被读成空串，而不是「打不开」
+    fsWrite(p("empty.txt"), "")
+    println(len(fsRead(p("empty.txt"))))           // 0
+    println(fsSize(p("empty.txt")))                // 0
+    // fsReadOr 在文件不存在时给默认值，不报错
+    println("[" + fsReadOr(p("nope.txt"), "默认值") + "]")   // [默认值]
+    println("[" + fsReadOr(p("empty.txt"), "默认值") + "]")  // []（存在，是空）
+
+    println("---- 非字符串内容 ----")
+    // 内容接受任意类型：数字按文本写进去
+    fsWrite(p("num.txt"), 42)
+    println(fsRead(p("num.txt")))                  // 42
+    fsWrite(p("flt.txt"), 3.5)
+    println(fsRead(p("flt.txt")))                  // 3.5
+    fsWrite(p("bool.txt"), true)
+    println(fsRead(p("bool.txt")))                 // true
+
+    println("---- 中文 ----")
+    // UTF-8 往返：写进去什么读出来什么，一个字节都不能少
+    let cn = "张三：你好，世界"
+    fsWrite(p("cn.txt"), cn)
+    println(fsRead(p("cn.txt")))                   // 张三：你好，世界
+    println(len(cn))                               // 8
+    // 文件大小是**字节数**不是码点数：8 个字符里 7 个汉字 + 1 个
+    // 全角冒号，全是 3 字节 → 24。这正是 len 与 fsSize 必须分开的
+    // 原因：一个数码点，一个数磁盘字节。
+    println(fsSize(p("cn.txt")))                   // 24
+
+    println("---- 多行 ----")
+    fsWrite(p("multi.txt"), "a\nb\nc\n")
+    println(len(fsRead(p("multi.txt"))))           // 6
+    println(fsSize(p("multi.txt")))                // 6
+
+    println("---- 原子替换 ----")
+    // fsWrite 直接覆盖；fsReplace 先写临时文件再改名。
+    // 对使用者来说结果一样，区别只在「写一半被杀」时：
+    // 前者留下半截文件，后者要么是旧的完整内容、要么是新的。
+    fsWrite(p("r.txt"), "old")
+    println(fsReplace(p("r.txt"), "new content"))  // true
+    println(fsRead(p("r.txt")))                    // new content
+    // 目标不存在时也能用
+    println(fsReplace(p("r2.txt"), "created"))     // true
+    println(fsRead(p("r2.txt")))                   // created
+
+    println("---- 目录 ----")
+    println(fsMkdir("C:/xtmp/xtest/fs/sub"))       // true
+    println(fsIsDir("C:/xtmp/xtest/fs/sub"))       // true
+    println(fsIsDir(p("a.txt")))                   // false
+    // 已存在视为成功（幂等）
+    println(fsMkdir("C:/xtmp/xtest/fs/sub"))       // true
+
+    // 列目录：只给名字，不含 . 与 ..
+    let names = fsList(dir)
+    println(len(names) > 0)                        // true
+    var sawA = false
+    var sawSub = false
+    var sawDot = false
+    var i = 0
+    while (i < len(names)) {
+        let n = names[i]
+        if (n == "a.txt") { sawA = true }
+        if (n == "sub") { sawSub = true }
+        if (n == "." || n == "..") { sawDot = true }
+        i = i + 1
+    }
+    println(sawA)      // true
+    println(sawSub)    // true
+    println(sawDot)    // false（. 与 .. 必须被过滤掉）
+
+    // 不存在的目录给空数组，不报错
+    println(len(fsList("C:/xtmp/xtest/fs/no_such_dir")))   // 0
+
+    println("---- 删除 ----")
+    println(fsRemove(p("a.txt")))                  // true
+    println(fsExists(p("a.txt")))                  // false
+    println(fsSize(p("a.txt")))                    // -1（不存在）
+    // 删不存在的文件返回 false，不报错
+    println(fsRemove(p("a.txt")))                  // false
+    // 删除后 fsReadOr 走默认值
+    println(fsReadOr(p("a.txt"), "gone"))          // gone
+
+    println("---- 清理 ----")
+    // 把本次写的文件删掉，让重复运行的结果稳定
+    let junk = array(8, "")
+    junk[0] = "b.txt"
+    junk[1] = "empty.txt"
+    junk[2] = "num.txt"
+    junk[3] = "flt.txt"
+    junk[4] = "bool.txt"
+    junk[5] = "cn.txt"
+    junk[6] = "multi.txt"
+    junk[7] = "r.txt"
+    var k = 0
+    while (k < len(junk)) {
+        fsRemove(p(junk[k]))
+        k = k + 1
+    }
+    fsRemove(p("r2.txt"))
+    println(fsExists(p("multi.txt")))              // false
+    println("fs ok")
+}

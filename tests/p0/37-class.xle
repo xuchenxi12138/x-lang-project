@@ -1,0 +1,292 @@
+// 37-class.xle — 类：封装、继承、多态、抽象类、接口
+//
+// 这组测试是「结构体 vs 类」的分界证明。两者不是同一个东西的两种
+// 写法，语义完全不同：
+//
+//              结构体 struct          类 class
+//   语义       值语义                 引用语义
+//   赋值      拷贝一份               共享同一个对象
+//   字段      不可变                 可变
+//   继承      没有                   单继承
+//   派发      静态（编译期定）       虚方法（按实际类型）
+//
+// 所以下面的测试重点不是「类也能存字段」，而是「赋值之后两边同步」、
+// 「同一个调用点按实际类型走不同实现」这些结构体做不到的事。
+//
+// 覆盖点：
+//   1. 类声明 + 构造函数 + new + 字段读写
+//   2. 引用语义（赋值共享同一对象）
+//   3. 实例相等是身份比较，不是字段比较
+//   4. 单继承：父类字段可见、子类扩展字段
+//   5. 虚方法派发：父类静态类型、子类实际行为
+//   6. 方法内访问 self、调用 self 的其它方法（含虚调用）
+//   7. 抽象类：不能实例化，但能声明变量接子类
+//   8. 接口 + implements
+//   9. 静态方法
+//  10. 多态数组：同一循环里对不同子类跑不同实现
+
+// ============================================================
+// 1. 最基础的类
+// ============================================================
+
+class Counter {
+    n: Int,
+
+    constructor(start: Int) {
+        self.n = start
+    }
+
+    fn bump() {
+        self.n = self.n + 1
+    }
+
+    fn value() -> Int {
+        return self.n
+    }
+}
+
+// ============================================================
+// 2. 继承 + 虚方法
+// ============================================================
+
+class Animal {
+    name: String,
+    legs: Int,
+
+    constructor(name: String, legs: Int) {
+        self.name = name
+        self.legs = legs
+    }
+
+    // 这个方法会被子类覆写 —— 虚方法派发的关键
+    fn speak() -> String {
+        return "..."
+    }
+
+    // 这个方法调用 self.speak()，所以它也必须按虚派发走，
+    // 否则 describe() 的输出永远是 "..."，多态形同虚设。
+    fn describe() -> String {
+        return self.name + " says " + self.speak()
+    }
+}
+
+class Dog extends Animal {
+    constructor(name: String) {
+        self.name = name
+        self.legs = 4
+    }
+
+    fn speak() -> String {
+        return "Woof"
+    }
+}
+
+class Bird extends Animal {
+    constructor(name: String) {
+        self.name = name
+        self.legs = 2
+    }
+
+    fn speak() -> String {
+        return "Tweet"
+    }
+
+    // 子类额外方法：父类静态类型看不到，子类静态类型看得到
+    fn fly() -> String {
+        return self.name + " flies"
+    }
+}
+
+// ============================================================
+// 3. 抽象类
+// ============================================================
+
+abstract class Shape {
+    tag: String,
+
+    constructor(tag: String) {
+        self.tag = tag
+    }
+
+    // 抽象方法：本类不给实现，子类必须给
+    abstract fn area() -> Int
+
+    fn label() -> String {
+        return self.tag
+    }
+}
+
+class Square extends Shape {
+    side: Int,
+
+    constructor(side: Int) {
+        self.tag  = "square"
+        self.side = side
+    }
+
+    fn area() -> Int {
+        return self.side * self.side
+    }
+}
+
+class Rect extends Shape {
+    w: Int,
+    h: Int,
+
+    constructor(w: Int, h: Int) {
+        self.tag = "rect"
+        self.w   = w
+        self.h   = h
+    }
+
+    fn area() -> Int {
+        return self.w * self.h
+    }
+}
+
+// ============================================================
+// 4. 接口
+// ============================================================
+
+interface Named {
+    fn name() -> String
+}
+
+class Tagged implements Named {
+    t: String,
+
+    constructor(t: String) {
+        self.t = t
+    }
+
+    fn name() -> String {
+        return self.t
+    }
+}
+
+// ============================================================
+// 5. 静态方法
+// ============================================================
+
+class Mathy {
+    // static 方法：不插 self，不经实例调用。
+    // `static` 不是保留字，所以它是一个位置固定的普通标识符 ——
+    // 写成 `fn static double` 是错的，必须 `static fn double`。
+    static fn double(x: Int) -> Int {
+        return x * 2
+    }
+}
+
+// ============================================================
+// 工具函数：接收父类静态类型，验证多态
+// ============================================================
+
+fn describeAll(a: Animal) -> String {
+    return a.describe()
+}
+
+// 接收抽象类静态类型
+fn areaOf(s: Shape) -> Int {
+    return s.area()
+}
+
+fn main() -> Int {
+    // ---- 1. new + 构造函数 + 字段 ----
+    let c = new Counter(10)
+    println(c.n)
+    println(c.value())
+    c.bump()
+    c.bump()
+    println(c.value())
+    println(c.n)
+
+    // ---- 2. 引用语义 ----
+    //
+    // 这是与结构体最根本的区别：赋值之后 d 和 c 是**同一个对象**，
+    // 通过 d 改，c 看得见。结构体在这里会各改各的。
+    let d = c
+    d.bump()
+    println(c.value())     // 13
+    println(d.value())     // 13
+    println(c == d)        // true —— 同一个对象
+
+    // ---- 3. 身份比较不是字段比较 ----
+    //
+    // 两个 Counter(5) 字段完全一样，但是两个不同的对象。
+    // 如果按字段比，它们会「相等」—— 而拖动判定、选中状态
+    // 这类逻辑会因此静默出错。
+    let e1 = new Counter(5)
+    let e2 = new Counter(5)
+    println(e1 == e2)      // false
+    println(e1.n == e2.n)  // true —— 字段确实一样
+
+    // ---- 4. 继承：父类字段子类能读 ----
+    let dog = new Dog("Rex")
+    println(dog.name)
+    println(dog.legs)
+
+    let bird = new Bird("Tweety")
+    println(bird.name)
+    println(bird.legs)
+
+    // ---- 5. 虚方法派发 ----
+    //
+    // 同一行代码，因为实际类型不同而走不同实现。
+    println(dog.speak())
+    println(bird.speak())
+
+    // 通过父类静态类型调用 —— 这里最能看清「运行时决定」
+    let a1: Animal = dog
+    let a2: Animal = bird
+    println(a1.speak())    // Woof
+    println(a2.speak())    // Tweet
+
+    // 父类方法里调 self.speak()，也必须派发到子类
+    println(a1.describe())
+    println(a2.describe())
+    println(describeAll(a1))
+    println(describeAll(a2))
+
+    // ---- 6. 抽象类 ----
+    let sq = new Square(5)
+    let rc = new Rect(3, 4)
+    println(sq.area())
+    println(rc.area())
+    println(sq.label())
+
+    // 通过抽象类静态类型访问 —— 多态
+    let s1: Shape = sq
+    let s2: Shape = rc
+    println(s1.area())
+    println(s2.area())
+    println(areaOf(s1))
+    println(areaOf(s2))
+
+    // ---- 7. 接口 ----
+    let t = new Tagged("hello")
+    println(t.name())
+
+    // ---- 8. 静态方法（不经实例）----
+    println(Mathy.double(21))
+
+    // ---- 9. 多态数组 ----
+    //
+    // 一个循环、一个调用点，跑出三种不同实现。这是多态真正有用的
+    // 地方，也是类系统存在的理由。
+    let zoo = array(0, "")
+    arrPush(zoo, describeAll(a1))
+    arrPush(zoo, describeAll(a2))
+    arrPush(zoo, describeAll(new Animal("Ghost", 0)))
+    println(zoo[0])
+    println(zoo[1])
+    println(zoo[2])
+    println(len(zoo))
+
+    // ---- 10. 打印格式带实际类名 ----
+    //
+    // 用 cls_name（实际类型）而不是静态类型，打印里也能看见多态。
+    println(dog)
+
+    println("class ok")
+    return 0
+}

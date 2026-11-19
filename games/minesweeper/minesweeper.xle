@@ -1,0 +1,130 @@
+// minesweeper.xle — 扫雷的入口与主循环
+//
+// 这个文件只有一件事：跑循环。
+//   · 每帧处理输入
+//   · 更新计时
+//   · 调 ui.xle 的绘制函数重画整个界面
+//
+// 绘制、交互、状态构造全在 ui.xle；棋盘逻辑全在 board.xle。
+// 三层分开的好处很直接：
+//   · board.xle 能脱离窗口用 println 测试（见 board_test.xle）
+//   · ui.xle 能被 demo.xle 直接调用，用构造好的局面截图做回归比对
+//   · 本文件只关心「什么时候调谁」，逻辑错不到哪里去
+
+from "ui.xle" import num_color, g_new, board_px_w, board_px_h, win_w, win_h, hit_cell, draw_num, draw_flag, draw_mine, draw_x, draw_header, draw_board, draw_footer, draw_banner, do_reveal, do_flag, CELL, PAD, HEADER, MINES_H, FOOTER, FACE_W, BTN_W, BTN_H, BTN_GAP, C_N1, C_N2, C_N3, C_N4, C_N5, C_N6, C_N7, C_N8, C_BG, C_PANEL, C_CELL_UP, C_CELL_UP_H, C_CELL_DN, C_GRID, C_TEXT, C_DIM, C_RED, C_FLAG, C_WIN, G_BOARD, G_DIFF, G_START, G_ELAPSED, G_W, G_H, G_OVER, G_SEED
+
+fn main() -> Int {
+    let g = g_new(0)
+
+    if !winOpen("扫雷 · X 语言", win_w(g), win_h(g)) {
+        return 1
+    }
+
+    var running = true
+    while running {
+        // ---- 处理输入 ----
+        let mx = winMouseX()
+        let my = winMouseY()
+
+        // 每帧把队列里的点击全部处理完。
+        //
+        // 为什么用 while 而不是 if：快速连点会在一帧内积累多个事件。
+        // 只取一个的话，剩下的留到下一帧，在 60fps 下表现为「点击
+        // 有延迟」，虽然最终都会生效但手感明显。
+        var click = winPollClick()
+        while click != null {
+            let cx = click[0]
+            let cy = click[1]
+            let btn = click[2]
+
+            // 先看表情按钮（重开）
+            //
+            // 这里的尺寸必须和 draw_header 里用的一致。二者都读
+            // ui.xle 的 FACE_W，所以「改一处两边同步」是编译器保证的，
+            // 不靠人记得同时改两处。
+            let W = win_w(g)
+            let bw = FACE_W
+            let bx = (W - bw) / 2
+            let by = (HEADER - bw) / 2
+            var handled = false
+            if cx >= bx && cx < bx + bw && cy >= by && cy < by + bw {
+                g = g_new(g[G_DIFF])
+                winClose()
+                if !winOpen("扫雷 · X 语言", win_w(g), win_h(g)) {
+                    running = false
+                }
+                handled = true
+            }
+
+            // 再看难度按钮
+            if !handled && running {
+                let fy = HEADER + board_px_h(g)
+                if cy >= fy && cy < fy + FOOTER {
+                    let btn_w = BTN_W
+                    let btn_h = BTN_H
+                    let byy = fy + (FOOTER - btn_h) / 2
+                    let total = btn_w * 3 + BTN_GAP * 2
+                    var bxx = (W - total) / 2
+                    for i in 0..3 {
+                        if cx >= bxx && cx < bxx + btn_w &&
+                           cy >= byy && cy < byy + btn_h {
+                            if g[G_DIFF] != i {
+                                g = g_new(i)
+                                winClose()
+                                if !winOpen("扫雷 · X 语言", win_w(g), win_h(g)) {
+                                    running = false
+                                }
+                            }
+                            handled = true
+                        }
+                        bxx += btn_w + BTN_GAP
+                    }
+                }
+            }
+
+            // 最后是棋盘
+            if !handled && running {
+                let c = hit_cell(g, cx, cy)
+                if c[0] >= 0 {
+                    if btn == 1 {
+                        do_reveal(g, c[0], c[1])
+                    } else {
+                        do_flag(g, c[0], c[1])
+                    }
+                }
+            }
+
+            click = winPollClick()
+        }
+
+        // ---- 更新计时 ----
+        //
+        // 只在「已经开始且还没结束」时推进。踩雷的那一刻计时停住，
+        // 玩家看到的最终用时就是踩雷时的用时，不会被后续犹豫时间污染。
+        let st = board_state(g[G_BOARD])
+        if g[G_START] >= 0 && st == ST_PLAY {
+            g[G_ELAPSED] = toInt(winTime() - g[G_START])
+        }
+
+        // ---- 绘制 ----
+        winBeginFrame()
+        winFillRect(0, 0, win_w(g), win_h(g), C_BG)
+        draw_header(g, mx, my)
+        draw_board(g, mx, my)
+        draw_footer(g, mx, my)
+        draw_banner(g)
+        winEndFrame()
+
+        // ---- 退出判定 ----
+        if winShouldClose() {
+            running = false
+        }
+
+        // 60fps 上限。不睡的话会占满一个核：即时模式每帧重画，
+        // CPU 跑得越快画得越勤，但屏幕刷新率固定，多出的重画全是浪费。
+        winSleep(16)
+    }
+
+    winClose()
+    return 0
+}

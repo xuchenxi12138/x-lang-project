@@ -1,0 +1,642 @@
+// net/http/uri.xle — URI / URL 解析
+//
+// ── 为什么不直接用字符串切 ─────────────────────────
+//
+// 因为 URL 有太多反直觉的规则，随手切必然出错。「切两下就够」的想法
+// 在下面每一个点上都翻车：
+//
+//   http://a.com/p?q=1#f        —— 有 fragment
+//   http://a.com:8080/p         —— 有端口
+//   http://user:pw@a.com/p      —— 有 userinfo（且密码里可能有 @）
+//   /path/to%20file?a=%26b%3Dc  —— 百分号编码，编码后的 & 不是分隔符
+//   http://[::1]:8080/p         —— IPv6 字面量，方括号里的冒号不是端口
+//   //a.com/p                   —— 协议相对 URL（常见于 CDN 引用）
+//   mailto:a@b.com              —— 无 authority，冒号后面不是端口
+//
+// 这个文件的每条规则都对应上面某一行的真实场景。
+//
+// ── 分层：URI 与 URL ─────────────────────────────
+//
+// 严格说 URL 是 URI 的子集（URI 还包含 URN，如 urn:isbn:...）。
+// 但本文件只处理「能定位资源」的那类，RFC 3986 里叫 URI-reference，
+// 日常都叫 URL。命名用 Uri 是因为它同时能装相对路径（/a/b），
+// 而「URL」在直觉上必须是绝对的。
+
+// bytes.xle 在 db/codec/ 下（见 tcp_stream.xle 的说明）。
+from "../../db/codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// ── 百分号编码 ───────────────────────────────────
+
+// 判断一个字节是否可以**不编码**地出现在路径里。
+//
+// ── unreserved 集为什么是这三个区间 ──────────────
+//
+// RFC 3986 §2.3 定义的 unreserved 是：
+//   ALPHA / DIGIT / "-" / "." / "_" / "~"
+//
+// 这四类字符在**所有** URI 组件里都无需编码。除此之外的字符在不同
+// 组件里规则不同（`/` 在路径里不能编码、在查询里可以），所以那些
+// 留给调用方按组件决定，本函数只回答「绝对安全那一批」。
+fn uriIsUnreserved(code: Int) -> Bool {
+    // 数字 0-9
+    if (code >= 48 && code <= 57) { return true }
+    // 大写 A-Z
+    if (code >= 65 && code <= 90) { return true }
+    // 小写 a-z
+    if (code >= 97 && code <= 122) { return true }
+    // - . _ ~
+    if (code == 45 || code == 46 || code == 95 || code == 126) { return true }
+    return false
+}
+
+// 把一个字节编码成 %XX 形式（大写十六进制）。
+//
+// ── 为什么用大写 ────────────────────────────────
+//
+// RFC 3986 §6.2.2.1 要求归一化时十六进制用大写。服务端解析时大小写
+// 都接受，但生成端统一大写能让「同一 URL 只有一种写法」，对缓存
+// 键、日志去重、签名校验都重要 —— 签名是按字符串算的，小写变大写
+// 就是另一个签名。
+fn uriPctEncodeByte(v: Int) -> String {
+    let hex = "0123456789ABCDEF"
+    var b = v
+    if (b < 0) { b = 0 }
+    if (b > 255) { b = 255 }
+    let hi = (b / 16) % 16
+    let lo = b % 16
+    return "%" + strSub(hex, hi, hi + 1) + strSub(hex, lo, lo + 1)
+}
+
+// 对字符串做百分号编码。
+//
+// extraSafe 是「除 unreserved 之外还要当作安全的字符」。
+//   编码路径段时传 "/" 之外的东西都不该额外放行
+//   编码查询值时传 "=&" 都不该放行（否则参数被劈开）
+//
+// ── 为什么按字节而不是按码点 ────────────────────
+//
+// 因为百分号编码的定义就是按字节的（RFC 3986 §2.1）。中文「你」是
+// 3 个 UTF-8 字节 E4 BD A0，编码结果必须是 %E4%BD%A0。如果按码点
+// 编码成 %4F60 那就是错的 —— 服务端解出来是 "O`" 两个字符。
+//
+// 所以这里先把 String 转成字节数组（bbFromUtf8 做 UTF-8 编码），
+// 再逐字节判断。
+fn uriEncode(s: String, extraSafe: String) -> String {
+    let raw = bbFromUtf8(s)
+    let n = len(raw)
+    var out = ""
+    var i = 0
+    while i < n {
+        let b = bbAt(raw, i)
+        if (uriIsUnreserved(b)) {
+            out = out + strFromCode(b)
+        } else {
+            // 注意：这里不能用 strFromCode(b) 直接追加 —— 见 bytes.xle
+            // 文件头的论证。但 uriIsUnreserved 已经保证走这个分支的 b
+            // 全是 ASCII 字母数字，所以 strFromCode 是安全的。
+            var safe = false
+            if (len(extraSafe) > 0) {
+                let c = strFromCode(b)
+                if (strFind(extraSafe, c) >= 0) { safe = true }
+            }
+            if (safe) {
+                out = out + strFromCode(b)
+            } else {
+                out = out + uriPctEncodeByte(b)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 路径编码：保留 `/`（否则路径层级被破坏）。
+fn uriEncodePath(s: String) -> String {
+    return uriEncode(s, "/")
+}
+
+// 查询值编码：`/` 也可以放行（查询里的斜杠无歧义），但 & = + # 必须编码。
+//
+// ── 为什么 + 要编码 ─────────────────────────────
+//
+// 因为 application/x-www-form-urlencoded 里 `+` 代表空格。查询字符串
+// 里出现裸 `+` 时，不同服务端有不同解读（有的当空格，有的当加号），
+// 于是「值里本来有个加号」变成「值里有个空格」。编码成 %2B 消除歧义。
+fn uriEncodeQueryValue(s: String) -> String {
+    return uriEncode(s, "/")
+}
+
+// 解码。非法序列原样保留，不报错、不丢字节。
+//
+// ── 为什么不严格报错 ────────────────────────────
+//
+// 因为真实的 URL 里有大量不规范的编码（`%` 后面只有一个十六进制位、
+// `%ZZ`、裸 `%`）。严格模式会让这些 URL 完全不可用，而宽松模式下
+// 最多是「这个位置解码不出东西」—— 局部问题优于整体失败。
+//
+// ── 为什么必须先收集字节再一次性 strFromBytes ─────────
+//
+// 因为 `%E4%BD%A0` 解出来是 3 个字节，它们合起来才是一个中文。
+// 逐段 strFromCode 拼字符串会把每个字节当成一个码点，得到 3 个
+// 拉丁字符（ä½ å）—— 这正是所有手写 URL 解码器的经典 bug。
+fn uriDecode(s: String) -> String {
+    let raw = bbFromUtf8(s)
+    let n = len(raw)
+    let out = []
+    var i = 0
+    while i < n {
+        let b = bbAt(raw, i)
+        if (b != 37) {                     // 不是 '%'
+            arrPush(out, b)
+            i = i + 1
+            continue
+        }
+        // 需要后面还有两个字符
+        if (i + 2 >= n) {
+            arrPush(out, b)                // 尾部残缺的 %，原样保留
+            i = i + 1
+            continue
+        }
+        let h1 = uriHexVal(bbAt(raw, i + 1))
+        let h2 = uriHexVal(bbAt(raw, i + 2))
+        if (h1 < 0 || h2 < 0) {
+            arrPush(out, b)                // %ZZ，原样保留
+            i = i + 1
+            continue
+        }
+        arrPush(out, h1 * 16 + h2)
+        i = i + 3
+    }
+    return bbToText(out)
+}
+
+// 十六进制字符 → 值，非法返回 -1。
+fn uriHexVal(c: Int) -> Int {
+    if (c >= 48 && c <= 57)  { return c - 48 }        // 0-9
+    if (c >= 65 && c <= 70)  { return c - 65 + 10 }   // A-F
+    if (c >= 97 && c <= 102) { return c - 97 + 10 }   // a-f
+    return 0 - 1
+}
+// ── 解析后的 URI ────────────────────────────────
+//
+// 字段一望即知，但有几个「为什么不是 String」的取舍值得记：
+//
+//   port        用 Int，0 表示「没写端口」。用 String 的话每个调用点
+//               都要 toIntOr，且 "" 和 "0" 的区分全靠约定。
+//
+//   hasAuthority 单独标记。`http://a.com` 和 `http:/a.com` 的区别就在
+//               这里 —— 后者是畸形但真实存在的（老代理会发出来），
+//               按 authority 处理会得到 host="a.com" 的假成功。
+//
+//   isAbsolute  协议是不是绝对（有 scheme）。相对路径 `/a/b` 为 false。
+//
+// ── 为什么用 class 而不是 struct ─────────────────
+//
+// 因为 parse 之后调用方经常要「改一个字段再拼回去」（重定向时换 host、
+// 加查询参数时改 query）。struct 字段不可变，改一个字段就要新建整个
+// 对象并复制 8 个字段。
+class Uri {
+    scheme: String       // "http" / "https" / ""（相对路径）
+    user: String         // userinfo 的用户名部分
+    password: String     // userinfo 的密码部分
+    host: String         // 主机名或 IP（IPv6 保留方括号）
+    port: Int            // 端口，0 = 未指定
+    path: String         // 路径（总是以 / 开头或为空）
+    query: String        // ? 之后的部分，不含 ?
+    fragment: String     // # 之后的部分，不含 #
+    hasAuthority: Bool   // 是否出现了 //authority
+    isAbsolute: Bool     // 是否有 scheme
+
+    constructor() {
+        self.scheme       = ""
+        self.user         = ""
+        self.password     = ""
+        self.host         = ""
+        self.port         = 0
+        self.path         = ""
+        self.query        = ""
+        self.fragment     = ""
+        self.hasAuthority = false
+        self.isAbsolute   = false
+    }
+
+    // ── 解析 ──────────────────────────────────
+
+    // 解析一个 URI 引用（绝对或相对）。
+    //
+    // ── 解析顺序为什么是这个 ──────────────────────
+    //
+    // 必须**从后往前**切：先取 fragment，再取 query，最后才是 scheme
+    // 和 authority。因为
+    //
+    //   · fragment 里可以出现 ? 和 :（`#a?b:c`），所以必须先剥 fragment
+    //   · query 里可以出现 : 和 /（`?redirect=http://x`），先找 scheme
+    //     会把 `http` 当成 scheme
+    //   · scheme 的判定是「第一个 : 之前全是合法 scheme 字符」，
+    //     而 `mailto:a@b` 里冒号后没有 `//`，所以不能靠 `://` 判断
+    //
+    // 反过来（先找 `://`）会把 `/a/b?u=http://x` 解成 scheme=http、
+    // host=x —— 一个内部路径被当成外部 URL，是 SSRF 类问题的经典入口。
+    static fn parse(s: String) -> Uri {
+        let u = new Uri()
+        var rest = s
+
+        // 1. fragment
+        let hashAt = strFind(rest, "#")
+        if (hashAt >= 0) {
+            u.fragment = strSub(rest, hashAt + 1, len(rest))
+            rest = strSub(rest, 0, hashAt)
+        }
+
+        // 2. query
+        let qAt = strFind(rest, "?")
+        if (qAt >= 0) {
+            u.query = strSub(rest, qAt + 1, len(rest))
+            rest = strSub(rest, 0, qAt)
+        }
+
+        // 3. scheme。判定规则见 RFC 3986 §3.1：
+        //    第一个字符必须是字母，后续是字母/数字/+/-/.
+        let colonAt = uriFindSchemeColon(rest)
+        if (colonAt > 0) {
+            u.scheme     = strLower(strSub(rest, 0, colonAt))
+            u.isAbsolute = true
+            rest = strSub(rest, colonAt + 1, len(rest))
+        }
+
+        // 4. authority（// 开头）
+        if (strStarts(rest, "//")) {
+            u.hasAuthority = true
+            rest = strSub(rest, 2, len(rest))
+            // authority 到第一个 / 结束
+            let slashAt = strFind(rest, "/")
+            var auth = rest
+            if (slashAt >= 0) {
+                auth = strSub(rest, 0, slashAt)
+                rest = strSub(rest, slashAt, len(rest))
+            } else {
+                rest = ""
+            }
+            uriSplitAuthority(u, auth)
+        }
+
+        u.path = rest
+        // 规范化：有 authority 但路径为空时补 "/"。
+        // 因为 `http://a.com` 和 `http://a.com/` 是同一个资源，
+        // 而拼请求行时 `GET  HTTP/1.1` 是非法请求 —— 必须补。
+        if (u.hasAuthority && len(u.path) == 0) { u.path = "/" }
+        return u
+    }
+
+    // 从当前上下文解析一个可能相对的引用。
+    //
+    // ── 为什么要这个方法而不是 parse 就够 ────────────
+    //
+    // 因为 HTTP 响应里的 Location、HTML 里的 href 大量是相对路径。
+    // `parse("/login")` 得到一个没有 host 的对象，直接拿它发请求
+    // 会连到 0.0.0.0 —— 所以必须能「基于当前 URL 补齐」。
+    //
+    // 规则按 RFC 3986 §5.2.2 的简化版（省略了点段归一化，见
+    // normalizePath 的说明）。
+    static fn resolve(base: Uri, rel: String) -> Uri {
+        let r = Uri.parse(rel)
+        if (r.isAbsolute) { return r }
+
+        let out = base.copy()
+
+        // 只有 fragment：`#top`
+        if (len(r.path) == 0 && !r.hasAuthority && len(r.query) == 0) {
+            out.fragment = r.fragment
+            return out
+        }
+        // 只有 query：`?page=2`
+        if (len(r.path) == 0 && !r.hasAuthority) {
+            out.query    = r.query
+            out.fragment = r.fragment
+            return out
+        }
+        // 协议相对：`//cdn.com/a.js`
+        if (r.hasAuthority) {
+            out.host         = r.host
+            out.port         = r.port
+            out.user         = r.user
+            out.password     = r.password
+            out.hasAuthority = true
+            out.path         = r.path
+            out.query        = r.query
+            out.fragment     = r.fragment
+            return out
+        }
+        // 绝对路径：`/login`
+        out.query    = r.query
+        out.fragment = r.fragment
+        if (strStarts(r.path, "/")) {
+            out.path = uriNormalizePath(r.path)
+            return out
+        }
+        // 相对路径：`a/b`，拼到 base 目录后面
+        let dir = uriDirOf(base.path)
+        out.path = uriNormalizePath(dir + r.path)
+        return out
+    }
+
+    // ── 输出 ──────────────────────────────────
+
+    // 拼回字符串。
+    //
+    // includeFragment 为 false 时可生成「可发送的请求目标」——
+    // HTTP 请求行里不能带 fragment（那是客户端内部用的锚点）。
+    fn toStringWith(includeFragment: Bool) -> String {
+        var out = ""
+        if (self.isAbsolute) { out = out + self.scheme + ":" }
+        if (self.hasAuthority) {
+            out = out + "//"
+            if (len(self.user) > 0) {
+                out = out + self.user
+                if (len(self.password) > 0) {
+                    out = out + ":" + self.password
+                }
+                out = out + "@"
+            }
+            out = out + self.host
+            if (self.port > 0) { out = out + ":" + toString(self.port) }
+        }
+        out = out + self.path
+        if (len(self.query) > 0) { out = out + "?" + self.query }
+        if (includeFragment && len(self.fragment) > 0) {
+            out = out + "#" + self.fragment
+        }
+        return out
+    }
+
+    fn toString() -> String {
+        return self.toStringWith(true)
+    }
+
+    // 请求行里用的目标（origin-form）：只有 path + query。
+    //
+    // ── 为什么发请求必须用这个 ────────────────────
+    //
+    // RFC 7230 §5.3.1：客户端直接向源服务器发请求时必须用
+    // origin-form（`GET /a/b?c=1 HTTP/1.1`），不能发完整 URL。
+    // 发完整 URL（absolute-form）是给**代理**用的 —— 对着源服务器
+    // 发绝对形式，多数服务器会 400，少数会把它当路径。
+    fn requestTarget() -> String {
+        var out = self.path
+        if (len(out) == 0) { out = "/" }
+        if (len(self.query) > 0) { out = out + "?" + self.query }
+        return out
+    }
+
+    // 该 scheme 的**协议默认**端口。0 表示未知 scheme。
+    //
+    // ── 为什么必须和 effectivePort 分开 ──────────────
+    //
+    // effectivePort() 的语义是「实际要连哪个端口」，所以它内部会
+    // 优先返回显式 port。用它来判断「是不是默认端口」永远为真 ——
+    // 于是 `http://a.com:8080/p` 的 Host 头被写成 `a.com`，丢掉
+    // 了 8080。那会让 nginx 按 80 端口的 server_name 匹配，把请求
+    // 路由到完全另一个站点（返回别人的页面，而不是报错）。
+    //
+    // 这个 bug 曾经真实存在于本文件里，症状是「本地 8080 起的服务
+    // 用 URL 访问返回了另一个网站的首页」。
+    fn schemeDefaultPort() -> Int {
+        if (self.scheme == "https") { return 443 }
+        if (self.scheme == "http")  { return 80 }
+        if (self.scheme == "ws")    { return 80 }
+        if (self.scheme == "wss")   { return 443 }
+        if (self.scheme == "ftp")   { return 21 }
+        return 0
+    }
+
+    // 实际要连接的端口。
+    //
+    // ── 为什么 port 字段不直接填默认值 ──────────────
+    //
+    // 因为「用户显式写了 80」和「没写，按 scheme 默认」在拼 URL 和
+    // 判断同源时行为不同。前者 `http://a.com:80/` 归一化后确实等于
+    // `http://a.com/`，但显式保留能让日志忠实反映原始输入。
+    fn effectivePort() -> Int {
+        if (self.port > 0) { return self.port }
+        return self.schemeDefaultPort()
+    }
+
+    // 主机头（Host: 行）的值。非默认端口要带上。
+    //
+    // RFC 7230 §5.4：Host 头在端口非默认时必须含端口。
+    fn hostHeader() -> String {
+        let def = self.schemeDefaultPort()
+        if (self.port > 0 && self.port != def) {
+            return self.host + ":" + toString(self.port)
+        }
+        return self.host
+    }
+
+    fn copy() -> Uri {
+        let u = new Uri()
+        u.scheme       = self.scheme
+        u.user         = self.user
+        u.password     = self.password
+        u.host         = self.host
+        u.port         = self.port
+        u.path         = self.path
+        u.query        = self.query
+        u.fragment     = self.fragment
+        u.hasAuthority = self.hasAuthority
+        u.isAbsolute   = self.isAbsolute
+        return u
+    }
+
+    fn describe() -> String {
+        return self.toString() +
+               "  [scheme=" + self.scheme +
+               " host=" + self.host +
+               " port=" + toString(self.effectivePort()) +
+               " authority=" + boolToString(self.hasAuthority) + "]"
+    }
+}
+
+// ── 内部辅助 ────────────────────────────────────
+
+// 找 scheme 后面那个冒号的位置。找不到返回 -1。
+//
+// ── 为什么不能简单地 strFind(rest, ":") ──────────
+//
+// 因为：
+//   /a/b:c          冒号在路径里，不是 scheme 分隔符
+//   ./x:y           同上
+//   [::1]:8080/p    方括号里的冒号更不是
+//
+// 判定规则（RFC 3986 §3.1）：冒号前必须全是大写/小写字母、数字、
+// 加号、减号、点，且**第一个字符必须是字母**。
+fn uriFindSchemeColon(s: String) -> Int {
+    let n = len(s)
+    var i = 0
+    while i < n {
+        let c = strSub(s, i, i + 1)
+        if (c == ":") {
+            if (i == 0) { return 0 - 1 }        // 冒号在开头，不是 scheme
+            return i
+        }
+        let code = strCode(c)
+        var ok = false
+        if (i == 0) {
+            // 首字符必须是字母
+            if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) { ok = true }
+        } else {
+            if (uriIsUnreserved(code)) { ok = true }
+            if (code == 43 || code == 45 || code == 46) { ok = true }   // + - .
+        }
+        if (!ok) { return 0 - 1 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 切 authority：`[user[:pw]@]host[:port]`
+//
+// ── 为什么从右往左找 @ ──────────────────────────
+//
+// 因为密码里可以出现 @（`http://u:p@ss@a.com/`）。RFC 3986 没有禁止，
+// 而真实世界里确实有人这么写。取**最后一个** @ 作为分隔符，host 部分
+// 才不会被切碎 —— 从左往右取第一个 @ 会把 `p` 当密码、`ss@a.com`
+// 当主机名，结果是 DNS 解析失败。
+fn uriSplitAuthority(u: Uri, auth: String) {
+    var hostPart = auth
+
+    let atAt = strLastFind(auth, "@")
+    if (atAt >= 0) {
+        let userinfo = strSub(auth, 0, atAt)
+        hostPart = strSub(auth, atAt + 1, len(auth))
+        let colAt = strFind(userinfo, ":")
+        if (colAt >= 0) {
+            // userinfo 里的 %40 等编码要解，否则 httpHeader 里会出现
+            // 「看起来像分隔符」的字符
+            u.user     = uriDecode(strSub(userinfo, 0, colAt))
+            u.password = uriDecode(strSub(userinfo, colAt + 1, len(userinfo)))
+        } else {
+            u.user = uriDecode(userinfo)
+        }
+    }
+
+    // ── IPv6 字面量 ──────────────────────────────
+    //
+    // `[::1]:8080` —— 方括号里的冒号不是端口分隔符。所以先看开头的
+    // 方括号，有就整体跳过，端口从 `]` 之后找。
+    //
+    // 为什么保留方括号而不剥掉：因为连接时需要裸地址 `::1`，但拼
+    // URL 和 Host 头时必须带方括号（`Host: [::1]:8080`）。保留原样
+    // 让「拼回去」无需特殊判断，剥掉只留给 connect 用。
+    if (strStarts(hostPart, "[")) {
+        let closeAt = strFind(hostPart, "]")
+        if (closeAt >= 0) {
+            u.host = strSub(hostPart, 0, closeAt + 1)
+            let after = strSub(hostPart, closeAt + 1, len(hostPart))
+            if (strStarts(after, ":")) {
+                let ps = strSub(after, 1, len(after))
+                if (len(ps) > 0) { u.port = toIntOr(ps, 0) }
+            }
+            return
+        }
+    }
+
+    let colAt2 = strFind(hostPart, ":")
+    if (colAt2 >= 0) {
+        u.host = strSub(hostPart, 0, colAt2)
+        let ps = strSub(hostPart, colAt2 + 1, len(hostPart))
+        if (len(ps) > 0) { u.port = toIntOr(ps, 0) }
+    } else {
+        u.host = hostPart
+    }
+    u.host = uriDecode(u.host)
+}
+
+// 从右往左找子串，返回下标，找不到 -1。
+fn strLastFind(s: String, sub: String) -> Int {
+    let ns = len(sub)
+    if (ns == 0) { return len(s) }
+    var i = len(s) - ns
+    while i >= 0 {
+        if (strSub(s, i, i + ns) == sub) { return i }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+// 取路径的目录部分（含末尾斜杠）。`/a/b/c` → `/a/b/`。
+//
+// ── 为什么没有斜杠时返回 "/" 而不是空串 ──────────
+//
+// 因为相对路径解析要把它拼在 base 目录后面。返回空串会让 `a/b`
+// 相对于 base="/dir/x" 拼成 "a/b"（丢掉了 /dir/），结果是根目录
+// 相对路径 —— 请求打到完全不同的资源上。
+fn uriDirOf(path: String) -> String {
+    let at = strLastFind(path, "/")
+    if (at < 0) { return "/" }
+    return strSub(path, 0, at + 1)
+}
+
+// 点段归一化：消掉 `.` 和 `..`。
+//
+// ── 为什么必须做 ────────────────────────────────
+//
+// 因为很多服务端会拒绝含 `..` 的请求（安全策略），而且 `a/../b`
+// 和 `b` 在签名、缓存键上是不同的字符串。不做归一化会让合理请求
+// 被 403。
+//
+// ── 为什么 ".." 越过根时直接丢弃而不是报错 ─────────
+//
+// RFC 3986 §5.2.4 明确要求「移除开头的 ..」，即 `/../a` 归一化为
+// `/a`。这不是宽容，是规范。按字面「上一级」处理会得到负深度，
+// 无法表示。
+fn uriNormalizePath(path: String) -> String {
+    if (len(path) == 0) { return path }
+    let abs = strStarts(path, "/")
+    let segs = strSplit(path, "/")
+    let out = []
+    var i = 0
+    let n = len(segs)
+    while i < n {
+        let seg: String = segs[i]
+        if (seg == "." || len(seg) == 0) {
+            // 空段来自连续的 //。保留它会让路径出现 //（多数服务器
+            // 会归一化，但签名不一致），所以丢弃。
+            i = i + 1
+            continue
+        }
+        if (seg == "..") {
+            if (len(out) > 0) {
+                // 弹掉最后一段。
+                //
+                // ── 为什么不能 arrPop 后不管 ────────────
+                //
+                // 因为要检查弹掉的是不是 `..` 本身。如果上游已经
+                // 弹到空了，再遇 `..` 就该丢弃（见上面的规范引用）。
+                arrPop(out)
+            }
+            i = i + 1
+            continue
+        }
+        arrPush(out, seg)
+        i = i + 1
+    }
+
+    var head = ""
+    if (abs) { head = "/" }
+    var joined = ""
+    var k = 0
+    let m = len(out)
+    while k < m {
+        if (k > 0) { joined = joined + "/" }
+        joined = joined + toString(out[k])
+        k = k + 1
+    }
+    var result = head + joined
+    // 原路径以 / 结尾时补回来。`/a/b/` 与 `/a/b` 在多数服务端是
+    // 不同资源（前者目录，后者可能是文件）。
+    if (strEnds(path, "/") && !strEnds(result, "/")) {
+        result = result + "/"
+    }
+    if (len(result) == 0) { result = "/" }
+    return result
+}

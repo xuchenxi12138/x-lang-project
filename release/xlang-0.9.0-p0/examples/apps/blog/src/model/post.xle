@@ -1,0 +1,143 @@
+// model/post.xle — 文章实体
+//
+// ── 一个实体的字段为什么都要有「空值语义」的约定 ────────
+//
+// 因为语言没有可空类型。所以「这个字段没有值」必须用一种明确的
+// 表示法：
+//
+//   id        0 表示「还没入库」（自增 id 从 1 开始）
+//   createdAt 空串表示「未知」
+//   tags      空数组表示「没有标签」
+//
+// 把约定写在字段旁边而不是散在代码里 —— 否则每个使用这个方法的人
+// 都要重新猜一次「id 为 0 是什么意思」。
+
+// 一篇文章。
+class Post {
+    // 自增主键。0 = 未入库。
+    id: Int
+
+    // 标题。
+    title: String
+
+    // 正文（纯文本，本示例不做 Markdown 渲染）。
+    body: String
+
+    // 作者名。
+    author: String
+
+    // 标签（不含 # 前缀）。
+    tags: Array
+
+    // 发布状态："draft" / "published"。
+    //
+    // ── 为什么用字符串而不是 Bool ─────────────────
+    //
+    // 因为「草稿/已发布」很容易长出第三、第四个状态（审核中、已归档、
+    // 已删除）。Bool 到那时只能再加一个字段，而那个字段和旧字段的
+    // 组合里有一半是非法的（`published=true, archived=true` 是什么？）。
+    //
+    // 字符串的代价是没有编译期检查。所以下面有 statusIsValid()。
+    status: String
+
+    // 创建时间（ISO 8601 字符串）。空串 = 未知。
+    createdAt: String
+
+    constructor(title: String, body: String, author: String) {
+        self.id        = 0
+        self.title     = title
+        self.body      = body
+        self.author    = author
+        self.tags      = []
+        self.status    = "draft"
+        self.createdAt = ""
+    }
+
+    // 状态是否合法。
+    fn statusIsValid() -> Bool {
+        return self.status == "draft" || self.status == "published"
+    }
+
+    // 校验。返回空串表示通过。
+    fn validate() -> String {
+        if (len(self.title) == 0) {
+            return "标题不能为空"
+        }
+        // ── 长度上限为什么按码点算 ────────────────
+        //
+        // 因为 len(String) 在本语言里返回码点数（见 bytes.xle 的
+        // 论证）。这对「用户看到多少个字」是正确语义，对「数据库
+        // 存多少字节」不是。用 VARCHAR(200) 的库要按字节算，那时
+        // 需要 strBytes(len)。
+        if (len(self.title) > 200) {
+            return "标题不能超过 200 字符（当前 " + toString(len(self.title)) + "）"
+        }
+        if (len(self.body) > 100000) {
+            return "正文不能超过 100000 字符"
+        }
+        if (len(self.author) == 0) {
+            return "作者不能为空"
+        }
+        if (!self.statusIsValid()) {
+            return "状态只能是 draft 或 published，实际是 `" + self.status + "`"
+        }
+        return ""
+    }
+
+    // 序列化成 JSON 对象。
+    fn toJson() -> String {
+        var out = "{\"id\":" + toString(self.id) +
+                  ",\"title\":" + postJsonStr(self.title) +
+                  ",\"body\":" + postJsonStr(self.body) +
+                  ",\"author\":" + postJsonStr(self.author) +
+                  ",\"status\":" + postJsonStr(self.status) +
+                  ",\"createdAt\":" + postJsonStr(self.createdAt) +
+                  ",\"tags\":["
+        var i = 0
+        while i < len(self.tags) {
+            if (i > 0) { out = out + "," }
+            let t: String = self.tags[i]
+            out = out + postJsonStr(t)
+            i = i + 1
+        }
+        out = out + "]}"
+        return out
+    }
+
+    fn describe() -> String {
+        return "Post#" + toString(self.id) + " [" + self.status + "] " + self.title +
+               " by " + self.author
+    }
+}
+
+// JSON 字符串字面量。
+//
+// ── 为什么每个层级都要自己的这个函数 ────────────────
+//
+// 因为不想让 model 层依赖 net/http（那会把「实体」和「传输」绑死，
+// 单元测试时为了序列化一个 Post 得引入整个 HTTP 栈）。
+//
+// 十几行的重复代码换单向依赖 + 可单独测试，值得。
+fn postJsonStr(s: String) -> String {
+    var out = "\""
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let c = strAt(s, i)
+        if (c == "\"") {
+            out = out + "\\\""
+        } else if (c == "\\") {
+            out = out + "\\\\"
+        } else if (c == "\n") {
+            out = out + "\\n"
+        } else if (c == "\r") {
+            out = out + "\\r"
+        } else if (c == "\t") {
+            out = out + "\\t"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out + "\""
+}

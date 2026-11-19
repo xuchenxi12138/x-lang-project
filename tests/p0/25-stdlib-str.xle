@@ -1,0 +1,179 @@
+// ============================================================
+// std.str —— 字符串组合工具
+// ============================================================
+//
+// 内建只提供「一次操作」（strAt/strSub/strFind/strSplit/...）。
+// 这一层补的是组合工具。
+//
+// ── 这个测试特别关注码点与显示宽度的区别 ────────────────────
+//
+// 中文是 3 字节 UTF-8、2 列终端宽度、1 个码点。三个数都不一样，
+// 而 len() 现在数码点。所以这里每条断言都同时放一个中文用例：
+// 只用 ASCII 测的话，len 数码点还是数字节根本区分不出来。
+
+from std.str import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+
+fn main() -> Void {
+    println("---- 判空 ----")
+    println(strIsEmpty(""))          // true
+    println(strIsEmpty(" "))         // false
+    println(strIsBlank(" \t\r\n"))   // true
+    println(strIsBlank(" x "))       // false
+    // 中文空格（全角）不是 ASCII 空白，trim 不动它
+    println(strIsBlank(strTrim("　")))   // false
+
+    println("---- 单侧 trim ----")
+    println("[" + strTrimStart("   abc  ") + "]")   // [abc  ]
+    println("[" + strTrimEnd("   abc  ") + "]")     // [   abc]
+    println("[" + strTrimStart("abc") + "]")        // [abc]
+    println("[" + strTrimEnd("abc") + "]")          // [abc]
+    println("[" + strTrimStart("") + "]")           // []
+    println("[" + strTrimStart("   ") + "]")        // []
+
+    println("---- 补齐 ----")
+    println("[" + strPadLeft("7", 3, "0") + "]")        // [007]
+    println("[" + strPadRight("7", 3, ".") + "]")       // [7..]
+    println("[" + strPadCenter("ab", 6, "-") + "]")     // [--ab--]
+    // 奇数差：多出的给右边
+    println("[" + strPadCenter("ab", 5, "-") + "]")     // [-ab--]
+    // 已够宽：原样返回，不截断
+    println("[" + strPadLeft("abcdef", 3, "0") + "]")   // [abcdef]
+    println("[" + strPadLeft("", 2, "0") + "]")         // [00]
+
+    println("---- 显示宽度 ----")
+    // 3 个码点 3 列
+    println(strDisplayWidth("abc"))       // 3
+    // 2 个码点，但占 4 列
+    println(len("张三"))                  // 2
+    println(strDisplayWidth("张三"))      // 4
+    // 混排：1 + 2 + 2
+    println(strDisplayWidth("a张三"))     // 5
+    // 全角标点也算 2 列
+    println(strDisplayWidth("，"))        // 2
+    println("[" + strPadDisplayRight("张三", 8) + "]")   // [张三    ]
+    println(len(strPadDisplayRight("张三", 8)))          // 6（4 空格 + 2 码点）
+    println("[" + strPadDisplayRight("张三", 2) + "]")   // [张三]（已够宽）
+
+    println("---- 切分 ----")
+    // 只切前 2 段，剩下的整体留下
+    let sp = strSplitN("a.b.c.d", ".", 2)
+    println(len(sp))                  // 2
+    println(sp[1])                    // b.c.d
+    // n=1 时整串返回
+    let sp1 = strSplitN("a.b.c", ".", 1)
+    println(len(sp1))                 // 1
+    println(sp1[0])                   // a.b.c
+    // n 大于实际段数：全切
+    let sp9 = strSplitN("a.b", ".", 9)
+    println(len(sp9))                 // 2
+    // n=0 / 负数：空数组
+    println(len(strSplitN("a.b", ".", 0)))    // 0
+    // 中文分隔符
+    let spc = strSplitN("张三、李四、王五", "、", 2)
+    println(spc[0])                   // 张三
+    println(spc[1])                   // 李四、王五
+
+    println("---- 按行 ----")
+    let lines = strLines("a\nb\nc")
+    println(len(lines))               // 3
+    println(lines[2])                 // c
+    // \r\n 也要吃掉 \r
+    let wl = strLines("a\r\nb\r\n")
+    println(len(wl))                  // 2
+    println(len(wl[0]))               // 1
+    // 末尾换行不多出空行
+    println(len(strLines("a\n")))     // 1
+    // 空串 0 行
+    println(len(strLines("")))        // 0
+    // 中间空行保留
+    println(len(strLines("a\n\nb")))  // 3
+    println(strLineCount("x\ny\nz")) // 3
+    println(strLineCount(""))        // 0
+
+    println("---- 替换与查找 ----")
+    println(strReplaceN("aaaa", "a", "b", 2))      // bbaa
+    println(strReplaceN("aaaa", "a", "b", 0))      // aaaa
+    println(strReplaceN("aaaa", "a", "b", 99))     // bbbb
+    // 中文替换
+    println(strReplaceN("甲乙甲", "甲", "丙", 1))   // 丙乙甲
+    // 第 n 次出现
+    println(strFindNth("a,b,c,b", "b", 2))         // 5
+    println(strFindNth("a,b,c,b", "b", 3))         // -1
+    println(strFindNth("a,b,c,b", "b", 0))         // -1
+    // 计数（不重叠）
+    println(strCount("aaaa", "aa"))                // 2
+    println(strCount("aaaa", "a"))                 // 4
+    println(strCount("abc", "z"))                  // 0
+    println(strCount("abc", ""))                   // 0
+
+    println("---- 反转 ----")
+    println(strReverse("abc"))       // cba
+    // 按码点反转，不是按字节 —— 按字节会出乱码
+    println(strReverse("张三"))      // 三张
+    println(strReverse(""))          // 空行
+    println(strReverse("a张b"))      // b张a
+
+    println("---- 摘要 ----")
+    println("[" + strFirstLine("abc\ndef") + "]")   // [abc]
+    println("[" + strFirstLine("") + "]")           // []
+    println("[" + strEllipsis("abcdefgh", 6) + "]") // [abc...]
+    println("[" + strEllipsis("abc", 6) + "]")      // [abc]
+    println("[" + strEllipsis("abcdef", 3) + "]")   // [abc]
+    println("[" + strEllipsis("abcdef", 0) + "]")   // []
+    // 中文按码点截
+    println("[" + strEllipsis("张三李四王五", 5) + "]")   // [张三...]
+
+    println("---- 数字判定 ----")
+    println(strIsInt("123"))      // true
+    println(strIsInt("-123"))     // true
+    println(strIsInt("+123"))     // true
+    println(strIsInt(" 123 "))    // true（先 trim）
+    println(strIsInt("1.5"))      // false
+    println(strIsInt(""))         // false
+    println(strIsInt("-"))        // false
+    println(strIsInt("1a"))       // false
+    println(strIsFloat("1.5"))    // true
+    println(strIsFloat("-1.5e3")) // true
+    println(strIsFloat("1e"))     // false
+    println(strIsFloat("1.2.3"))  // false
+    println(strIsFloat("123"))    // true
+    println(strIsFloat(""))       // false
+
+    println("---- 画线 ----")
+    println(strRule(5, "-"))        // -----
+    println(strChar(3, "="))        // ===
+    println("[" + strRule(0, "-") + "]")   // []
+
+    println("---- 路径 ----")
+    println(strBasename("/a/b/c.txt"))    // c.txt
+    println(strBasename("/a/b/"))         // b
+    println(strBasename("c.txt"))         // c.txt
+    println("[" + strBasename("/") + "]") // []
+    println(strDirname("/a/b/c.txt"))     // /a/b
+    println(strDirname("/a/b/"))          // /a
+    println(strDirname("c.txt"))          // .
+    println(strDirname("/c.txt"))         // /
+    println(strExtname("/a/b/c.txt"))     // txt
+    println("[" + strExtname("/a/b/c") + "]")     // []
+    println("[" + strExtname("a.b/c") + "]")      // []
+    println(strJoinPath("/a", "b"))       // /a/b
+    println(strJoinPath("/a/", "b"))      // /a/b（不产生 //）
+    println(strJoinPath("", "b"))         // b
+    println(strJoinPath("a", ""))         // a
+
+    println("---- 模板 ----")
+    let keys = array(2, "")
+    keys[0] = "name"
+    keys[1] = "n"
+    let vals = array(2, "")
+    vals[0] = "张三"
+    vals[1] = "42"
+    // 模板用 r""：`{name}` 是 strTemplate 的**运行时**占位符，
+// 不是编译期插值。若写成普通字符串，`{name}` 会被当表达式求值并报
+// 「未定义的变量 name」—— 这正是 r"" 存在的首要理由。
+    println(strTemplate(r"name={name}, n={n}", keys, vals))  // name=张三, n=42
+    // 未命中的占位符原样保留
+    println(strTemplate(r"{name}-{miss}", keys, vals))       // 张三-{miss}
+    // 没有占位符
+    println(strTemplate("plain", keys, vals))                // plain
+}

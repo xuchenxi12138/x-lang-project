@@ -1,0 +1,326 @@
+// ioc.xle — xboot 的 IoC 容器
+//
+// ── 容器的三段式生命周期 ──────────────────────────────────
+//
+// Spring 容器启动时做的事，在这里拆成三个显式阶段：
+//
+//   scan()          扫描：classAll() → 注解过滤 → BeanDefinition 清单
+//                   （此时只有类名，没有实例 —— 注解查询收类名，
+//                    构造函数不会带着未注入的依赖提前跑）
+//
+//   instantiate()   实例化：对清单里的类逐个 classNew（无参构造）
+//
+//   inject()        注入：对每个实例遍历字段，@Autowired 按类型
+//                   装配依赖，@Value 从配置装配值
+//
+// 顺序是对的代价是「实例化之后才知道依赖谁」。先实例化、后注入的
+// 两段式让循环依赖天然可解（Spring 单例 + 字段注入的同一招）：
+// 所有实例先都存在了，注入只是把引用填进去，A 依赖 B、B 依赖 A
+// 都能装配成功。构造注入做不到这一点，所以容器只支持字段注入。
+
+from "anno.xle" import mappingAnnoNames, isComponentAnno, beanNameOf, camelToSnake, isComponentClass, annoHasInherited, annoGetInherited, annoGetKVInherited, ANNO_COMPONENT, ANNO_SERVICE, ANNO_REPOSITORY, ANNO_CONTROLLER, ANNO_RESTCONTROLLER, ANNO_MAPPER, ANNO_AUTOWIRED, ANNO_VALUE, ANNO_GET_MAPPING, ANNO_POST_MAPPING, ANNO_PUT_MAPPING, ANNO_DELETE_MAPPING, ANNO_PATCH_MAPPING, ANNO_REQUEST_MAPPING, ANNO_TABLE, ANNO_TABLE_ID, ANNO_COLUMN, ANNO_QUERY
+from "../../stdlib/service/config.xle" import cfgPriority, cfgEnvName, envGet, ConfigEntry, Config
+
+// ---------------- Bean 定义 ----------------
+//
+// 平行数组而不是 BeanDef 对象数组：容器要装**任意类**的实例，
+// 语言没有「任意对象」的静态类型。数组的元素是动态值 —— 实例
+// 存进 Array，取出时仍是那个实例（fieldGet/fieldSet/methodCall
+// 都按值工作），类型安全在「使用者拿到的每个引用都经过静态类型
+// 声明」这一层保证。
+class Container {
+    // Bean 名（camelCase）清单，与下面三个数组按下标对齐。
+    names: Array
+
+    // 类名清单。
+    classes: Array
+
+    // 实例池。instantiate 之后按下标可取。
+    insts: Array
+
+    // 注入完成标记。
+    ready: Array
+
+    // 配置源（@Value 注入用）。XBoot 在 scan 前设置。
+    cfg: Config
+
+    // 启动诊断（dump 用）：跳过链。
+    skipped: Array
+
+    constructor() {
+        self.names    = []
+        self.classes  = []
+        self.insts    = []
+        self.ready    = []
+        self.cfg      = new Config()
+        self.skipped  = []
+    }
+
+    // ---------------- 阶段 1：扫描 ----------------
+
+    // 组件扫描。返回发现的 Bean 个数。
+    //
+    // ── 为什么扫描不过滤「包路径」 ────────────────────────
+    //
+    // 字节码里没有包信息（import 在编译前文本级合并）。过滤只能
+    // 靠注解：组件必须带组件注解（见 anno.xle 的约定）。框架自身
+    // 的类（Router、Container、BaseMapper...）不带组件注解，天然
+    // 不会误入 —— 误伤面收敛到「忘了删注解的类」。
+    fn scan() -> Int {
+        let all = classAll()
+        var i = 0
+        while i < len(all) {
+            let cn = toString(all[i])
+            if (isComponentClass(cn)) {
+                arrPush(self.names, beanNameOf(cn))
+                arrPush(self.classes, cn)
+                arrPush(self.insts, null)
+                arrPush(self.ready, false)
+            }
+            i = i + 1
+        }
+        return len(self.names)
+    }
+
+    // 显式注册（补充扫描：配置出来的实例、手工构造的对象）。
+    fn registerSingleton(name: String, clsName: String, inst) {
+        arrPush(self.names, name)
+        arrPush(self.classes, clsName)
+        arrPush(self.insts, inst)
+        arrPush(self.ready, true)      // 外部构造的实例视为就绪
+    }
+
+    // ---------------- 阶段 2：实例化 ----------------
+
+    // 对扫描出的每个类做无参实例化。返回实例化个数。
+    //
+    // 构造函数带参数的组件在这里失败（classNew 的报错会写清楚
+    // 要几个参数）—— 容器只支持无参构造 + 字段注入。这不是限制，
+    // 是取舍：构造注入没法解循环依赖（上面注释里的理由）。
+    fn instantiate() -> Int {
+        var made = 0
+        var i = 0
+        while i < len(self.names) {
+            if (self.ready[i] == false) {
+                let inst = classNew(toString(self.classes[i]), [])
+                self.insts[i] = inst
+                made = made + 1
+            }
+            i = i + 1
+        }
+        return made
+    }
+
+    // ---------------- 阶段 3：注入 ----------------
+
+    // 对每个未就绪的 Bean 做 @Autowired / @Value 注入。
+    // 返回注入字段总数。
+    //
+    // 循环依赖在这里天然可解：injectBean 对「正在注入中的 Bean」
+    // 直接按引用取 —— 所有实例在 instantiate 阶段已经存在，
+    // 注入只填引用。
+    fn inject() -> Int {
+        var filled = 0
+        var i = 0
+        while i < len(self.names) {
+            if (self.ready[i] == false) {
+                filled = filled + self.injectBean(i)
+                self.ready[i] = true
+            }
+            i = i + 1
+        }
+        return filled
+    }
+
+    // 注入单个 Bean 的全部字段。返回注入的字段数。
+    fn injectBean(idx: Int) -> Int {
+        let clsName = toString(self.classes[idx])
+        let inst = self.insts[idx]
+        // classFields 返回 [[name, type, vis, final], ...]，含父类字段。
+        let fields = classFields(clsName)
+        var filled = 0
+        var i = 0
+        while i < len(fields) {
+            let row: Array = fields[i]
+            let fname = toString(row[0])
+            let ftype = toString(row[1])
+            let vis   = toString(row[2])
+            let fin   = row[3]
+
+            if (annoHasInherited(clsName, "field", fname, ANNO_AUTOWIRED)) {
+                // ── 封装守卫 ──────────────────────────────
+                // 反射不绕过访问控制（与 methodCall 同一条原则）。
+                // 注入字段必须是 public 且非 final —— 写成 private
+                // 会在 fieldSet 处失败，这里提前给出能定位的报错。
+                if (vis != "public") {
+                    fail("xboot: Bean `" + clsName + "` 的注入字段 `" + fname +
+                         "` 必须是 public（容器从外部写字段，private 会被拒绝）")
+                }
+                if (fin == true) {
+                    fail("xboot: Bean `" + clsName + "` 的注入字段 `" + fname +
+                         "` 不能是 final")
+                }
+                let dep = self.resolveDependency(ftype, clsName + "." + fname)
+                fieldSet(inst, fname, dep)
+                filled = filled + 1
+            } else if (annoHasInherited(clsName, "field", fname, ANNO_VALUE)) {
+                if (vis != "public") {
+                    fail("xboot: Bean `" + clsName + "` 的注入字段 `" + fname +
+                         "` 必须是 public（容器从外部写字段，private 会被拒绝）")
+                }
+                if (fin == true) {
+                    fail("xboot: Bean `" + clsName + "` 的注入字段 `" + fname +
+                         "` 不能是 final")
+                }
+                // @Value("key") 或 @Value("key", "默认值")
+                let kv = annoGetKVInherited(clsName, "field", fname, ANNO_VALUE)
+                if (len(kv) == 0) {
+                    fail("xboot: Bean `" + clsName + "." + fname +
+                         "` 的 @Value 缺少 key 参数")
+                }
+                let row0: Array = kv[0]
+                let key = toString(row0[1])
+                let raw = self.cfg.getOr(key, "")
+                if (len(raw) == 0 && len(kv) > 1) {
+                    let row1: Array = kv[1]
+                    raw = toString(row1[1])
+                }
+                if (len(raw) == 0) {
+                    fail("xboot: 配置项 `" + key + "` 不存在（@" + clsName +
+                         "." + fname + " 需要，也没有默认值）")
+                }
+                fieldSet(inst, fname, convertByType(raw, ftype))
+                filled = filled + 1
+            }
+            i = i + 1
+        }
+        return filled
+    }
+
+    // 按声明类型解析依赖实例。
+    //
+    // 解析顺序（与 Spring 的 byType 一致）：
+    //   1. 精确类名匹配 —— Bean 的类名 == 字段声明的类型名
+    //   2. IS-A 匹配 —— 字段声明抽象基类（如 DataSource），Bean
+    //      是它的子类（MySqlDataSource classIs DataSource）
+    //   3. 恰好一个候选 → 注入；多个 → 报错列出候选（歧义要暴露，
+    //      不要猜）；零个 → 报错并提示缺什么
+    //
+    // 接口暂不支持（classIs 沿父类链查，接口关系不在其中）——
+    // 面向接口编程请用抽象基类（本项目 db 层的 DataSource 就是
+    // 这个用法）。
+    fn resolveDependency(typeName: String, at: String) {
+        var found = -1
+        var count = 0
+        var i = 0
+        while i < len(self.classes) {
+            let cn = toString(self.classes[i])
+            if (cn == typeName || classIs(cn, typeName)) {
+                found = i
+                count = count + 1
+            }
+            i = i + 1
+        }
+        if (count == 0) {
+            fail("xboot: 无法注入 " + at + " —— 容器里没有类型为 `" +
+                 typeName + "` 的 Bean\n" +
+                 "       检查：依赖类是否带了组件注解（@Component/@Service/@Repository/@Mapper）？")
+        }
+        if (count > 1) {
+            let cands = []
+            var j = 0
+            while j < len(self.classes) {
+                let cn = toString(self.classes[j])
+                if (cn == typeName || classIs(cn, typeName)) {
+                    arrPush(cands, cn)
+                }
+                j = j + 1
+            }
+            fail("xboot: 注入 " + at + " 有歧义 —— " + toString(count) +
+                 " 个候选（" + strJoin(cands, ", ") + "）\n" +
+                 "       把字段类型改成具体类名，或只保留一个候选 Bean")
+        }
+        return self.insts[found]
+    }
+
+    // ---------------- 查询 ----------------
+
+    // Bean 名是否存在。
+    fn has(name: String) -> Bool {
+        return arrIndexOf(self.names, name) >= 0
+    }
+
+    // 按名取实例。不存在时给明确报错（启动期错误要 fail fast）。
+    fn get(name: String) {
+        let idx = arrIndexOf(self.names, name)
+        if (idx < 0) {
+            fail("xboot: 容器里没有名为 `" + name + "` 的 Bean\n" +
+                 "       现有：" + strJoin(self.names, ", "))
+        }
+        return self.insts[idx]
+    }
+
+    // 按名取类名。
+    fn classNameOf(name: String) -> String {
+        let idx = arrIndexOf(self.names, name)
+        if (idx < 0) { return "" }
+        return toString(self.classes[idx])
+    }
+
+    // 全部 Mapper Bean 的下标清单（XBoot 用它做 Mapper 装配）。
+    fn mapperIndexes() -> Array {
+        let out = []
+        var i = 0
+        while i < len(self.classes) {
+            if (annoHasInherited(toString(self.classes[i]), "class", "", ANNO_MAPPER)) {
+                arrPush(out, i)
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // 容器清单（启动 banner 用）。
+    fn dump() -> String {
+        var s = "beans (" + toString(len(self.names)) + "):"
+        var i = 0
+        while i < len(self.names) {
+            let mark = if (self.ready[i] == true) { " [ready]" } else { " [not-wired]" }
+            s = s + "\n  " + toString(self.names[i]) + " -> " +
+                toString(self.classes[i]) + mark
+            i = i + 1
+        }
+        return s
+    }
+}
+
+// ---------------- 值转换 ----------------
+
+// 按字段声明类型把字符串配置值转成目标类型。
+//
+// 类型名单来自 classFields —— 它返回的是**声明**类型名
+// （Int/Float/Bool/String/自定义类名）。配置值只有字符串形态，
+// 转换在这里集中做，类型错误给行内信息。
+fn convertByType(raw: String, typeName: String) {
+    if (typeName == "Int") {
+        return strParseInt(raw)
+    }
+    if (typeName == "Float") {
+        return strParseFloat(raw)
+    }
+    if (typeName == "Bool") {
+        let lo = strLower(strTrim(raw))
+        if (lo == "true" || lo == "1" || lo == "yes" || lo == "on") {
+            return true
+        }
+        if (lo == "false" || lo == "0" || lo == "no" || lo == "off") {
+            return false
+        }
+        fail("xboot: 配置值 `" + raw + "` 无法转成 Bool（期望 true/false/1/0/yes/no/on/off）")
+    }
+    if (typeName == "String") {
+        return raw
+    }
+    fail("xboot: @Value 不支持注入类型 `" + typeName +
+         "`（支持 Int/Float/Bool/String）")
+}

@@ -1,0 +1,445 @@
+// db/sqlite/schema.xle — sqlite_master 解析
+//
+// ── SQLite 把「元数据」也存在一张表里 ────────────────────
+//
+// 别的数据库有系统表 / 数据字典（information_schema.tables 之类），
+// 结构由内核维护。SQLite 简单得多：它有一张名为 `sqlite_master`
+// 的**普通表**，root page 固定是 1，每行是一个数据库对象：
+//
+//   type      'table' / 'index' / 'view' / 'trigger'
+//   name      对象名
+//   tbl_name  所属表（索引/触发器才有意义）
+//   rootpage  这张表/索引的 B-tree 根页号
+//   sql       建表语句原文（内部对象为 NULL）
+//
+// 所以「列出所有表」= 扫 sqlite_master，不需要解析任何特殊结构。
+// 这是 SQLite 「一个文件就是一个数据库」能做到极简的根本原因。
+//
+// ── 为什么要解析 sql 里的列名 ────────────────────────
+//
+// 因为记录里**没有列名**，只有按顺序排的值。列名只能从建表语句里
+// 抠出来（或从 `PRAGMA table_info` 的虚拟表，而那也要跑 SQL）。
+//
+// ── 为什么用文本扫描而不是完整 SQL 解析器 ─────────────
+//
+// 写一个完整 SQL 解析器是为了「执行」SQL；而这里只需要「找出列名
+// 和主键」。两者复杂度差两个数量级。P0 的取舍是：只处理 CREATE
+// TABLE 的常见形状，遇到不认识的（约束子句里带逗号、生成列等）
+// 就明确放弃而不是给错答案。
+//
+// 具体做法：先按「顶层逗号」切分括号内的定义（顶层 = 不在括号里
+// 且不在引号里），然后每段取第一个标识符。以 `PRIMARY` / `UNIQUE`
+// / `CHECK` / `FOREIGN` / `CONSTRAINT` / `WITHOUT` 开头的段是表级
+// 约束，不是列。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "record.xle" import svSerialKind, svSerialBytes, svReadRecord, svReadSignedBE, svReadDoubleBE, svRecordColCount, SvValue, SV_NULL, SV_INT, SV_FLOAT, SV_TEXT, SV_BLOB
+
+// 一个表（或索引 / 视图）的元数据。
+class SvSchemaEntry {
+    objType: String,
+    name: String,
+    tblName: String,
+    rootPage: Int,
+    sql: String,
+
+    constructor() {
+        self.objType  = ""
+        self.name     = ""
+        self.tblName  = ""
+        self.rootPage = 0
+        self.sql      = ""
+    }
+
+    fn describe() -> String {
+        return self.objType + " " + self.name + " (root=" + toString(self.rootPage) + ")"
+    }
+}
+
+// sqlite_master 的列固定是这 5 个（顺序固定，所以可以按下标取）。
+const SV_MASTER_COLS = 5
+
+// 从 sqlite_master 的每条记录解出对象。
+//
+// ── 为什么参数是「payload 字节数组的数组」而不是 SvCell ──────
+//
+// 因为 SvCell 定义在 btree.xle，而 schema 层不该知道 B-tree 的存在
+// —— 它的输入只是「几条记录的字节」。这样分层有两个好处：
+//
+//   1. schema 层可以脱离文件、脱离页，用构造的字节直接单测；
+//   2. btree.xle 将来改 cell 布局（比如加 overflow 字段），schema
+//      层不用跟着改。
+//
+// 调用方只需把 cell 的 payload 逐个取出来传进来，一行 map 的事。
+fn svSchemaFromPayloads(payloads: Array) -> Array {
+    let out = []
+    var i = 0
+    while (i < len(payloads)) {
+        let payload = payloads[i]
+        let r = svReadRecord(payload, 0)
+        let vals = r[0]
+        // 至少要有 type / name / tbl_name / rootpage 四列。
+        // sql 可能为 NULL（sqlite_autoindex_* 这类内部对象）。
+        if (len(vals) >= 4) {
+            let e = new SvSchemaEntry()
+            e.objType  = svValText(vals, 0)
+            e.name     = svValText(vals, 1)
+            e.tblName  = svValText(vals, 2)
+            e.rootPage = svValInt(vals, 3)
+            if (len(vals) >= 5) { e.sql = svValText(vals, 4) }
+            arrPush(out, e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 从「值数组」里按序取类型化的值。
+//
+// 注意参数类型写 SvValue —— 数组元素取出来之后类型不可追踪，
+// 必须显式注解，否则 `v.text()` 会报「无法确定宿主类型」。
+fn svValText(vals: Array, i: Int) -> String {
+    if (i < 0 || i >= len(vals)) { return "" }
+    let v: SvValue = vals[i]
+    return v.text()
+}
+
+fn svValInt(vals: Array, i: Int) -> Int {
+    if (i < 0 || i >= len(vals)) { return 0 }
+    let v: SvValue = vals[i]
+    if (v.kind == SV_INT) { return v.i }
+    return toIntOr(v.text(), 0)
+}
+
+// ── 建表语句 → 列名 ──────────────────────────────────
+
+// 表级约束的开头关键词。
+//
+// ── 为什么写成函数而不是顶层 const 数组 ───────────────
+//
+// 因为顶层 `const` 的初始值只能是标量字面量（编译器的明确规定，
+// 见报错里的 note）。数组必须用函数返回 —— 每次调用新建一个数组
+// 看起来浪费，但编译器报错时明确提示了这一点，而且这个函数只在
+// 解析建表语句时被调用几次，不在热路径上。
+fn svTableConstraintKeywords() -> Array {
+    return ["PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "CONSTRAINT", "WITHOUT"]
+}
+
+// 从 CREATE TABLE 语句里抠出列名数组。
+//
+// ── 为什么返回空数组而不是报错 ───────────────────────
+//
+// 因为有些表是内部表（sqlite_sequence、sqlite_stat1），语句由内核
+// 生成，格式可能很怪。对它们「拿不到列名」比「报错中断」更合理 ——
+// 用户想看的通常是自己的表。
+fn svColumnsFromCreate(sql: String) -> Array {
+    // 找第一个 '(' —— 表名之后的那一个。
+    //
+    // 为什么不找最后一个：`CREATE TABLE t (a INT)` 里表名可能带引号
+    // 或带 schema 前缀，但没有嵌套括号的表名，所以第一个 '(' 必然
+    // 是列定义的开头。
+    let lp = strFind(sql, "(")
+    if (lp < 0) { return [] }
+
+    // 找配对的 ')'
+    let rp = svMatchParen(sql, lp)
+    if (rp < 0) { return [] }
+
+    let inner = strSub(sql, lp + 1, rp)
+    let parts = svSplitTop(inner, ",")
+
+    let cols = []
+    var i = 0
+    while (i < len(parts)) {
+        let seg = strTrim(toString(parts[i]))
+        if (len(seg) > 0 && !svIsTableConstraint(seg)) {
+            let name = svFirstIdent(seg)
+            if (len(name) > 0) { arrPush(cols, name) }
+        }
+        i = i + 1
+    }
+    return cols
+}
+
+fn svIsTableConstraint(seg: String) -> Bool {
+    let kws = svTableConstraintKeywords()
+    var i = 0
+    while (i < len(kws)) {
+        let kw = toString(kws[i])
+        if (svStartsWithCi(seg, kw)) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// 大小写不敏感的前缀判断。SQL 关键词大小写随意。
+fn svStartsWithCi(s: String, p: String) -> Bool {
+    if (len(p) > len(s)) { return false }
+    return strLower(strSub(s, 0, len(p))) == strLower(p)
+}
+
+// 从 p 处的 '(' 找到配对的 ')'，跳过引号内的括号。
+fn svMatchParen(s: String, p: Int) -> Int {
+    var i = p
+    var depth = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        // 引号：跳过整段，里面的括号不算。
+        if (c == "'" || c == "\"" || c == "`") {
+            i = svSkipQuoted(s, i)
+            continue
+        }
+        if (c == "(") { depth = depth + 1 }
+        if (c == ")") {
+            depth = depth - 1
+            if (depth == 0) { return i }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 跳过一段引号包裹的内容，返回闭引号之后的位置。
+fn svSkipQuoted(s: String, i: Int) -> Int {
+    let q = strAt(s, i)
+    var k = i + 1
+    while (k < len(s)) {
+        let c = strAt(s, k)
+        if (c == q) {
+            // SQL 里两个连续引号是「一个转义的引号」，不是结束。
+            if (k + 1 < len(s) && strAt(s, k + 1) == q) {
+                k = k + 2
+                continue
+            }
+            return k + 1
+        }
+        k = k + 1
+    }
+    return k
+}
+
+// 按顶层分隔符切分（不在括号、不在引号内的分隔符）。
+//
+// 这是解析 CREATE TABLE 的核心难点：`DECIMAL(10,2)` 里的逗号不是
+// 列分隔符。凡是把 `strSplit(sql, ",")` 直接用在建表语句上的实现，
+// 都会在第一个带精度的数值列上把列数算多。
+fn svSplitTop(s: String, sep: String) -> Array {
+    let out = []
+    var start = 0
+    var i = 0
+    var depth = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == "'" || c == "\"" || c == "`") {
+            i = svSkipQuoted(s, i)
+            continue
+        }
+        if (c == "(") { depth = depth + 1 }
+        else if (c == ")") { depth = depth - 1 }
+        else if (depth == 0 && c == sep) {
+            arrPush(out, strSub(s, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    arrPush(out, strSub(s, start, len(s)))
+    return out
+}
+
+// 取一段定义开头的标识符（列名）。
+//
+// 支持三种写法：裸名、`反引号`、"双引号"、[方括号]。
+// 裸名一直读到空白或 '('。
+fn svFirstIdent(seg: String) -> String {
+    if (len(seg) == 0) { return "" }
+    let c0 = strAt(seg, 0)
+
+    if (c0 == "`") { return svReadQuotedName(seg, "`") }
+    if (c0 == "\"") { return svReadQuotedName(seg, "\"") }
+    if (c0 == "[") {
+        let e = strFind(seg, "]")
+        if (e < 0) { return "" }
+        return strSub(seg, 1, e)
+    }
+
+    var i = 0
+    while (i < len(seg)) {
+        let c = strAt(seg, i)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r" || c == "(") { break }
+        i = i + 1
+    }
+    return strSub(seg, 0, i)
+}
+
+fn svReadQuotedName(seg: String, q: String) -> String {
+    var i = 1
+    while (i < len(seg)) {
+        if (strAt(seg, i) == q) {
+            return strSub(seg, 1, i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 表名（从 CREATE TABLE 语句里取）。
+//
+// 支持 `CREATE TABLE IF NOT EXISTS main.t (...)` 这种形状。
+//
+// ── 为什么不能「从后往前找最后一个空白」 ────────────────
+//
+// 因为表名可能**自己含空格**：`CREATE TABLE \`my table\` (...)`。
+// 从后往前找空白时，那个空白落在引号内部，于是切出 `` table` ``
+// 这种半截名字（实测就是这样）。
+//
+// 正确做法是从前向后扫：跳过 `CREATE TABLE`，可选跳过
+// `IF NOT EXISTS`，然后**按标识符规则**读一个名字 —— 裸名读到空白
+// 或 '(' 为止，引号名读到配对的闭引号为止。
+fn svTableNameFromCreate(sql: String) -> String {
+    var i = 0
+    // 跳过 CREATE
+    i = svSkipKeyword(sql, i, "CREATE")
+    i = svSkipSpaces(sql, i)
+    i = svSkipKeyword(sql, i, "TABLE")
+    i = svSkipSpaces(sql, i)
+    // 可选 IF NOT EXISTS
+    if (svStartsWithCi(strSub(sql, i, len(sql)), "IF")) {
+        i = svSkipKeyword(sql, i, "IF")
+        i = svSkipSpaces(sql, i)
+        i = svSkipKeyword(sql, i, "NOT")
+        i = svSkipSpaces(sql, i)
+        i = svSkipKeyword(sql, i, "EXISTS")
+        i = svSkipSpaces(sql, i)
+    }
+    if (i >= len(sql)) { return "" }
+
+    // 读名字（可能带 schema 前缀）
+    let full = svReadQualifiedName(sql, i)
+    // schema.table → table
+    let dot = svFindTopDot(full)
+    if (dot >= 0) { return svUnquote(strSub(full, dot + 1, len(full))) }
+    return svUnquote(full)
+}
+
+fn svSkipSpaces(s: String, i: Int) -> Int {
+    var k = i
+    while (k < len(s)) {
+        let c = strAt(s, k)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+            k = k + 1
+        } else {
+            return k
+        }
+    }
+    return k
+}
+
+fn svSkipKeyword(s: String, i: Int, kw: String) -> Int {
+    if (svStartsWithCi(strSub(s, i, len(s)), kw)) {
+        return i + len(kw)
+    }
+    return i
+}
+
+// 读一个可能带 schema 前缀、可能被引号包裹的限定名。
+fn svReadQualifiedName(s: String, i: Int) -> String {
+    var k = i
+    while (k < len(s)) {
+        let c = strAt(s, k)
+        if (c == "`" || c == "\"" || c == "[") {
+            k = svSkipQuoted(s, k)
+            continue
+        }
+        if (c == " " || c == "\t" || c == "\n" || c == "\r" || c == "(") { break }
+        k = k + 1
+    }
+    return strSub(s, i, k)
+}
+
+// 只在引号外找点号，用于拆 schema.table。
+fn svFindTopDot(s: String) -> Int {
+    var i = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == "`" || c == "\"" || c == "[") {
+            i = svSkipQuoted(s, i)
+            continue
+        }
+        if (c == ".") { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn svUnquote(s: String) -> String {
+    if (len(s) < 2) { return s }
+    let c0 = strAt(s, 0)
+    let cn = strAt(s, len(s) - 1)
+    if (c0 == "`" && cn == "`") { return strSub(s, 1, len(s) - 1) }
+    if (c0 == "\"" && cn == "\"") { return strSub(s, 1, len(s) - 1) }
+    if (c0 == "[" && cn == "]") { return strSub(s, 1, len(s) - 1) }
+    if (c0 == "'" && cn == "'") { return strSub(s, 1, len(s) - 1) }
+    return s
+}
+
+// ── INTEGER PRIMARY KEY 是 rowid 的别名 ──────────────────
+//
+// 这是 SQLite 最重要的一条内部约定，也是本项目实际读错数据的地方：
+//
+//   CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)
+//
+// 这条语句里的 `id` **不占用 payload 的一个字段**。它被当成 rowid
+// 的别名，payload 里那一列的 serial type 写成 0（NULL），真实值来自
+// cell 的 rowid。
+//
+// 症状（实测）：`SELECT * FROM xlang_user` 得到 5 行，但 id 列
+// 全是 NULL。而列数、其他列的值、行数全对 —— 所以很容易被忽略。
+//
+// 判据（同时满足）：
+//   1. 声明里含 `PRIMARY KEY`（大小写不敏感）
+//   2. 类型是 `INTEGER`（严格是 INTEGER，不是 INT / BIGINT ——
+//      SQLite 只认这一个拼写。写 INT 的话它**不会**变成 rowid 别名，
+//      而是建出一个真实的、可为 NULL 的列）
+//   3. 不是 `DESC` 结尾（`INTEGER PRIMARY KEY DESC` 不生效）
+//
+// 只有第一列会是别名（SQLite 只允许一列），但为稳妥还是扫全部。
+fn svIsRowidAlias(seg: String) -> Bool {
+    let u = strUpper(seg)
+    if (strFind(u, "PRIMARY KEY") < 0) { return false }
+    // 类型部分在列名之后、约束之前。
+    let name = svFirstIdent(seg)
+    if (len(name) == 0) { return false }
+    let rest = strUpper(strTrim(strSub(seg, len(name), len(seg))))
+    if (!svStartsWithCi(rest, "INTEGER")) { return false }
+    // `INTEGER PRIMARY KEY DESC` 不是别名
+    if (strFind(rest, "DESC") >= 0 && strFind(rest, "ASC") < 0) {
+        // 粗略判断：DESC 出现在 PRIMARY KEY 之后
+        let pkAt = strFind(rest, "PRIMARY KEY")
+        let descAt = strFind(rest, "DESC")
+        if (descAt > pkAt) { return false }
+    }
+    return true
+}
+
+// 找出哪个列下标是 rowid 的别名。没有则返回 -1。
+//
+// 入参是建表语句与已解析的列名（两者顺序一致）。
+fn svRowidAliasIndex(sql: String, cols: Array) -> Int {
+    let lp = strFind(sql, "(")
+    if (lp < 0) { return 0 - 1 }
+    let rp = svMatchParen(sql, lp)
+    if (rp < 0) { return 0 - 1 }
+    let parts = svSplitTop(strSub(sql, lp + 1, rp), ",")
+
+    var n = 0
+    var i = 0
+    while (i < len(parts)) {
+        let seg = strTrim(toString(parts[i]))
+        if (len(seg) > 0 && !svIsTableConstraint(seg)) {
+            if (svIsRowidAlias(seg)) { return n }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}

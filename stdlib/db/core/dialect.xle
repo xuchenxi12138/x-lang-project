@@ -1,0 +1,186 @@
+// db/core/dialect.xle — SQL 方言
+//
+// ── 七种数据库的 SQL 到底差在哪 ────────────────────
+//
+// 大部分 SELECT 是通的，但「分页」「引号」「自增主键」「当前时间」
+// 「字符串拼接」「布尔字面量」这六个地方几乎每家都不一样：
+//
+//   MySQL     LIMIT 10 OFFSET 20   `col`     AUTO_INCREMENT  NOW()
+//   Postgres  LIMIT 10 OFFSET 20   "col"     SERIAL          NOW()
+//   Oracle    OFFSET 20 ROWS...    "COL"     (无)            SYSDATE
+//   SQLite    LIMIT 10 OFFSET 20   `col`     AUTOINCREMENT   datetime('now')
+//   Mongo     （无 SQL）             N/A       _id             new Date()
+//   Redis     （无 SQL）             N/A       N/A             N/A
+//   ES        （JSON DSL）           N/A       _id             now
+//
+// 如果把这六个差异散落在各个 Repository 里，业务代码就绑死在了
+// 某一个数据库上 —— 而这正是 ORM 要解决的问题。
+//
+// 所以方言做成一个**值对象 + 一组方法**，Repository 只调
+// `dialect.limitClause(n, ofs)`，换库只换方言实例。
+
+from "endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+
+// 方言种类。用 Int 常量而不是 enum（语言还没有 enum）。
+const DB_MYSQL    = 0
+const DB_POSTGRES = 1
+const DB_ORACLE   = 2
+const DB_SQLITE   = 3
+const DB_MONGO    = 4
+const DB_REDIS    = 5
+const DB_ES       = 6
+
+struct Dialect {
+    kind: Int,
+
+    // 标识符引号。MySQL / SQLite 用反引号，Postgres / Oracle 用双引号。
+    quote: String,
+
+    // 分页语法种类：0 = LIMIT/OFFSET，1 = OFFSET/FETCH（SQL Server
+    // 与 Oracle 12c+），2 = 不支持（NoSQL）。
+    pagingStyle: Int,
+
+    // 是否大小写不敏感地折叠标识符（Oracle 会把未加引号的标识符
+    // 全转大写，这是它最坑人的一个行为）。
+    foldUpper: Bool,
+}
+
+fn dialectOf(kind: Int) -> Dialect {
+    if (kind == DB_MYSQL) {
+        return Dialect { kind: DB_MYSQL, quote: "`", pagingStyle: 0, foldUpper: false }
+    }
+    if (kind == DB_POSTGRES) {
+        return Dialect { kind: DB_POSTGRES, quote: "\"", pagingStyle: 0, foldUpper: false }
+    }
+    if (kind == DB_ORACLE) {
+        return Dialect { kind: DB_ORACLE, quote: "\"", pagingStyle: 1, foldUpper: true }
+    }
+    if (kind == DB_SQLITE) {
+        return Dialect { kind: DB_SQLITE, quote: "`", pagingStyle: 0, foldUpper: false }
+    }
+    // NoSQL 三家没有 SQL 方言，返回一个占位（调用它们的分页会走
+    // 各自的专用方法，不会走到这里）。
+    return Dialect { kind: kind, quote: "\"", pagingStyle: 2, foldUpper: false }
+}
+
+fn dialectName(d: Dialect) -> String {
+    if (d.kind == DB_MYSQL)    { return "MySQL" }
+    if (d.kind == DB_POSTGRES) { return "PostgreSQL" }
+    if (d.kind == DB_ORACLE)   { return "Oracle" }
+    if (d.kind == DB_SQLITE)   { return "SQLite" }
+    if (d.kind == DB_MONGO)    { return "MongoDB" }
+    if (d.kind == DB_REDIS)    { return "Redis" }
+    if (d.kind == DB_ES)       { return "Elasticsearch" }
+    return "未知"
+}
+
+// 标识符加引号。
+//
+// ── 为什么不总是加引号 ─────────────────────────────
+//
+// 因为加了引号之后标识符**大小写敏感**。MySQL 上加反引号没问题，
+// 但 Oracle 上加双引号会让 `"users"` 和 `users` 变成两张表
+// （后者被折叠成 USERS）。所以只在调用方明确要求时加。
+fn dialectQuoteIdent(d: Dialect, name: String) -> String {
+    return d.quote + name + d.quote
+}
+
+// 分页子句。
+//
+// ── 为什么 Oracle 单独一支 ────────────────────────
+//
+// Oracle 12c 之前根本没有 LIMIT，只能用 ROWNUM 套子查询；12c 之后
+// 支持 OFFSET ... FETCH NEXT。这里用后者（更接近其他家的语义），
+// 并把「不支持 12c 之前版本」的边界写进注释而不是假装支持。
+fn dialectLimit(d: Dialect, limit: Int, offset: Int) -> String {
+    if (limit <= 0) { return "" }
+    if (d.pagingStyle == 0) {
+        if (offset > 0) {
+            return " LIMIT " + toString(limit) + " OFFSET " + toString(offset)
+        }
+        return " LIMIT " + toString(limit)
+    }
+    if (d.pagingStyle == 1) {
+        var s = " OFFSET " + toString(offset) + " ROWS FETCH NEXT "
+        return s + toString(limit) + " ROWS ONLY"
+    }
+    return ""
+}
+
+// 当前时间函数。
+fn dialectNow(d: Dialect) -> String {
+    if (d.kind == DB_MYSQL)    { return "NOW()" }
+    if (d.kind == DB_POSTGRES) { return "NOW()" }
+    if (d.kind == DB_ORACLE)   { return "SYSDATE" }
+    if (d.kind == DB_SQLITE)   { return "datetime('now')" }
+    return "NOW()"
+}
+
+// 字符串拼接。
+//
+// ── 为什么这里值得单列一个方法 ────────────────────
+//
+// 因为 MySQL 的 `||` 默认是**逻辑或**（除非开 PIPES_AS_CONCAT），
+// 而其他家 `||` 都是拼接。一个「看起来通用」的 `a || b` 在 MySQL
+// 上会静默返回 0/1 —— 不报错，只是结果全错。这是跨库 SQL 里
+// 最经典的一个陷阱。
+fn dialectConcat(d: Dialect, a: String, b: String) -> String {
+    if (d.kind == DB_MYSQL) {
+        return "CONCAT(" + a + ", " + b + ")"
+    }
+    return a + " || " + b
+}
+
+// 自增主键的列定义片段。
+fn dialectAutoIncrement(d: Dialect) -> String {
+    if (d.kind == DB_MYSQL)    { return "BIGINT AUTO_INCREMENT PRIMARY KEY" }
+    if (d.kind == DB_POSTGRES) { return "BIGSERIAL PRIMARY KEY" }
+    if (d.kind == DB_ORACLE)   { return "NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY" }
+    if (d.kind == DB_SQLITE)   { return "INTEGER PRIMARY KEY AUTOINCREMENT" }
+    return ""
+}
+
+// 布尔字面量。
+//
+// Oracle 没有布尔类型（只能用 NUMBER(1) 或 CHAR(1)），这是它
+// 和其他家最大的语义差异之一。
+fn dialectBool(d: Dialect, v: Bool) -> String {
+    if (d.kind == DB_ORACLE) {
+        if (v) { return "1" }
+        return "0"
+    }
+    if (v) { return "TRUE" }
+    return "FALSE"
+}
+
+// 转义一个字符串字面量（单引号翻倍）。
+//
+// ── 为什么必须做这一步 ────────────────────────────
+//
+// 拼接 SQL 时如果值里含有单引号，就会变成 SQL 注入或者直接语法
+// 错误。翻倍单引号是所有 SQL 方言通用的正确做法；而参数化查询
+// 才是最终方案（见各驱动的 prepare 方法），这里只是给「必须
+// 拼字符串」的场景一个安全的兜底。
+fn sqlEscape(v: String) -> String {
+    return strReplace(v, "'", "''")
+}
+
+// 把一个值包成 SQL 字面量（字符串加引号并转义，数字原样）。
+//
+// ── 为什么需要类型判断 ────────────────────────────
+//
+// `WHERE name = '123'` 和 `WHERE id = 123` 的引号不能通用：给数字
+// 加引号在 MySQL 上会走隐式转换（索引失效），给字符串不加引号
+// 直接语法错误。所以必须看值本身长得像不像数字。
+//
+// 这个判断是**启发式**的，不完美（比如字符串 "123" 会被当数字）。
+// 真正的解法是参数化查询，各驱动的 queryParams 走的就是那条路。
+fn sqlLiteral(v: String) -> String {
+    if (len(v) == 0) { return "''" }
+    if (strIsInt(v)) { return v }
+    if (strIsFloat(v)) { return v }
+    if (v == "NULL") { return "NULL" }
+    if (v == "TRUE" || v == "FALSE") { return v }
+    return "'" + sqlEscape(v) + "'"
+}

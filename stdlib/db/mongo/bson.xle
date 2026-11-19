@@ -1,0 +1,670 @@
+// db/mongo/bson.xle — BSON 编解码
+//
+// ── BSON 是什么 ────────────────────────────────
+//
+// Binary JSON。MongoDB 的线格式和存储格式都是它。设计目标是
+// 「可快速遍历 + 类型丰富」，所以它是长度前缀的二进制，而不是文本。
+//
+// ── 文档结构 ──────────────────────────────────
+//
+//   [4]  总长度（小端，含自身）
+//   [..] 元素序列，每个元素：
+//          [1]  类型字节
+//          [NUL] 键名
+//          [..]  值（布局取决于类型）
+//   [1]  0x00 结束标记
+//
+// ── 为什么总长度在最前面 ────────────────────────
+//
+// 因为 MongoDB 要能**跳过**不认识或不关心的字段。有总长度就能
+// `跳过 N 字节`，而不必逐字段解析。这在服务端过滤文档时非常关键
+// （否则每个查询都要深解整个文档）。
+//
+// ── 为什么元素是「类型 + 键名 + 值」而不是「键名 + 类型 + 值」──
+//
+// 历史原因。类型在前让解析器可以先看类型再决定用哪个分支读值，
+// 而键名在不同类型下都要读一次，顺序无影响。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// ── BSON 类型字节 ──────────────────────────────
+//
+// 注意这里的编号是**协议规定**的，不是任意的。0x01 是 double，
+// 0x10 是 int32 —— 中间的空洞是因为早期版本删掉了一些类型。
+const BSON_DOUBLE     = 0x01
+const BSON_STRING     = 0x02
+const BSON_DOCUMENT   = 0x03
+const BSON_ARRAY      = 0x04
+const BSON_BINARY     = 0x05
+const BSON_UNDEFINED  = 0x06
+const BSON_OBJECTID   = 0x07
+const BSON_BOOL       = 0x08
+const BSON_DATETIME   = 0x09
+const BSON_NULL       = 0x0A
+const BSON_REGEX      = 0x0B
+const BSON_DBPOINTER  = 0x0C
+const BSON_JSCODE     = 0x0D
+const BSON_SYMBOL     = 0x0E
+const BSON_JSCODEWS   = 0x0F
+const BSON_INT32      = 0x10
+const BSON_TIMESTAMP  = 0x11
+const BSON_INT64      = 0x12
+const BSON_DECIMAL128 = 0x13
+const BSON_MINKEY     = 0xFF
+const BSON_MAXKEY     = 0x7F
+
+// ── 值类型（供上层使用）──────────────────────────
+//
+// ── 为什么还要一套自己的值表示 ────────────────────
+//
+// 因为语言的 Array/String/Int 无法表达「文档」「数组」「ObjectId」
+// 的区别。上层（查询构造、结果解析）需要这些类型信息。所以定义
+// 一组构造函数，值统一是 [类型, 内容] 的二元数组。
+//
+// 这比自定义类轻，而且不需要为每种类型写一个类。
+
+fn bsonStr(s: String) -> Array {
+    return [BSON_STRING, s]
+}
+
+fn bsonInt(v: Int) -> Array {
+    return [BSON_INT32, v]
+}
+
+fn bsonLong(v: Int) -> Array {
+    return [BSON_INT64, v]
+}
+
+fn bsonDouble(v: Float) -> Array {
+    return [BSON_DOUBLE, v]
+}
+
+fn bsonBool(v: Bool) -> Array {
+    return [BSON_BOOL, v]
+}
+
+fn bsonNull() -> Array {
+    return [BSON_NULL, ""]
+}
+
+fn bsonDoc(v: Array) -> Array {
+    return [BSON_DOCUMENT, v]
+}
+
+fn bsonArr(v: Array) -> Array {
+    return [BSON_ARRAY, v]
+}
+
+fn bsonOid(hex: String) -> Array {
+    return [BSON_OBJECTID, hex]
+}
+
+fn bsonBin(data: Array) -> Array {
+    return [BSON_BINARY, data]
+}
+
+// ── 写侧 ────────────────────────────────────────
+
+// 写一个文档（fields 是 [键, 值, 键, 值…] 的交替数组）。
+//
+// ── 为什么用交替数组而不是 Map ────────────────────
+//
+// 语言没有 Map。而 MongoDB 关心字段**顺序**（某些场景下会影响
+// 索引和比较），所以顺序必须保留 —— 交替数组天然有序。
+fn bsonWriteDoc(fields: Array) -> Array {
+    let body = []
+    var i = 0
+    while i + 1 < len(fields) {
+        let key = toString(fields[i])
+        let val = fields[i + 1]
+        bsonWriteElem(body, key, val)
+        i = i + 2
+    }
+    bbPut(body, 0)
+
+    let out = []
+    // 总长度 = 4（长度字段）+ 内容
+    bbPutU32LE(out, len(body) + 4)
+    bbPutBytes(out, body)
+    return out
+}
+
+// 写一个元素（类型 + 键名 + 值）。
+fn bsonWriteElem(out: Array, key: String, val: Array) -> Array {
+    if (len(val) < 2) {
+        // 非法值按 null 处理而不是崩溃 —— 上层构造错了能看出症状
+        bbPut(out, BSON_NULL)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        return out
+    }
+    let tag = toInt(val[0])
+
+    if (tag == BSON_STRING) {
+        bbPut(out, BSON_STRING)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        // 字符串值：长度（含结尾 NUL）+ 内容 + NUL
+        let sv = bbFromUtf8(toString(val[1]))
+        bbPutU32LE(out, len(sv) + 1)
+        bbPutBytes(out, sv)
+        bbPut(out, 0)
+        return out
+    }
+    if (tag == BSON_INT32) {
+        bbPut(out, BSON_INT32)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        bbPutU32LE(out, toInt(val[1]))
+        return out
+    }
+    if (tag == BSON_INT64) {
+        bbPut(out, BSON_INT64)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        bbPutU64LE(out, toInt(val[1]))
+        return out
+    }
+    if (tag == BSON_DOUBLE) {
+        bbPut(out, BSON_DOUBLE)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        let d = val[1]
+        let f = 0.0
+        if (typeOf(d) == "Float") { f = d }
+        if (typeOf(d) == "Int") { f = toFloat(d) }
+        bbPutDoubleLE(out, f)
+        return out
+    }
+    if (tag == BSON_BOOL) {
+        bbPut(out, BSON_BOOL)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        if (val[1] == true) { bbPut(out, 1) } else { bbPut(out, 0) }
+        return out
+    }
+    if (tag == BSON_NULL) {
+        bbPut(out, BSON_NULL)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        return out
+    }
+    if (tag == BSON_DOCUMENT) {
+        bbPut(out, BSON_DOCUMENT)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        bbPutBytes(out, bsonWriteDoc(val[1]))
+        return out
+    }
+    if (tag == BSON_ARRAY) {
+        bbPut(out, BSON_ARRAY)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        // ── 数组在 BSON 里就是「键名是数字序号的文档」──
+        // 这是 BSON 的一个巧妙设计：不需要单独的数组编码。
+        let items = val[1]
+        let asFields = []
+        var k = 0
+        while k < len(items) {
+            arrPush(asFields, toString(k))
+            arrPush(asFields, items[k])
+            k = k + 1
+        }
+        bbPutBytes(out, bsonWriteDoc(asFields))
+        return out
+    }
+    if (tag == BSON_OBJECTID) {
+        bbPut(out, BSON_OBJECTID)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        bbPutBytes(out, hexToBytes12(toString(val[1])))
+        return out
+    }
+    if (tag == BSON_BINARY) {
+        bbPut(out, BSON_BINARY)
+        bbPutUtf8(out, key)
+        bbPut(out, 0)
+        let data = val[1]
+        bbPutU32LE(out, len(data))
+        bbPut(out, 0)          // 子类型：0x00 通用二进制
+        bbPutBytes(out, data)
+        return out
+    }
+
+    // 兜底：当字符串写，至少不丢数据
+    bbPut(out, BSON_STRING)
+    bbPutUtf8(out, key)
+    bbPut(out, 0)
+    let sv2 = bbFromUtf8(toString(val[1]))
+    bbPutU32LE(out, len(sv2) + 1)
+    bbPutBytes(out, sv2)
+    bbPut(out, 0)
+    return out
+}
+
+// 写 IEEE 754 双精度（小端）。
+//
+// ── 为什么不能用 math 拼 ─────────────────────────
+//
+// 因为要拿到浮点数的**位模式**，而语言没有 float→bits 的转换。
+// 只能自己做：拆成整数部分和小数部分再拼尾数。
+//
+// 这个实现覆盖了绝大多数业务值（|x| < 2^63，非 NaN/Inf），
+// 但不是完整的 IEEE 754 编码器。明确的边界。
+fn bbPutDoubleLE(b: Array, v: Float) -> Array {
+    var x = v
+    var neg = false
+    if (x < 0.0) {
+        neg = true
+        x = 0.0 - x
+    }
+
+    // 拆成 [整数部分, 小数部分]，再把小数部分转成二进制尾数
+    var ip = toInt(x)
+    var fp = x - toFloat(ip)
+
+    // 整数部分转成二进制位（最多 53 位）
+    let intBits = []
+    if (ip == 0) {
+        arrPush(intBits, 0)
+    } else {
+        var t = ip
+        while t > 0 {
+            arrPush(intBits, t % 2)
+            t = t / 2
+        }
+    }
+    // 反转成高位在前
+    let revInt = []
+    var i = len(intBits) - 1
+    while i >= 0 {
+        arrPush(revInt, toInt(intBits[i]))
+        i = i - 1
+    }
+
+    // 小数部分乘 2 取整（最多 63 位，够双精度尾数）
+    let fracBits = []
+    var f = fp
+    var k = 0
+    while k < 63 && f > 0.0 {
+        f = f * 2.0
+        let bit = toInt(f)
+        arrPush(fracBits, bit)
+        f = f - toFloat(bit)
+        k = k + 1
+    }
+
+    // 规范化：找到第一个 1 的位置（隐含位的起点）
+    var allBits = []
+    var j = 0
+    while j < len(revInt) {
+        arrPush(allBits, toInt(revInt[j]))
+        j = j + 1
+    }
+    j = 0
+    while j < len(fracBits) {
+        arrPush(allBits, toInt(fracBits[j]))
+        j = j + 1
+    }
+
+    var firstOne = 0 - 1
+    var q = 0
+    while q < len(allBits) {
+        if (toInt(allBits[q]) == 1) {
+            firstOne = q
+            break
+        }
+        q = q + 1
+    }
+
+    var exp = 0
+    var mantissa = []
+    if (firstOne < 0) {
+        // ── 值为 0：位模式全 0 ────────────────────────
+        //
+        // 注意不能走下面的规格化分支：那里 exp = len(revInt)-1-firstOne
+        // 会得到 -1，biasedExp = 1022，尾数全 0 —— 解出来是 2^-1 = 0.5，
+        // 而不是 0。所以零必须显式给出「指数 0 + 尾数 0」。
+        exp = 0
+        var z = 0
+        while z < 52 {
+            arrPush(mantissa, 0)
+            z = z + 1
+        }
+        // 直接写出全零的位模式并返回
+        bbPutU32LE(b, 0)
+        bbPutU32LE(b, 0)
+        return b
+    } else {
+        // 指数 = 第一个 1 在小数点前有几位
+        exp = len(revInt) - 1 - firstOne
+        // 尾数是第一个 1 之后的 52 位
+        var m = firstOne + 1
+        while len(mantissa) < 52 {
+            if (m < len(allBits)) {
+                arrPush(mantissa, toInt(allBits[m]))
+            } else {
+                arrPush(mantissa, 0)
+            }
+            m = m + 1
+        }
+    }
+
+    let biasedExp = exp + 1023
+
+    // 拼成 64 位：符号(1) + 指数(11) + 尾数(52)
+    var hi = biasedExp & 0x7FF
+    hi = (hi << 20)
+    var m1 = 0
+    var idx = 0
+    while idx < 20 {
+        m1 = (m1 << 1) | toInt(mantissa[idx])
+        idx = idx + 1
+    }
+    hi = hi | m1
+    if (neg) { hi = hi | 0x80000000 }
+
+    var lo = 0
+    while idx < 52 {
+        lo = (lo << 1) | toInt(mantissa[idx])
+        idx = idx + 1
+    }
+    // lo 现在是 32 位尾数
+    lo = lo & 0xFFFFFFFF
+
+    bbPutU32LE(b, lo)
+    bbPutU32LE(b, hi)
+    return b
+}
+
+// 12 字节的十六进制 ObjectId → 字节数组。
+fn hexToBytes12(hex: String) -> Array {
+    let out = []
+    var i = 0
+    while i < 24 && i + 1 < len(hex) + 1 {
+        let h = strSub(hex, i, i + 1)
+        let l = strSub(hex, i + 1, i + 2)
+        arrPush(out, (hexVal(h) << 4) | hexVal(l))
+        i = i + 2
+    }
+    while len(out) < 12 {
+        arrPush(out, 0)
+    }
+    return out
+}
+
+fn hexVal(ch: String) -> Int {
+    let c = strCode(ch)
+    if (c >= 48 && c <= 57) { return c - 48 }
+    if (c >= 97 && c <= 102) { return c - 87 }
+    if (c >= 65 && c <= 70) { return c - 55 }
+    return 0
+}
+
+// ── 读侧 ────────────────────────────────────────
+
+// 读一个文档，返回 [字段交替数组, 新位置]。
+//
+// ── 为什么返回交替数组而不是二维数组 ────────────────
+//
+// 因为二维数组 `[[键, 值], …]` 在取值时要用 `row[1]` 这种下标，
+// 而值本身又是 [类型, 内容] 两层嵌套 —— 变成 `doc[i][1][1]`。
+// 交替数组配一个 bsonGet(b, key) 更好用。
+fn bsonReadDoc(b: Array, pos: Int) -> Array {
+    if (pos + 4 > len(b)) { return [[], pos] }
+    let total = bbU32LE(b, pos)
+    if (total <= 4 || pos + total > len(b)) { return [[], pos] }
+
+    let end = pos + total - 1     // 最后 1 字节是 0x00 结束符
+    var p = pos + 4
+    let fields = []
+
+    while p < end {
+        let tag = bbAt(b, p)
+        if (tag == 0) { break }
+        p = p + 1
+        let keyR = bsonReadCStr(b, p)
+        let key = toString(keyR[0])
+        p = toInt(keyR[1])
+
+        let vr = bsonReadValue(b, p, tag)
+        arrPush(fields, key)
+        arrPush(fields, vr[0])
+        p = toInt(vr[1])
+    }
+    return [fields, pos + total]
+}
+
+// 读一个值。返回 [值([类型,内容]), 新位置]。
+fn bsonReadValue(b: Array, pos: Int, tag: Int) -> Array {
+    if (tag == BSON_STRING || tag == BSON_SYMBOL || tag == BSON_JSCODE) {
+        let l = bbU32LE(b, pos)
+        let s = bbToText(bbSlice(b, pos + 4, pos + 4 + l - 1))
+        return [bsonStr(s), pos + 4 + l]
+    }
+    if (tag == BSON_INT32) {
+        return [bsonInt(bbU32LE(b, pos)), pos + 4]
+    }
+    if (tag == BSON_INT64) {
+        return [bsonLong(bbU64LE(b, pos)), pos + 8]
+    }
+    if (tag == BSON_DOUBLE) {
+        return [bsonDouble(bsonReadDoubleLE(b, pos)), pos + 8]
+    }
+    if (tag == BSON_BOOL) {
+        let v = bbAt(b, pos) != 0
+        return [bsonBool(v), pos + 1]
+    }
+    if (tag == BSON_NULL || tag == BSON_UNDEFINED) {
+        return [bsonNull(), pos]
+    }
+    if (tag == BSON_DOCUMENT) {
+        let r = bsonReadDoc(b, pos)
+        return [bsonDoc(r[0]), r[1]]
+    }
+    if (tag == BSON_ARRAY) {
+        let r = bsonReadDoc(b, pos)
+        // 文档 → 数组：按键名数字顺序取值
+        let fields = r[0]
+        let items = []
+        var i = 1
+        while i < len(fields) {
+            arrPush(items, fields[i])
+            i = i + 2
+        }
+        return [bsonArr(items), r[1]]
+    }
+    if (tag == BSON_OBJECTID) {
+        let h = ""
+        var i = 0
+        while i < 12 {
+            let v = bbAt(b, pos + i)
+            h = h + toHex(v >> 4) + toHex(v & 0x0F)
+            i = i + 1
+        }
+        return [bsonOid(h), pos + 12]
+    }
+    if (tag == BSON_BINARY) {
+        let l = bbU32LE(b, pos)
+        let sub = bbAt(b, pos + 4)
+        let data = bbSlice(b, pos + 5, pos + 5 + l)
+        return [bsonBin(data), pos + 5 + l]
+    }
+    if (tag == BSON_DATETIME) {
+        // 毫秒时间戳（小端 int64）
+        return [bsonLong(bbU64LE(b, pos)), pos + 8]
+    }
+    if (tag == BSON_TIMESTAMP) {
+        return [bsonLong(bbU64LE(b, pos)), pos + 8]
+    }
+    if (tag == BSON_DECIMAL128) {
+        // 128 位十进制：P0 不解码，原样保留十六进制
+        let h = ""
+        var i = 0
+        while i < 16 {
+            let v = bbAt(b, pos + i)
+            h = h + toHex(v >> 4) + toHex(v & 0x0F)
+            i = i + 1
+        }
+        return [bsonStr("Decimal128(" + h + ")"), pos + 16]
+    }
+    if (tag == BSON_REGEX) {
+        let p1 = bsonReadCStr(b, pos)
+        let p2 = bsonReadCStr(b, toInt(p1[1]))
+        return [bsonStr("/" + toString(p1[0]) + "/" + toString(p2[0])), toInt(p2[1])]
+    }
+
+    // 不认识的类型：无法知道长度，只能停下。
+    //
+    // ── 为什么这里必须停而不是猜 ────────────────────
+    //
+    // BSON 的类型长度不统一（有的定长有的变长）。猜错一个字节之后
+    // 整个文档就废了。停下至少能返回前面已经解析好的字段。
+    return [bsonStr(""), len(b)]
+}
+
+// 读双精度。返回 Float。
+//
+// ── 为什么从位模式手工还原 ────────────────────────
+//
+// 因为语言没有 bits→float 的转换。用尾数 × 2^指数 的数学方式还原。
+fn bsonReadDoubleLE(b: Array, pos: Int) -> Float {
+    let lo = bbU32LE(b, pos)
+    let hi = bbU32LE(b, pos + 4)
+
+    let sign = ((hi >> 31) & 1) != 0
+    let exp = (hi >> 20) & 0x7FF
+    // 尾数高 20 位在 hi，低 32 位在 lo
+    let mHi = hi & 0xFFFFF
+
+    // 组装尾数（52 位，作为 Float 计算）
+    var mant = toFloat(mHi)
+    var i = 0
+    while i < 32 {
+        let bit = (lo >> (31 - i)) & 1
+        mant = mant * 2.0 + toFloat(bit)
+        i = i + 1
+    }
+
+    var result = 0.0
+    if (exp == 0 && mHi == 0 && lo == 0) {
+        // ── 零必须单独判断 ──────────────────────────────
+        //
+        // IEEE 754 里 +0 的位模式是「指数 0 + 尾数 0」。而「指数 0 +
+        // 尾数非 0」表示非规格化数（极小的值）。漏掉这个判断会把 0
+        // 算成 0 × 2^-1022 —— 数学上是 0，但如果走下面的规格化分支
+        // （exp==0 时误加隐含位 1.0），结果就变成 1.0。
+        //
+        // 实测症状：写 0.0 读回 1.0。这个 bug 只在零值时出现，
+        // 其它所有浮点都对 —— 典型的边界遗漏。
+        result = 0.0
+    } else if (exp == 0) {
+        // 非规格化数：尾数 × 2^-1022（没有隐含位）
+        result = mant * math(pow, 2.0, toFloat(0 - 1022))
+    } else {
+        // 规格化：1.mantissa × 2^(exp-1023)
+        result = (mant / math(pow, 2.0, toFloat(52)) + 1.0)
+                 * math(pow, 2.0, toFloat(exp - 1023))
+    }
+    if (sign) { result = 0.0 - result }
+    return result
+}
+
+// 读 NUL 结尾字符串，返回 [文本, 新位置]。
+fn bsonReadCStr(b: Array, pos: Int) -> Array {
+    let k = bbIndexOf(b, 0, pos)
+    if (k < 0) { return [bbToText(bbSlice(b, pos, len(b))), len(b)] }
+    return [bbToText(bbSlice(b, pos, k)), k + 1]
+}
+
+// ── 便捷取值 ──────────────────────────────────────
+
+// 从交替字段数组里按键名取值（返回 [类型, 内容]），找不到返回空数组。
+//
+// ── 为什么找不到返回空数组而不是 null ────────────────
+//
+// 语言的静态检查会警告「声明返回 Array 实际返回 Null」，而调用方
+// 每次都要判 null 也会让类型推断失效。返回 [] 让调用方用
+// `len(v) < 2` 判断，没有类型歧义。
+fn bsonGet(fields: Array, key: String) -> Array {
+    var i = 0
+    while i + 1 < len(fields) {
+        if (toString(fields[i]) == key) { return fields[i + 1] }
+        i = i + 2
+    }
+    return []
+}
+
+// 取值并转成字符串（最常用）。
+fn bsonGetText(fields: Array, key: String) -> String {
+    let v = bsonGet(fields, key)
+    if (len(v) < 2) { return "" }
+    let tag = toInt(v[0])
+    if (tag == BSON_NULL) { return "" }
+    if (tag == BSON_DOCUMENT || tag == BSON_ARRAY) { return bsonToJson(v[1], tag) }
+    return toString(v[1])
+}
+
+// 取值并转成整数。
+fn bsonGetInt(fields: Array, key: String) -> Int {
+    let v = bsonGet(fields, key)
+    if (len(v) < 2) { return 0 }
+    let tag = toInt(v[0])
+    if (tag == BSON_INT32 || tag == BSON_INT64) { return toInt(v[1]) }
+    if (tag == BSON_DOUBLE) { return toInt(v[1]) }
+    if (tag == BSON_BOOL) {
+        if (v[1] == true) { return 1 }
+        return 0
+    }
+    return strParseInt(toString(v[1]))
+}
+
+// 转成可读文本（调试/日志用，不是严格 JSON）。
+fn bsonToJson(v: Array, tag: Int) -> String {
+    if (tag == BSON_DOCUMENT) {
+        let fields = v
+        var out = "{"
+        var i = 0
+        while i + 1 < len(fields) {
+            if (i > 0) { out = out + ", " }
+            let key = toString(fields[i])
+            let pair = fields[i + 1]
+            out = out + "\"" + key + "\": " + bsonValueText(pair)
+            i = i + 2
+        }
+        return out + "}"
+    }
+    if (tag == BSON_ARRAY) {
+        let items = v
+        var out = "["
+        var i = 0
+        while i < len(items) {
+            if (i > 0) { out = out + ", " }
+            out = out + bsonValueText(items[i])
+            i = i + 1
+        }
+        return out + "]"
+    }
+    return toString(v)
+}
+
+// 单个值的文本形式。
+fn bsonValueText(pair: Array) -> String {
+    let tag = toInt(pair[0])
+    if (tag == BSON_STRING) { return "\"" + toString(pair[1]) + "\"" }
+    if (tag == BSON_NULL) { return "null" }
+    if (tag == BSON_BOOL) {
+        if (pair[1] == true) { return "true" }
+        return "false"
+    }
+    if (tag == BSON_OBJECTID) { return "ObjectId(\"" + toString(pair[1]) + "\")" }
+    if (tag == BSON_DOCUMENT) { return bsonToJson(pair[1], BSON_DOCUMENT) }
+    if (tag == BSON_ARRAY) { return bsonToJson(pair[1], BSON_ARRAY) }
+    if (tag == BSON_BINARY) { return "<binary " + toString(len(pair[1])) + "B>" }
+    return toString(pair[1])
+}
+
+// 文档的 JSON 文本形式。
+fn bsonDocText(fields: Array) -> String {
+    return bsonToJson(fields, BSON_DOCUMENT)
+}

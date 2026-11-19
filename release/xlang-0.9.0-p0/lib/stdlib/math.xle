@@ -1,0 +1,459 @@
+// ============================================================
+// std.math —— 数值、矩阵、统计
+// ============================================================
+//
+// 基础标量运算（sqrt/pow/sin/...）已经是语言内建，走单入口
+// `math(op, ...)`。这里补的是**组合运算**：矩阵、统计、数论 ——
+// 它们由标量运算拼出来，放在标准库而不是内建里，因为内建表
+// 是给「一次操作」用的，把 matMul 塞进去会让它变成杂物间。
+//
+// ── 矩阵的表示 ──────────────────────────────────────────────
+//
+// X 没有结构体、没有二维数组，所以矩阵用「扁平一维数组 + 行列数」
+// 表示：rows × cols 的矩阵是长度 rows*cols 的数组，元素 (r,c) 在
+// 下标 r*cols + c。
+//
+// 为什么选行优先（row-major）而不是列优先：矩阵乘法、按行累加、
+// 打印都是按行走的，行优先下「遍历一行」是连续访问，缓存友好。
+// MATLAB 选列优先是因为它的历史实现是 Fortran，这里没有那个包袱。
+//
+// 每个函数都显式收 rows/cols，不打包成「矩阵对象」：语言没有
+// 结构体，任何打包都会退化成一个数组里塞 [rows, cols, data]，
+// 于是每次取行列数都要 toInt(m[0])，既慢又容易错位。
+
+// ---- 矩阵构造 ----
+
+// 全零矩阵。
+fn matZeros(rows: Int, cols: Int) -> Array {
+    return array(rows * cols, 0.0)
+}
+
+// 全一矩阵。
+fn matOnes(rows: Int, cols: Int) -> Array {
+    return array(rows * cols, 1.0)
+}
+
+// 单位矩阵。非方阵也允许：取 min(rows,cols) 个 1 其余为 0。
+// 这比报错有用 —— 用户经常需要一个矩形单位阵去乘。
+fn matEye(rows: Int, cols: Int) -> Array {
+    let m = array(rows * cols, 0.0)
+    var n = rows
+    if (cols < n) { n = cols }
+    var i = 0
+    while (i < n) {
+        m[i * cols + i] = 1.0
+        i = i + 1
+    }
+    return m
+}
+
+// 按行填充：vals 的长度必须正好是 rows*cols。
+// 长度不符时报错而不是截断/补零 —— 静默错位是数值代码最难查的 bug。
+fn matFromRows(rows: Int, cols: Int, vals: Array) -> Array {
+    let need = rows * cols
+    if (len(vals) != need) {
+        fail("matFromRows: 元素个数不符，需要 " + toString(need) + " 个，实际 " + toString(len(vals)) + " 个")
+    }
+    return arrCopy(vals)
+}
+
+// ---- 基本访问 ----
+//
+// 越界直接报错，不做钳制：矩阵运算里下标越界一定是逻辑错误
+// （维度算错了），静默返回 0 会让错误一路传播到结果里。
+fn matGet(m: Array, cols: Int, r: Int, c: Int) -> Float {
+    if (r < 0 || c < 0 || r * cols + c >= len(m)) {
+        fail("matGet: 下标越界 (" + toString(r) + "," + toString(c) + ")，列数 " + toString(cols))
+    }
+    return toFloat(m[r * cols + c])
+}
+
+fn matSet(m: Array, cols: Int, r: Int, c: Int, v: Float) -> Void {
+    if (r < 0 || c < 0 || r * cols + c >= len(m)) {
+        fail("matSet: 下标越界 (" + toString(r) + "," + toString(c) + ")，列数 " + toString(cols))
+    }
+    m[r * cols + c] = v
+}
+
+// ---- 逐元素运算 ----
+//
+// 两矩阵逐元素运算要求形状完全一致，不做广播。广播是 NumPy 的
+// 便利特性，但它让「维度错了」从错误变成静默计算，而维度错误
+// 恰恰是数值代码最常见的 bug。
+fn matAdd(a: Array, b: Array) -> Array {
+    if (len(a) != len(b)) {
+        fail("matAdd: 长度不同（" + toString(len(a)) + " vs " + toString(len(b)) + "）")
+    }
+    let out = array(len(a), 0.0)
+    var i = 0
+    while (i < len(a)) {
+        out[i] = toFloat(a[i]) + toFloat(b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn matSub(a: Array, b: Array) -> Array {
+    if (len(a) != len(b)) {
+        fail("matSub: 长度不同（" + toString(len(a)) + " vs " + toString(len(b)) + "）")
+    }
+    let out = array(len(a), 0.0)
+    var i = 0
+    while (i < len(a)) {
+        out[i] = toFloat(a[i]) - toFloat(b[i])
+        i = i + 1
+    }
+    return out
+}
+
+// 逐元素乘（Hadamard 积）。不是矩阵乘法，矩阵乘法用 matMul。
+fn matMulElem(a: Array, b: Array) -> Array {
+    if (len(a) != len(b)) {
+        fail("matMulElem: 长度不同（" + toString(len(a)) + " vs " + toString(len(b)) + "）")
+    }
+    let out = array(len(a), 0.0)
+    var i = 0
+    while (i < len(a)) {
+        out[i] = toFloat(a[i]) * toFloat(b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn matScale(m: Array, k: Float) -> Array {
+    let out = array(len(m), 0.0)
+    var i = 0
+    while (i < len(m)) {
+        out[i] = toFloat(m[i]) * k
+        i = i + 1
+    }
+    return out
+}
+
+fn matAddScalar(m: Array, k: Float) -> Array {
+    let out = array(len(m), 0.0)
+    var i = 0
+    while (i < len(m)) {
+        out[i] = toFloat(m[i]) + k
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 矩阵乘法 ----
+//
+// 经典三重循环，但顺序是 i-k-j（j 在最内层）而不是 i-j-k：
+// 前者在内层对 b 连续访问，b 的整行被反复读，缓存命中率高；
+// 后者内层访问 b 时跨行跳跃，每步都可能 cache miss。
+// 小矩阵差别不明显，200×200 以上能差几倍。
+fn matMul(a: Array, arows: Int, acols: Int, b: Array, bcols: Int) -> Array {
+    if (arows * acols > len(a)) {
+        fail("matMul: 左矩阵尺寸不符，需要 " + toString(arows * acols) + " 个元素，实际 " + toString(len(a)))
+    }
+    if (bcols <= 0) {
+        fail("matMul: 右矩阵列数必须为正")
+    }
+    if (len(b) % bcols != 0) {
+        fail("matMul: 右矩阵长度 " + toString(len(b)) + " 不是列数 " + toString(bcols) + " 的整数倍")
+    }
+    let brows = len(b) / bcols
+    if (brows != acols) {
+        fail("matMul: 维度不匹配，要求左矩阵列数 == 右矩阵行数（" +
+             toString(acols) + " vs " + toString(brows) + "）")
+    }
+
+    let out = array(arows * bcols, 0.0)
+    var i = 0
+    while (i < arows) {
+        var k = 0
+        while (k < acols) {
+            let av = toFloat(a[i * acols + k])
+            // av 为 0 时整行跳过：稀疏矩阵（单位阵、邻接矩阵）在
+            // 数值代码里很常见，这个跳过能省掉大部分乘法。
+            if (av != 0.0) {
+                var j = 0
+                while (j < bcols) {
+                    out[i * bcols + j] = toFloat(out[i * bcols + j]) + av * toFloat(b[k * bcols + j])
+                    j = j + 1
+                }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 转置 ----
+
+fn matTranspose(m: Array, rows: Int, cols: Int) -> Array {
+    let out = array(rows * cols, 0.0)
+    var r = 0
+    while (r < rows) {
+        var c = 0
+        while (c < cols) {
+            out[c * rows + r] = toFloat(m[r * cols + c])
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+// ---- 归约 ----
+
+fn matSum(m: Array) -> Float {
+    var s = 0.0
+    var i = 0
+    while (i < len(m)) {
+        s = s + toFloat(m[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn matMean(m: Array) -> Float {
+    if (len(m) == 0) { return 0.0 }
+    return matSum(m) / toFloat(len(m))
+}
+
+fn matMin(m: Array) -> Float {
+    if (len(m) == 0) { return 0.0 }
+    var v = toFloat(m[0])
+    var i = 1
+    while (i < len(m)) {
+        let x = toFloat(m[i])
+        if (x < v) { v = x }
+        i = i + 1
+    }
+    return v
+}
+
+fn matMax(m: Array) -> Float {
+    if (len(m) == 0) { return 0.0 }
+    var v = toFloat(m[0])
+    var i = 1
+    while (i < len(m)) {
+        let x = toFloat(m[i])
+        if (x > v) { v = x }
+        i = i + 1
+    }
+    return v
+}
+
+// 返回下标而不是值 —— 找最优解时通常还需要知道它在哪
+fn matArgMin(m: Array) -> Int {
+    if (len(m) == 0) { return -1 }
+    var best = 0
+    var v = toFloat(m[0])
+    var i = 1
+    while (i < len(m)) {
+        let x = toFloat(m[i])
+        if (x < v) { v = x; best = i }
+        i = i + 1
+    }
+    return best
+}
+
+fn matArgMax(m: Array) -> Int {
+    if (len(m) == 0) { return -1 }
+    var best = 0
+    var v = toFloat(m[0])
+    var i = 1
+    while (i < len(m)) {
+        let x = toFloat(m[i])
+        if (x > v) { v = x; best = i }
+        i = i + 1
+    }
+    return best
+}
+
+// 按行 / 按列求和，结果长度分别是 rows / cols
+fn matRowSums(m: Array, rows: Int, cols: Int) -> Array {
+    let out = array(rows, 0.0)
+    var r = 0
+    while (r < rows) {
+        var s = 0.0
+        var c = 0
+        while (c < cols) {
+            s = s + toFloat(m[r * cols + c])
+            c = c + 1
+        }
+        out[r] = s
+        r = r + 1
+    }
+    return out
+}
+
+fn matColSums(m: Array, rows: Int, cols: Int) -> Array {
+    let out = array(cols, 0.0)
+    var c = 0
+    while (c < cols) {
+        var s = 0.0
+        var r = 0
+        while (r < rows) {
+            s = s + toFloat(m[r * cols + c])
+            r = r + 1
+        }
+        out[c] = s
+        c = c + 1
+    }
+    return out
+}
+
+// ---- 统计（对标 Python statistics / MATLAB 的 std） ----
+
+fn arrayMean(xs: Array) -> Float {
+    if (len(xs) == 0) { return 0.0 }
+    var s = 0.0
+    var i = 0
+    while (i < len(xs)) {
+        s = s + toFloat(xs[i])
+        i = i + 1
+    }
+    return s / toFloat(len(xs))
+}
+
+// 样本方差，分母 n-1（无偏估计），与 Python statistics.variance 一致。
+// 总体方差是 popVariance。两者在小样本上差很多，而选错了不会报错，
+// 只会给出一个「看起来合理」的错数 —— 所以两个都给，名字写清楚。
+fn variance(xs: Array) -> Float {
+    let n = len(xs)
+    if (n < 2) { return 0.0 }
+    let mu = arrayMean(xs)
+    var s = 0.0
+    var i = 0
+    while (i < n) {
+        let d = toFloat(xs[i]) - mu
+        s = s + d * d
+        i = i + 1
+    }
+    return s / toFloat(n - 1)
+}
+
+fn popVariance(xs: Array) -> Float {
+    let n = len(xs)
+    if (n == 0) { return 0.0 }
+    let mu = arrayMean(xs)
+    var s = 0.0
+    var i = 0
+    while (i < n) {
+        let d = toFloat(xs[i]) - mu
+        s = s + d * d
+        i = i + 1
+    }
+    return s / toFloat(n)
+}
+
+fn stddev(xs: Array) -> Float {
+    return math(sqrt, variance(xs))
+}
+
+fn popStddev(xs: Array) -> Float {
+    return math(sqrt, popVariance(xs))
+}
+
+fn median(xs: Array) -> Float {
+    let n = len(xs)
+    if (n == 0) { return 0.0 }
+    let s = arrCopy(xs)
+    arrSort(s)
+    if (n % 2 == 1) {
+        return toFloat(s[n / 2])
+    }
+    return (toFloat(s[n / 2 - 1]) + toFloat(s[n / 2])) / 2.0
+}
+
+// ---- 数值工具 ----
+
+// 线性插值。t 钳制到 [0,1]，调用方不用自己夹。
+fn lerp(a: Float, b: Float, t: Float) -> Float {
+    var u = t
+    if (u < 0.0) { u = 0.0 }
+    if (u > 1.0) { u = 1.0 }
+    return a + (b - a) * u
+}
+
+// 把 x 从 [lo,hi] 映射到 [0,1]。区间退化（lo==hi）时返回 0 而不是
+// NaN —— NaN 会一路污染后续计算，0 至少是个明确的默认。
+fn normalize(x: Float, lo: Float, hi: Float) -> Float {
+    if (hi == lo) { return 0.0 }
+    return (x - lo) / (hi - lo)
+}
+
+// 阶乘。返回 Float：13! 已经超出 Int32，20! 超出任何整数类型
+// 的精确表示，而 Float 至少能表示到 1.8e308。
+fn fact(n: Int) -> Float {
+    if (n < 0) {
+        fail("fact: 阶乘不接受负数（收到 " + toString(n) + "）")
+    }
+    var r = 1.0
+    var i = 2
+    while (i <= n) {
+        r = r * toFloat(i)
+        i = i + 1
+    }
+    return r
+}
+
+// 组合数 C(n,k)。用乘除交替而不是两个阶乘相除：C(52,5) 的中间
+// 结果是 3e8 量级，而 52! 是 8e67 —— 前者不溢出，后者必然损失精度。
+fn comb(n: Int, k: Int) -> Float {
+    if (k < 0 || n < 0 || k > n) { return 0.0 }
+    var kk = k
+    if (kk > n - kk) { kk = n - kk }   // C(n,k)==C(n,n-k)，取小的一边省一半迭代
+    var r = 1.0
+    var i = 0
+    while (i < kk) {
+        r = r * toFloat(n - i) / toFloat(i + 1)
+        i = i + 1
+    }
+    return r
+}
+
+// 最大公约数（欧几里得）。结果恒非负。
+fn gcd(a: Int, b: Int) -> Int {
+    var x = a
+    var y = b
+    if (x < 0) { x = -x }
+    if (y < 0) { y = -y }
+    while (y != 0) {
+        let t = y
+        y = x % y
+        x = t
+    }
+    return x
+}
+
+fn lcm(a: Int, b: Int) -> Int {
+    if (a == 0 || b == 0) { return 0 }
+    let g = gcd(a, b)
+    var x = a / g
+    if (x < 0) { x = -x }
+    return x * b
+}
+
+// 是否素数。试除到 sqrt(n)，跳过偶数。
+fn isPrime(n: Int) -> Bool {
+    if (n < 2) { return false }
+    if (n < 4) { return true }
+    if (n % 2 == 0) { return false }
+    var i = 3
+    while (i * i <= n) {
+        if (n % i == 0) { return false }
+        i = i + 2
+    }
+    return true
+}
+
+// 浮点近似相等。数值计算里永远不该用 == 比浮点，但用户会这么写，
+// 所以给一个明确的工具，顺便把 eps 显式化。
+fn nearly(a: Float, b: Float, eps: Float) -> Bool {
+    let d = math(abs, a - b)
+    return d <= eps
+}
+
+// 常用精度（1e-9）。写成函数而不是全局常量，因为语言没有模块级变量。
+fn epsDefault() -> Float {
+    return 1.0e-9
+}

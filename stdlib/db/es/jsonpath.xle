@@ -1,0 +1,205 @@
+// db/es/jsonpath.xle — JSON 安全取值
+//
+// ── 为什么不能直接用 std.json ───────────────────
+//
+// 因为 std.json 的 jsonGet 在键不存在时**直接 fail（终止程序）**：
+//
+//     jsonGet: 没有键 `hits`
+//
+// 对读配置文件这是合理的（缺项是错误），但读 ES 响应完全不合适 ——
+// ES 的响应字段是**按查询变化**的：
+//
+//   * match_all 有 hits.hits，写文档的响应没有
+//   * 报错响应只有 error，没有 hits
+//   * _cat 接口的顶层是数组，不是对象
+//
+// 所以这里实现一套「键不存在返回空标记而不报错」的取值函数。
+//
+// ── jsonParse 的结果结构 ────────────────────────
+//
+// 对象：键值交替的 Array：["a", 1, "b", 2]
+// 数组：普通 Array：[1, 2, 3] 或 ["a", "b"]
+// 标量：直接是 String / Int / Float / Bool
+//
+// 对象和数组都可能是 Array，靠 jsonIsObject 的启发式区分（长度偶数
+// 且奇数位全是 String）。
+//
+// ── 「找不到」怎么表示 ─────────────────────────
+//
+// 语言没有可空类型：`fn f() -> String` 返回 null 会触发「声明返回
+// String 实际返回 Null」的警告，而 `fn f() -> Array` 返回 null 同理。
+//
+// 所以约定：**内部取值函数返回 [找到, 值]**。
+//   找到时 [true, 值]，没找到时 []（长度 0）。
+// 调用方用 `len(r) >= 2` 判断。这样既没有 null，也不依赖类型推断。
+
+from "../../json.xle" import jsonParse, jsonParseScalar, jsonInt, jsonSetInt, jsonCur, jsonSkipWs, jsonFail, jsonParseValue, jsonExpect, jsonParseNumber, jsonParseString, jsonParseEscape, jsonHex4, jsonParseArray, jsonParseObject, jsonIsObject, jsonTypeOf, jsonGet, jsonGetOr, jsonHas, jsonKeys, jsonValues, jsonStringify, jsonArrayAny, jsonQuote, jsonHex, jsonNull, jsonNullValue, jsonBool, jsonNumber, jsonIntLit, jsonArrayOfStrings, jsonObject
+
+// 按点号路径取值，返回 [找到, 值]。找不到返回 []。
+//
+// esGetValue(doc, "hits.hits") 会先取 hits（对象），再在其中取 hits。
+//
+// ── 为什么值也可能是 Array ───────────────────────
+//
+// 因为对象和数组都解析成 Array。上层用 jsonIsObject 区分，或者
+// 直接按「期望的形状」取（取数组用 jsonGetArray，取对象用
+// jsonGetObject）。
+fn esGetValue(obj: Array, path: String) -> Array {
+    let segs = strSplit(path, ".")
+    var cur = obj
+    var i = 0
+    while i < len(segs) {
+        let key = toString(segs[i])
+        if (!jsonIsObject(cur)) {
+            // 当前层不是对象（是数组或标量），无法按键取
+            return []
+        }
+        let found = esLookup(cur, key)
+        if (len(found) < 2) { return [] }
+
+        if (i == len(segs) - 1) {
+            return [true, found[1]]
+        }
+        // 还有下一段：当前值必须仍能当对象用
+        let inner = found[1]
+        if (typeOf(inner) != "Array") { return [] }
+        cur = inner
+        i = i + 1
+    }
+    return []
+}
+
+// 在对象里找键，返回 [true, 值] 或 []。
+//
+// ── 为什么不用「返回值是否为 null」判断 ───────────
+//
+// 因为 JSON 的 null 会被解析成某种具体值（这里通常是字符串 "null"
+// 或语言 null），用「返回值是 null」无法区分「键不存在」和「键存在
+// 且值为 null」。用长度标记区分两者。
+fn esLookup(o: Array, key: String) -> Array {
+    if (typeOf(o) != "Array") { return [] }
+    let n = len(o)
+    if (n % 2 != 0) { return [] }
+    var i = 0
+    while i < n {
+        if (toString(o[i]) == key) {
+            return [true, o[i + 1]]
+        }
+        i = i + 2
+    }
+    return []
+}
+
+// 对象是否有某个键。
+fn jsonHasKey(o: Array, key: String) -> Bool {
+    return len(esLookup(o, key)) >= 2
+}
+
+// 取文本。不存在或为 null 时返回 ""。
+fn jsonGetText(o: Array, path: String) -> String {
+    let r = esGetValue(o, path)
+    if (len(r) < 2) { return "" }
+    return jsonScalarText(r[1])
+}
+
+// 取整数。不存在返回 0。
+fn jsonGetInt(o: Array, path: String) -> Int {
+    let r = esGetValue(o, path)
+    if (len(r) < 2) { return 0 }
+    return jsonScalarInt(r[1])
+}
+
+// 取数组。不存在或不是数组时返回空数组。
+//
+// ── 注意：hits.hits 的每一项是对象 ────────────────
+//
+// 返回的数组元素是「键值交替的 Array」（对象）。要用 jsonLookupText
+// 或 jsonGetObject 在它们内部取值。
+fn jsonGetArray(o: Array, path: String) -> Array {
+    let r = esGetValue(o, path)
+    if (len(r) < 2) { return [] }
+    let v = r[1]
+    if (typeOf(v) != "Array") { return [] }
+    // 空数组和空对象无法区分，都返回空 —— 对调用方语义一致
+    return v
+}
+
+// 取子对象。不存在或不是对象时返回空数组。
+fn jsonGetObject(o: Array, path: String) -> Array {
+    let r = esGetValue(o, path)
+    if (len(r) < 2) { return [] }
+    let v = r[1]
+    if (typeOf(v) != "Array") { return [] }
+    if (!jsonIsObject(v)) { return [] }
+    return v
+}
+
+// 在（已知是对象的）值里按**单层键**取值，返回 [true, 值] 或 []。
+//
+// ── 这个函数和 jsonGetObject 的分工 ────────────────
+//
+// jsonGetObject 接受点号路径，用于「从根往下找」。
+// 这个函数只查一层，用于「已经拿到某个对象，取它的键」——
+// 比如命中项里的 _source。键名本身可能含点号（ES 的字段名允许），
+// 那种情况必须用单层查找，不能被路径拆开。
+fn jsonLookup(o: Array, key: String) -> Array {
+    return esLookup(o, key)
+}
+
+// 取单层键并转文本。
+fn jsonLookupText(o: Array, key: String) -> String {
+    let r = esLookup(o, key)
+    if (len(r) < 2) { return "" }
+    return jsonScalarText(r[1])
+}
+
+// 判断一个 JSON 文本的顶层是不是数组。
+//
+// ── 为什么要单独判断 ──────────────────────────
+//
+// 因为 jsonParse 对顶层数组和顶层对象都返回 Array，而 _cat/indices
+// 的响应是前者、_search 的响应是后者。区分它们决定走哪条摊平路径。
+fn jsonIsArray(text: String) -> Bool {
+    let t = strTrim(text)
+    return strStarts(t, "[")
+}
+
+// 标量值 → 文本。数组/对象走 jsonStringify。
+fn jsonScalarText(v: String) -> String {
+    if (v == null) { return "" }
+    let t = typeOf(v)
+    if (t == "Array") { return jsonStringify(v) }
+    if (t == "Bool") {
+        if (v == true) { return "true" }
+        return "false"
+    }
+    return toString(v)
+}
+
+// 标量值 → 整数。
+fn jsonScalarInt(v: String) -> Int {
+    let t = typeOf(v)
+    if (t == "Int") { return toInt(v) }
+    if (t == "Float") { return toInt(v) }
+    if (t == "Bool") {
+        if (v == true) { return 1 }
+        return 0
+    }
+    return strParseInt(toString(v))
+}
+
+// ── 结果集形状的单元格取值 ─────────────────────────
+//
+// 这一对是给「把 JSON 对象摊平成表格」用的：值存在返回文本，
+// 不存在返回 ""，同时用一个并行数组标记 NULL。
+//
+// ── 为什么返回 [值, 是否存在] ───────────────────
+//
+// 因为摊平成表格时「字段缺失」要记为 NULL，而「字段存在且为空串」
+// 要记为不是 NULL。两者都是 ""，只能靠第二个分量区分。
+fn jsonCell(o: Array, key: String) -> Array {
+    let r = esLookup(o, key)
+    if (len(r) < 2) { return ["", false] }
+    if (r[1] == null) { return ["", false] }
+    return [jsonScalarText(r[1]), true]
+}

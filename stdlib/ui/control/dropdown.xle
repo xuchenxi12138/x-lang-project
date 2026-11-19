@@ -1,0 +1,363 @@
+// ui/control/dropdown.xle — 下拉选择框
+//
+// ── 下拉框真正的难点不是「画一个列表」 ──────────────
+//
+// 而是**浮层**：展开的选项列表画在控件本体之外，可能盖住别的
+// 控件，也可能被窗口边界裁掉。这带来三个必须处理的问题：
+//
+//   1. 展开时，列表要画在最后（在最上层）—— 否则会被后画的
+//      控件盖住。即时模式里「最后画」= 「在代码里最后调用」。
+//   2. 列表可能超出窗口底部 —— 必须向上翻转。
+//   3. 点击落在列表外时应该关闭，而那个点击不该同时触发
+//      它下面的控件。
+//
+// 这三点没有一个是「画列表」本身的问题，而它们全都是必须解决的
+// 问题。所以 Dropdown 的接口设计成两阶段：
+//
+//   dd.draw()          画本体（合着的状态）
+//   dd.drawPopup()     画展开的列表 —— 由调用方在**所有控件之后**调
+//
+// 两阶段而不是「draw 里自己判断」：因为 draw 的调用顺序就是绘制
+// 顺序，如果 Dropdown 在自己 draw 里画浮层，浮层就会被后面画的
+// 控件盖住。把浮层分出来，调用方就能自然地控制层级。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 每个选项行的高度。
+const DD_ROW_H = 26
+
+// 展开列表的最大可见行数。超过时滚动。
+const DD_MAX_ROWS = 8
+
+class Dropdown extends Widget {
+    items: Array,
+    selected: Int,
+
+    // 是否展开。
+    open: Bool,
+
+    // 鼠标悬停在展开列表的哪一行。-1 表示没有。
+    hoverIndex: Int,
+
+    // 列表滚动位置（行数）。选项多于 DD_MAX_ROWS 时用。
+    scrollY: Int,
+
+    // 占位符。selected < 0 时显示。
+    placeholder: String,
+
+    constructor(r: Rect, items: Array) {
+        self.r          = r
+        self.vis        = true
+        self.enabled    = true
+        self.focused    = false
+        self.hovered    = false
+        self.items      = items
+        self.selected   = 0 - 1
+        self.open       = false
+        self.hoverIndex = 0 - 1
+        self.scrollY    = 0
+        self.placeholder = "请选择"
+        self.style      = Style.plain()
+    }
+
+    static fn of(r: Rect, items: Array, selected: Int) -> Dropdown {
+        let d = new Dropdown(r, items)
+        d.selected = selected
+        return d
+    }
+
+    // ── 状态 ────────────────────────────────────
+
+    fn current() -> Int {
+        return self.selected
+    }
+
+    fn currentText() -> String {
+        if (self.selected < 0 || self.selected >= len(self.items)) {
+            return self.placeholder
+        }
+        return toString(self.items[self.selected])
+    }
+
+    fn select(i: Int) -> Bool {
+        if (i < 0 || i >= len(self.items)) { return false }
+        if (i == self.selected) {
+            self.open = false
+            return false
+        }
+        self.selected = i
+        self.open = false
+        return true
+    }
+
+    fn toggleOpen() -> Dropdown {
+        self.open = !self.open
+        return self
+    }
+
+    fn close() -> Dropdown {
+        self.open = false
+        self.hoverIndex = 0 - 1
+        return self
+    }
+
+    // ── 浮层几何 ──────────────────────────────────
+    //
+    // 可见行数：min(选项数, DD_MAX_ROWS)。
+    fn visibleRows() -> Int {
+        let n = len(self.items)
+        if (n > DD_MAX_ROWS) { return DD_MAX_ROWS }
+        return n
+    }
+
+    // 浮层的矩形。
+    //
+    // ── 向上翻转 ────────────────────────────────
+    //
+    // 如果下方放不下，就翻到上方。判断依据是「本体底部 + 浮层高
+    // 是否超过窗口高」，窗口高从当前帧的裁剪区拿不到 —— 所以用
+    // winTextHeight 之外的东西都不行。
+    //
+    // 实际做法：调用方通过 flipUp 字段告知是否要向上。为什么不让
+    // Dropdown 自己看窗口尺寸：因为「窗口尺寸」在即时模式里是
+    // 每帧可变的，而 Dropdown 拿不到可靠的值（winOpen 之后才知道）。
+    // 让调用方决定翻转是更诚实的接口 —— 它知道自己的布局。
+    flipUp: Bool,
+
+    fn popupRect() -> Rect {
+        let rows = self.visibleRows()
+        let ph = rows * DD_ROW_H + 2
+        if (self.flipUp) {
+            return rectOf(self.r.x, self.r.y - ph, self.r.w, ph)
+        }
+        return rectOf(self.r.x, self.r.y + self.r.h, self.r.w, ph)
+    }
+
+    // 第 i 行（索引是**选项下标**）在浮层里的矩形。
+    fn rowRect(i: Int) -> Rect {
+        let pr = self.popupRect()
+        let ry = pr.y + 1 + (i - self.scrollY) * DD_ROW_H
+        return rectOf(pr.x, ry, pr.w, DD_ROW_H)
+    }
+
+    // 浮层里当前鼠标位置对应哪个选项下标。-1 表示不在任何行上。
+    fn indexAt(mx: Int, my: Int) -> Int {
+        if (!self.open) { return 0 - 1 }
+        let pr = self.popupRect()
+        if (!pr.contains(mx, my)) { return 0 - 1 }
+        let rel = my - pr.y - 1
+        if (rel < 0) { return 0 - 1 }
+        let row = rel / DD_ROW_H
+        let i = row + self.scrollY
+        if (i < 0 || i >= len(self.items)) { return 0 - 1 }
+        return i
+    }
+
+    // ── 交互 ────────────────────────────────────
+    //
+    // 一次性处理「点本体开合」和「点选项选择」。返回是否发生了变化
+    // （选中项变了）。关闭事件不算变化。
+    //
+    // ── 为什么需要一个处理整个点击的方法 ──────────────
+    //
+    // 因为点击的归属判定跨越两层：点在浮层里 → 选与关；点在
+    // 本体上 → 开合；点在别处 → 关。三段逻辑必须一起看才不会
+    // 出现「点选项时列表关了但没选上」这种半状态。
+    fn click(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+
+        // 展开时优先判浮层 —— 浮层在本体下方（或上方），
+        // 两者不重叠，但先判浮层更符合「浮层在最上层」的直觉。
+        if (self.open) {
+            let i = self.indexAt(mx, my)
+            if (i >= 0) {
+                return self.select(i)
+            }
+        }
+
+        // 点本体：开合。
+        if (self.r.contains(mx, my)) {
+            if (self.open) {
+                self.close()
+            } else {
+                self.open = true
+            }
+            return false
+        }
+
+        // 点别处：关。
+        if (self.open) { self.close() }
+        return false
+    }
+
+    // ── 绘制：本体 ───────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 底色与边框。展开时边框用主色，表示「这个控件现在是焦点」。
+        var borderC = th.border
+        if (!self.enabled) {
+            borderC = th.border
+        } else if (self.open || self.hovered) {
+            borderC = th.accent
+        }
+
+        var bg = th.surface
+        if (self.hovered && self.enabled) { bg = th.surfaceHover }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, bg)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, borderC)
+
+        // 文字：左对齐，右侧留出箭头的位置。
+        let pad = 10
+        let arrowW = 20
+        let avail = self.r.w - pad - arrowW
+        var s = self.currentText()
+        if (winTextWidth(s) > avail) { s = uiEllipsize(s, avail) }
+
+        var tc = th.text
+        if (self.selected < 0) { tc = th.textDim }
+        if (!self.enabled) { tc = th.disabled }
+        uiTextLeft(self.r, s, pad, tc)
+
+        // 箭头：一个向下的小三角。展开时翻转成向上。
+        //
+        // ── 用 winPath 画三角形而不是字符 "▼" ────────────
+        //
+        // 字符是否存在于字体里不可控，而且不同字体的三角形
+        // 比例差很多。用三个点画三角形在任何字体下都一致。
+        self.drawArrow(th, self.r.x + self.r.w - arrowW, self.r.y, arrowW, self.r.h)
+    }
+
+    fn drawArrow(th: Theme, x: Int, y: Int, w: Int, h: Int) {
+        let cx = x + w / 2
+        let cy = y + h / 2
+        let half = 4
+        let hh = 3
+
+        var pts = []
+        if (self.open) {
+            // 向上：顶点在上。
+            pts = [cx, cy - hh, cx - half, cy + hh, cx + half, cy + hh]
+        } else {
+            // 向下：顶点在下。
+            pts = [cx, cy + hh, cx - half, cy - hh, cx + half, cy - hh]
+        }
+        var c = th.textDim
+        if (!self.enabled) { c = th.disabled }
+        winPath(pts, c)
+    }
+
+    // ── 绘制：浮层 ───────────────────────────────
+    //
+    // 调用方必须在**所有控件之后**调这个。
+    fn drawPopup(th: Theme) {
+        if (!self.vis || !self.open) { return }
+        let pr = self.popupRect()
+
+        // 阴影：先画一层偏移的圆角矩形，做出浮起感。
+        winFillRound(pr.x + 2, pr.y + 3, pr.w, pr.h, 4, th.scrim)
+
+        // 底面 + 边框。
+        winFillRect(pr.x, pr.y, pr.w, pr.h, th.surface)
+        winBorderRect(pr.x, pr.y, pr.w, pr.h, 1, th.border)
+
+        // 内容裁剪：滚动时行不能画到浮层外。
+        winClip(pr.x + 1, pr.y + 1, pr.w - 2, pr.h - 2)
+
+        let rows = self.visibleRows()
+        var i = 0
+        while i < rows {
+            let idx = self.scrollY + i
+            if (idx >= len(self.items)) { break }
+            let rr = self.rowRect(idx)
+
+            // 悬停 / 已选中的底色。
+            //
+            // 已选中用主色浅底（不是主色实心底）—— 实心会盖住
+            // 文字，而「已选中」只是个标记，不该压过可读性。
+            if (idx == self.hoverIndex) {
+                winFillRect(rr.x, rr.y, rr.w, rr.h, th.surfaceHover)
+            } else if (idx == self.selected) {
+                winFillRect(rr.x, rr.y, rr.w, rr.h, th.surfaceActive)
+            }
+
+            let s = toString(self.items[idx])
+            let pad = 10
+            var avail = rr.w - pad * 2 - 16
+            var text = s
+            if (winTextWidth(text) > avail) {
+                text = uiEllipsize(text, avail)
+            }
+
+            var tc = th.text
+            if (idx == self.selected) { tc = th.accent }
+            uiTextLeft(rr, text, pad, tc)
+
+            // 已选中项右侧打勾。
+            if (idx == self.selected) {
+                let kx = rr.x + rr.w - 18
+                let ky = rr.y + rr.h / 2
+                let p1 = [kx, ky, kx + 4, ky + 4, kx + 10, ky - 4]
+                winPath(p1, th.accent)
+            }
+
+            i = i + 1
+        }
+
+        winUnclip()
+    }
+
+    // ── 键盘 ────────────────────────────────────
+    //
+    // 展开时上下键移动，回车确认，Esc 关闭。返回是否消费了这个键。
+    fn keyDown(key: String) -> Bool {
+        if (!self.open) {
+            if (key == "Enter" || key == " ") {
+                self.open = true
+                return true
+            }
+            return false
+        }
+
+        if (key == "Escape") {
+            self.close()
+            return true
+        }
+        if (key == "Enter") {
+            let i = self.hoverIndex
+            if (i < 0) { i = self.selected }
+            if (i >= 0) { self.select(i) } else { self.close() }
+            return true
+        }
+        if (key == "ArrowDown") {
+            var i = self.hoverIndex + 1
+            if (i < 0) { i = 0 }
+            if (i >= len(self.items)) { i = len(self.items) - 1 }
+            self.hoverIndex = i
+            self.ensureVisible(i)
+            return true
+        }
+        if (key == "ArrowUp") {
+            var i = self.hoverIndex - 1
+            if (i < 0) { i = 0 }
+            self.hoverIndex = i
+            self.ensureVisible(i)
+            return true
+        }
+        return false
+    }
+
+    fn ensureVisible(i: Int) {
+        let rows = self.visibleRows()
+        if (i < self.scrollY) { self.scrollY = i }
+        if (i >= self.scrollY + rows) { self.scrollY = i - rows + 1 }
+        if (self.scrollY < 0) { self.scrollY = 0 }
+    }
+}

@@ -1,0 +1,135 @@
+// ui/layout/panel.xle — 面板（带标题栏的分区容器）
+//
+// ── 容器不是「带背景的矩形」 ────────────────────────
+//
+// 一个容器要做三件事：
+//
+//   1. 画自己的外观（底色、边框、标题）
+//   2. 给出**内容区**（扣掉边框、标题、padding）
+//   3. 可能裁剪（滚动容器）
+//
+// 第 2 件是最容易被忽略但最要紧的：内容区算错 1px，里面所有
+// 控件都会偏。所以容器的核心接口是 content()，而不是 draw()。
+//
+// ── 容器家族 ─────────────────────────────────
+//
+//   panel.xle      —— 本文件，普通分区，有底色和细边框 + 标题栏
+//   card.xle       —— 浮起的分区，圆角 + 阴影，无标题栏
+//   group.xle      —— 只有边框、无底色，「把几个东西圈在一起」
+//   divider.xle    —— 一条线，纯装饰
+//   scrollview.xle —— 裁剪 + 滚动状态
+//
+// 视觉差别是刻意保留的：如果全都长一样，用户就分不清「这是一块
+// 内容」还是「这是一个可点击的卡片」。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 标题栏高度。识别度与占用空间的平衡点。
+const PANEL_TITLE_H = 32
+
+class Panel extends Widget {
+    title: String,
+
+    // 内边距。内容区 = 面板减去边框和 padding。
+    pad: Int,
+
+    // 是否画标题栏。有标题时自动为真，但也可以显式开一个空标题栏
+    // （放工具按钮用）。
+    header: Bool,
+
+    constructor(r: Rect, title: String) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.title   = title
+        self.pad     = 12
+        self.header  = len(title) > 0
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, title: String) -> Panel {
+        return new Panel(r, title)
+    }
+
+    static fn bare(r: Rect) -> Panel {
+        return new Panel(r, "")
+    }
+
+    fn setPad(p: Int) -> Panel {
+        self.pad = p
+        return self
+    }
+
+    fn setTitle(t: String) -> Panel {
+        self.title = t
+        self.header = len(t) > 0
+        return self
+    }
+
+    // 标题栏矩形。
+    fn headerRect() -> Rect {
+        return rectOf(self.r.x, self.r.y, self.r.w, PANEL_TITLE_H)
+    }
+
+    // 内容区。
+    //
+    // 计算顺序：整体 → 扣边框 1px → 扣标题栏 → 扣 padding。
+    // 每步都要做，少一步内容就会压到边框上。
+    fn content() -> Rect {
+        var inner = Rect.inset(self.r, 1)
+        if (self.header) {
+            inner = rectOf(inner.x, inner.y + PANEL_TITLE_H,
+                           inner.w, inner.h - PANEL_TITLE_H)
+        }
+        return Rect.inset(inner, self.pad)
+    }
+
+    // 不扣 padding 的内容区（需要自己管理的场景）。
+    fn contentRaw() -> Rect {
+        var inner = Rect.inset(self.r, 1)
+        if (self.header) {
+            inner = rectOf(inner.x, inner.y + PANEL_TITLE_H,
+                           inner.w, inner.h - PANEL_TITLE_H)
+        }
+        return inner
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 底色 + 边框。
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.surface)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, th.border)
+
+        if (!self.header) { return }
+
+        // 标题栏：底色略深一点（用 bg 而不是另一个新颜色）。
+        //
+        // ── 为什么标题栏用 bg 而不是 surfaceHover ──────
+        //
+        // surfaceHover 是「鼠标悬停」的语义色。用它做标题栏，会让
+        // 静止状态看起来像「悬停中」。用 bg（窗口底色）更暗，
+        // 视觉上自然形成「标题栏在面板之上」的层次。
+        let hr = self.headerRect()
+        winFillRect(hr.x, hr.y, hr.w, hr.h, th.bg)
+
+        // 标题栏底部的分隔线。
+        winFillRect(hr.x, hr.y + hr.h - 1, hr.w, 1, th.border)
+
+        // 标题文字。
+        if (len(self.title) > 0) {
+            let tp = 12
+            let avail = hr.w - tp * 2
+            var s = self.title
+            if (winTextWidth(s) > avail) { s = uiEllipsize(s, avail) }
+            uiTextLeft(hr, s, tp, th.text)
+        }
+    }
+}

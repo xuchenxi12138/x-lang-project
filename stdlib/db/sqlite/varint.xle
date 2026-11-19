@@ -1,0 +1,212 @@
+// db/sqlite/varint.xle — SQLite 的变长整数编码
+//
+// ── 为什么 SQLite 自己发明一种 varint ────────────────────
+//
+// 数据库文件里有两类数字，它们的分布完全不同：
+//
+//   1. **小的非负数**（行数、列数、payload 长度、record header 长度）
+//      它们 99% 的值都小于 128，但偶尔会到几百万。
+//   2. **任意 int64**（整数列的值、rowid）
+//      跨度是完整 64 位，但小值远比大值常见。
+//
+// 用定长 8 字节存第一类会浪费 7 字节 × 每行每列 —— 一个 1000 万行
+// 的表就是几百 MB 的纯浪费。所以两类都用变长。
+//
+// ── 编码规则（和 protobuf / LEB128 都不一样，必须看清楚） ──
+//
+// **9 字节形式**（大值或负值）：
+//
+//   第 1 字节的 8 个 bit 全部是数据，第 9 字节也是数据。
+//   也就是 72 位里取低 64 位 —— 首个字节其实浪费了高 8 位。
+//
+//   H = (b0 << 56) | (b1 << 48) | ... | (b7 << 8) | b8
+//
+//   注意 b0 的 bit7 如果是 1，说明这是负数（因为左移 56 之后它
+//   落在 bit63）。所以 9 字节形式天然表示完整 int64。
+//
+// **1..8 字节形式**（只表示非负值 0 .. 2^56-1）：
+//
+//   每个字节低 7 位是数据，bit7 是「还有下一字节」标志。
+//   首字节的最高位（bit7）为 0 表示「到这就结束了」，而数据按
+//   大端拼接：值 = (b0 & 0x7F) << (7*(n-1)) | ...
+//
+// ── 一个必须记住的不对称 ───────────────────────────
+//
+// 9 字节形式里第 1 字节的**全部 8 位都是数据**；1..8 字节形式里
+// 第 1 字节只有**低 7 位是数据**。同一个 bit7 在两种形式下含义
+// 相反：
+//
+//   9 字节形式：b0 bit7 = 1 → 值是负数（数据位）
+//   1..8 形式 ：b0 bit7 = 0 → 这是最后一个字节（结束标志）
+//
+// SQLite 的判据是「如果 b0 bit7 为 0，则这一字节里就是全部值」，
+// 「如果 b0 bit7 为 1，则继续读；若读满 9 个字节就是 9 字节形式」。
+//
+// 所以解码循环必须写成「先读一个字节，若 bit7 为 0 直接返回；
+// 否则继续，最多 9 个」，且**第 9 个字节无条件收尾**（不再看 bit7）。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// 解码一个 varint。返回 [值, 消耗的字节数]。
+//
+// ── 为什么返回「消耗字节数」而不是新位置 ────────────────
+//
+// 因为调用方常常在循环里连续解多个 varint（record header 就是一串
+// varint），返回长度比返回绝对位置更好组合：`pos = pos + n`。
+// 如果返回位置，调用方还得自己记住起点，反而多一处出错机会。
+//
+// 失败（越界）时返回 [0, 0] —— 长度为 0 是「没解出来」的信号。
+fn svReadInt(b: Array, pos: Int) -> Array {
+    if (pos < 0 || pos >= len(b)) { return [0, 0] }
+
+    let b0 = bbU8(b, pos)
+    // 1..8 字节形式：首字节 bit7 为 0，值就在这一个字节里（低 7 位）。
+    // 注意 1 字节时 b0 < 128，所以「低 7 位」和「整个字节」是同一个值。
+    if (b0 < 128) {
+        return [b0, 1]
+    }
+
+    // 多字节形式：**每组 7 位**（不是 8 位）。
+    //
+    // ── 这里错过一次，症状是 128 解成 33024 ────────────
+    //
+    // 编码器用 `n & 0x7F` / `n >> 7` 拆组，是完全正确的；但解码器
+    // 写成 `v = v << 8 | c`，把 7 位组当成了 8 位组，于是
+    // `81 00`（= 128）被解成 0x8100 = 33024。
+    //
+    // 错得整齐：所有 ≥128 的值都偏移了，而 <128 的值全对 ——
+    // 所以只测小值的用例会**全部通过**，这个 bug 能一路活到
+    // 解析真实数据库时才炸。
+    var v = b0 & 0x7F
+    var i = 1
+    while (i < 9) {
+        if (pos + i >= len(b)) { return [0, 0] }
+        let c = bbU8(b, pos + i)
+        if (i == 8) {
+            // 第 9 个字节：**全部 8 位都是数据**，且不再看 bit7。
+            //
+            // 所以 9 字节形式是「前 8 字节各贡献 7 位（56 位）+ 第 9
+            // 字节贡献 8 位」= 64 位，按大端拼接。这里先 << 8 再把
+            // 第 9 字节 OR 进去，恰好就是那个拼接。
+            v = v << 8
+            v = v | c
+            return [v, 9]
+        }
+        v = v << 7
+        v = v | (c & 0x7F)
+        if (c < 128) {
+            i = i + 1
+            return [v, i]
+        }
+        i = i + 1
+    }
+    return [v, 9]
+}
+
+// 编码一个非负整数（0 .. 2^56-1）成 1..8 字节 varint。
+//
+// 负数与超过 2^56 的值走 9 字节形式 —— 见 svWriteInt64。
+fn svWriteInt(v: Int) -> Array {
+    // 小值是绝大多数情况：一个字节搞定，直接返回。
+    if (v >= 0 && v < 128) {
+        return [v]
+    }
+
+    // 负数或超大值：交给 9 字节形式。
+    if (v < 0 || v >= 72057594037927936) {
+        return svWriteInt64(v)
+    }
+
+    // 1..8 字节形式：从低位往高位取 7 位一组，最后反转。
+    let tmp = []
+    var n = v
+    while (n > 0) {
+        arrPush(tmp, n & 0x7F)
+        n = n >> 7
+    }
+    // tmp 现在低位在前，需要翻转成大端输出。
+    let out = []
+    var i = len(tmp) - 1
+    while (i >= 0) {
+        var byte = toInt(tmp[i])
+        // 除最后一个字节外，都要置 bit7 表示「后面还有」。
+        if (i > 0) { byte = byte | 0x80 }
+        arrPush(out, byte)
+        i = i - 1
+    }
+    return out
+}
+
+// 编码成 9 字节形式（完整 int64，支持负数）。
+//
+// ── 9 字节形式的确切位划分（这里错过两次，值得记清楚） ──────
+//
+// SQLite 文档：「前 8 个字节各有 7 位数据，第 9 个字节有 8 位数据。」
+// 总位数 8×7 + 8 = 64，正好是一个 int64。
+//
+// 按大端分配：
+//
+//   b0 → v 的 bit63..57      b5 → v 的 bit28..22
+//   b1 → v 的 bit56..50      b6 → v 的 bit21..15
+//   b2 → v 的 bit49..43      b7 → v 的 bit14..8
+//   b3 → v 的 bit42..36      b8 → v 的 bit7..0     ← 注意是 8 位
+//   b4 → v 的 bit35..29
+//
+// 前 8 字节的 bit7 一律置 1（表示「还有后续」），恰好与「只取 7 位
+// 数据」互补 —— 这正是能塞下 9 字节的原因。
+//
+// ── 两个写错的版本，症状各不相同 ──────────────────
+//
+// ① 当成「标准 8 字节大端 + 补一个 0」
+//      b0..b7 = (v>>56)..(v&0xFF)，b8 = 0
+//    → 解码时前 7 字节左移 49 位会丢掉 b7 的数据，-1 解成 -256。
+//
+// ② 写成 8 个 push（漏掉第 9 字节）
+//    → 长度只有 8，解码器按 9 字节形式读会越界，返回 [0,0]。
+fn svWriteInt64(v: Int) -> Array {
+    let out = []
+    // 前 8 字节：每字节取 7 位，从高位开始，并置 bit7 表示续接。
+    arrPush(out, ((v >> 57) & 0x7F) | 0x80)
+    arrPush(out, ((v >> 50) & 0x7F) | 0x80)
+    arrPush(out, ((v >> 43) & 0x7F) | 0x80)
+    arrPush(out, ((v >> 36) & 0x7F) | 0x80)
+    arrPush(out, ((v >> 29) & 0x7F) | 0x80)
+    arrPush(out, ((v >> 22) & 0x7F) | 0x80)
+    arrPush(out, ((v >> 15) & 0x7F) | 0x80)
+    arrPush(out, ((v >> 8)  & 0x7F) | 0x80)
+    // 第 9 字节：低 8 位，且不加续接位。
+    arrPush(out, v & 0xFF)
+    return out
+}
+
+// 把 varint 追加到字节缓冲，返回新缓冲。
+fn svPutInt(b: Array, v: Int) -> Array {
+    let enc = svWriteInt(v)
+    var i = 0
+    while (i < len(enc)) {
+        b = bbPut(b, toInt(enc[i]))
+        i = i + 1
+    }
+    return b
+}
+
+// 连续解出 count 个 varint，返回 [值数组, 消耗字节数]。
+//
+// record header 就是这个形状：一串 varint。
+fn svReadMany(b: Array, pos: Int, count: Int) -> Array {
+    let vals = []
+    var p = pos
+    var i = 0
+    while (i < count) {
+        let r = svReadInt(b, p)
+        let n = toInt(r[1])
+        if (n == 0) {
+            // 越界：把已解出的返回，长度告诉调用方到哪停了
+            return [vals, p - pos]
+        }
+        arrPush(vals, r[0])
+        p = p + n
+        i = i + 1
+    }
+    return [vals, p - pos]
+}

@@ -1,0 +1,346 @@
+// db/sqlite/select.xle — 极简 SELECT 解析与执行
+//
+// ── 为什么要单独一个文件 ────────────────────────────
+//
+// 因为「解析 SQL」和「读文件」是两件完全独立的事，混在一起会变成
+// 一个八百行的函数。拆开之后：
+//
+//   select.xle  纯文本变换，输入 SQL 输出 Query 对象 —— 可以单测
+//   driver.xle  把 Query 套到 B-tree 上执行 —— 只关心数据
+//
+// ── 支持的范围（写清楚，避免误以为这是 SQL 引擎） ──────────
+//
+//   SELECT * FROM t
+//   SELECT a, b FROM t
+//   SELECT COUNT(*) FROM t
+//   SELECT SUM(x), AVG(x), MIN(x), MAX(x) FROM t
+//   SELECT ... FROM t WHERE col = 'x'        （= != < <= > >=）
+//   SELECT ... FROM t WHERE col = 1
+//   SELECT ... LIMIT n
+//   SELECT ... WHERE ... LIMIT n
+//
+// 不支持（遇到会明确报错，不静默忽略）：
+//   JOIN / 子查询 / GROUP BY / HAVING / ORDER BY / DISTINCT /
+//   表达式（`WHERE a + 1 > 2`）/ OR / AND / IN / LIKE / BETWEEN
+//
+// ── 为什么不支持 AND / OR ──────────────────────────
+//
+// 不是做不到（解析两个条件再求值而已），而是「支持一部分逻辑运算」
+// 比「完全不支持」更危险：用户写了 `WHERE a=1 AND b=2`，如果驱动
+// 只认第一个条件并静默忽略第二个，返回的行会**比预期多**，而调用方
+// 通常不会核对行数。明确报错才能让用户改用全表扫描 + 自己过滤。
+
+// 一次查询的解析结果。
+class SvQuery {
+    // 解析是否成功。
+    ok: Bool,
+
+    // 失败原因。
+    error: String,
+
+    // 要查的表名。
+    tableName: String,
+
+    // 投影列表。`["*"]` 表示全列。
+    //
+    // 聚合函数的调用形如 "SUM:score"，冒号前是函数名、后是列名。
+    // 这样不用额外的结构体来表达「这是函数还是列」。
+    projection: Array,
+
+    // WHERE 条件。hasWhere 为 false 时其余三个字段无意义。
+    hasWhere: Bool,
+    whereCol: String,
+    whereOp: String,
+    whereVal: String,
+
+    // LIMIT。-1 表示没有。
+    limit: Int,
+
+    constructor() {
+        self.ok         = false
+        self.error      = ""
+        self.tableName  = ""
+        self.projection = []
+        self.hasWhere   = false
+        self.whereCol   = ""
+        self.whereOp    = ""
+        self.whereVal   = ""
+        self.limit      = 0 - 1
+    }
+
+    fn isAggregate() -> Bool {
+        if (len(self.projection) == 0) { return false }
+        let p0 = toString(self.projection[0])
+        let c = strFind(p0, ":")
+        if (c < 0) { return false }
+        let fname = strSub(p0, 0, c)
+        return fname == "COUNT" || fname == "SUM" || fname == "AVG" || fname == "MIN" || fname == "MAX"
+    }
+
+    fn describe() -> String {
+        var s = "SELECT "
+        var i = 0
+        while (i < len(self.projection)) {
+            if (i > 0) { s = s + ", " }
+            s = s + toString(self.projection[i])
+            i = i + 1
+        }
+        s = s + " FROM " + self.tableName
+        if (self.hasWhere) {
+            s = s + " WHERE " + self.whereCol + " " + self.whereOp + " " + self.whereVal
+        }
+        if (self.limit >= 0) { s = s + " LIMIT " + toString(self.limit) }
+        return s
+    }
+}
+
+// 解析一条 SELECT。失败时 ok=false 且 error 有可读原因。
+fn svParseSelect(sql: String) -> SvQuery {
+    let q = new SvQuery()
+    let s = svCollapseWs(sql)
+
+    // ① 必须是 SELECT
+    if (!svStartsWithCi(s, "SELECT")) {
+        q.error = "只支持 SELECT（" + sqlHead(sql, 30) + "）"
+        return q
+    }
+    var rest = strTrim(strSub(s, 6, len(s)))
+
+    // ② 找 FROM（必须在顶层，不在一对括号里）
+    let fromAt = svFindKeyword(rest, "FROM")
+    if (fromAt < 0) {
+        q.error = "缺少 FROM 子句"
+        return q
+    }
+    let projText = strTrim(strSub(rest, 0, fromAt))
+    rest = strTrim(strSub(rest, fromAt + 4, len(rest)))
+
+    // ③ 表名（到空白或末尾）
+    let tblEnd = svIdentEnd(rest, 0)
+    q.tableName = svUnquote(strSub(rest, 0, tblEnd))
+    rest = strTrim(strSub(rest, tblEnd, len(rest)))
+    if (len(q.tableName) == 0) {
+        q.error = "缺少表名"
+        return q
+    }
+
+    // ④ 投影
+    let proj = svSplitTop(projText, ",")
+    var i = 0
+    while (i < len(proj)) {
+        let p = strTrim(toString(proj[i]))
+        if (len(p) == 0) {
+            q.error = "投影列表里有空项"
+            return q
+        }
+        arrPush(q.projection, svNormProjection(p))
+        i = i + 1
+    }
+    if (len(q.projection) == 0) {
+        q.error = "投影列表为空"
+        return q
+    }
+
+    // ⑤ WHERE
+    if (svStartsWithCi(rest, "WHERE")) {
+        rest = strTrim(strSub(rest, 5, len(rest)))
+        // WHERE 之后到 LIMIT（若有）为止
+        let limAt = svFindKeyword(rest, "LIMIT")
+        var condText = rest
+        if (limAt >= 0) {
+            condText = strTrim(strSub(rest, 0, limAt))
+            rest = strTrim(strSub(rest, limAt, len(rest)))
+        } else {
+            rest = ""
+        }
+        if (!svParseCondition(condText, q)) { return q }
+    }
+
+    // ⑥ LIMIT
+    if (svStartsWithCi(rest, "LIMIT")) {
+        let limText = strTrim(strSub(rest, 5, len(rest)))
+        let n = toIntOr(limText, 0 - 1)
+        if (n < 0) {
+            q.error = "LIMIT 后面需要一个非负整数，实际是 `" + limText + "`"
+            return q
+        }
+        q.limit = n
+        rest = ""
+    }
+
+    // ⑦ 剩余内容必须为空 —— 这是「不支持的特性」的拦截点
+    if (len(rest) > 0) {
+        q.error = "SQL 里还有不支持的部分：`" + sqlHead(rest, 40) + "`。" +
+                  "本驱动支持 SELECT / WHERE（单个等值或比较）/ LIMIT / 聚合，不支持 JOIN、ORDER BY、GROUP BY、子查询"
+        return q
+    }
+
+    q.ok = true
+    return q
+}
+
+// 多个空白压成一个空格。SQL 里换行/多空格都一样。
+fn svCollapseWs(s: String) -> String {
+    var out = ""
+    var i = 0
+    var prevSpace = false
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+            if (!prevSpace) { out = out + " " }
+            prevSpace = true
+        } else {
+            out = out + c
+            prevSpace = false
+        }
+        i = i + 1
+    }
+    return strTrim(out)
+}
+
+// 在顶层（不在括号/引号内）找关键词的位置。找不到返回 -1。
+fn svFindKeyword(s: String, kw: String) -> Int {
+    let n = len(kw)
+    var i = 0
+    var depth = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == "'" || c == "\"" || c == "`") {
+            i = svSkipQuoted(s, i)
+            continue
+        }
+        if (c == "(") { depth = depth + 1 }
+        else if (c == ")") { depth = depth - 1 }
+        else if (depth == 0 && i + n <= len(s)) {
+            if (strLower(strSub(s, i, i + n)) == strLower(kw)) {
+                // 前后必须是边界（非标识符字符），否则 `FROMAGE` 会被
+                // 当成 FROM。
+                let before = 1
+                if (i == 0) { before = 1 }
+                else {
+                    let pc = strAt(s, i - 1)
+                    if (pc == " " || pc == "\t" || pc == "(" || pc == ",") { before = 1 }
+                    else { before = 0 }
+                }
+                var afterOk = 0
+                if (i + n >= len(s)) { afterOk = 1 }
+                else {
+                    let nc = strAt(s, i + n)
+                    if (nc == " " || nc == "\t" || nc == "(" || nc == "," || nc == ")" || nc == ";") {
+                        afterOk = 1
+                    }
+                }
+                if (before == 1 && afterOk == 1) { return i }
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 标识符到哪里结束（空白 / 逗号 / ';' / '(' / ')'）。
+fn svIdentEnd(s: String, start: Int) -> Int {
+    var i = start
+    // 引号名的整体跳过
+    if (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == "`" || c == "\"" || c == "[") {
+            return svSkipQuoted(s, i)
+        }
+    }
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == " " || c == "\t" || c == "," || c == ";" || c == "(" || c == ")") { break }
+        i = i + 1
+    }
+    return i
+}
+
+// 规范化一个投影项：
+//   `*`        → "*"
+//   `COUNT(*)` → "COUNT:*"
+//   `SUM(x)`   → "SUM:x"
+//   `x`        → "x"
+fn svNormProjection(p: String) -> String {
+    if (p == "*") { return "*" }
+    let lp = strFind(p, "(")
+    if (lp < 0) { return svUnquote(p) }
+
+    let fname = strUpper(strTrim(strSub(p, 0, lp)))
+    let rp = strFind(p, ")")
+    if (rp < 0 || rp < lp) { return svUnquote(p) }
+    let arg = strTrim(strSub(p, lp + 1, rp))
+    return fname + ":" + arg
+}
+
+// 解析 WHERE 条件。只支持单个比较（不接受 AND / OR）。
+fn svParseCondition(cond: String, q: SvQuery) -> Bool {
+    let c = strTrim(cond)
+    if (len(c) == 0) {
+        q.error = "WHERE 后面缺条件"
+        return false
+    }
+
+    // 明确拦截逻辑运算 —— 静默忽略第二个条件会让结果偏多
+    if (svFindKeyword(c, "AND") >= 0 || svFindKeyword(c, "OR") >= 0) {
+        q.error = "不支持 AND / OR（静默忽略部分条件会返回多余的行）。" +
+                  "请用全表扫描 `SELECT * FROM t` 后自行过滤"
+        return false
+    }
+    if (svFindKeyword(c, "IN") >= 0 && svFindKeyword(c, "=") < 0) {
+        q.error = "不支持 IN，请改用多个单条件查询或在调用方过滤"
+        return false
+    }
+
+    // 按运算符长度从长到短匹配，避免 `<=` 被 `=` 抢走。
+    let ops = ["<=", ">=", "!=", "<>", "=", "<", ">"]
+    var i = 0
+    while (i < len(ops)) {
+        let op = toString(ops[i])
+        let at = svFindOperator(c, op)
+        if (at >= 0) {
+            q.hasWhere = true
+            q.whereCol = svUnquote(strTrim(strSub(c, 0, at)))
+            q.whereOp  = op
+            q.whereVal = svNormLiteral(strTrim(strSub(c, at + len(op), len(c))))
+            return true
+        }
+        i = i + 1
+    }
+
+    q.error = "无法解析 WHERE 条件：`" + c + "`（支持 = != <> < <= > >=）"
+    return false
+}
+
+// 在引号外找运算符。运算符优先长匹配由调用方保证。
+fn svFindOperator(c: String, op: String) -> Int {
+    let n = len(op)
+    var i = 0
+    while (i + n <= len(c)) {
+        let ch = strAt(c, i)
+        if (ch == "'" || ch == "\"" || ch == "`") {
+            i = svSkipQuoted(c, i)
+            continue
+        }
+        if (strSub(c, i, i + n) == op) {
+            // `<>` 与 `<=` 这类要确认不是更长运算符的一部分
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 规范化字面量：去掉包裹的引号，保留内容。
+fn svNormLiteral(v: String) -> String {
+    if (len(v) >= 2) {
+        let c0 = strAt(v, 0)
+        let cn = strAt(v, len(v) - 1)
+        if ((c0 == "'" && cn == "'") || (c0 == "\"" && cn == "\"")) {
+            // 去掉首尾引号，并把内部的''还原成'
+            let inner = strSub(v, 1, len(v) - 1)
+            return inner
+        }
+    }
+    return v
+}

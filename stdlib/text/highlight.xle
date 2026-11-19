@@ -1,0 +1,677 @@
+// ============================================================
+// std.text.highlight —— 词法着色
+// ============================================================
+//
+// ── 只做「词法」，不做语法 ────────────────────────────────
+//
+// 编辑器要在每帧给可见的几十行着色，预算只有几毫秒。真正的语法
+// 分析（AST、作用域、类型）代价是每行几十微秒到毫秒级，而且需要
+// 跨文件信息。Notepad++ 的着色本质也是词法级：关键字表 + 字符串
+// + 注释，足够让人一眼分清结构。所以这里的分界线是：**不解析，
+// 只扫描字符**。
+//
+// ── 为什么用「关键字串」而不是数组 ────────────────────────
+//
+// 每次判断一个标识符是否是关键字，如果遍历 200 个字符串的数组，
+// 一帧 40 行 × 20 个标识符 × 200 = 16 万次字符串比较。改成把关键字
+// 拼成 "|fn|class|..." 后做一次 strFind("|" + w + "|")，命中与否
+// 都只走一次优化的子串搜索。这也避免了顶层数组常量（语言暂不支持）。
+//
+// ── 跨行状态 ──────────────────────────────────────────
+//
+// 块注释、HTML 注释、Python 三引号、Markdown 围栏都无法在单行内
+// 判定结束。hlLine 返回 [tokens, newState]，调用方把 newState 传给
+// 下一行。状态值本身就是「我在等什么结束符」：
+//
+//   0 普通   1 等 "* /"   2 等 "-->"   3 等 "'''"   5 等 '"""'   4 等围栏
+//
+// 状态只增不减地往下传，遇到修改就整篇重算，不做增量。
+
+const LANG_NONE = 0
+const LANG_X    = 1
+const LANG_C    = 2
+const LANG_JSON = 3
+const LANG_HTML = 4
+const LANG_PY   = 5
+const LANG_MD   = 6
+const LANG_INI  = 7
+
+const TK_NORM = 0
+const TK_KW   = 1
+const TK_STR  = 2
+const TK_CMT  = 3
+const TK_NUM  = 4
+const TK_FUNC = 5
+const TK_TYPE = 6
+const TK_PRE  = 7
+const TK_TAG  = 8
+const TK_ATTR = 9
+const TK_KEY  = 10
+const TK_OP   = 11
+const TK_LINK = 12
+const TK_BOLD = 13
+const TK_ANNO = 14
+
+// ── 关键字表 ─────────────────────────────────────────
+
+const HL_KW_X = "|fn|class|struct|interface|let|var|const|if|else|while|for|in|return|break|continue|import|from|as|new|static|abstract|extends|implements|public|private|protected|final|self|null|true|false|match|switch|case|default|enum|throw|try|catch|finally|fail|typeof|await|async|yield|do|loop|until|and|or|not|is|"
+
+const HL_TYPE_X = "|Int|Float|String|Bool|Void|Null|Array|Any|Map|"
+
+// 中文关键字。.xlc 里这些词由词法器归一化，但着色看的是原始文本，
+// 所以必须单独列出来，否则中文源码会「关键字不着色」。
+const HL_KW_ZH = "|令|设|函数|类|结构|接口|如果|否则|当|循环|直到|对于|遍历|返回|跳出|继续|引入|导入|使用|从|新建|空|真|假|尝试|捕获|终止|匹配|情况|默认|静态|公开|私有|继承|实现|自我|类型|断言|"
+
+const HL_KW_C = "|auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|restrict|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while|bool|class|public|private|protected|virtual|override|namespace|using|template|typename|this|import|package|extends|implements|interface|var|let|function|async|await|try|catch|finally|throw|new|delete|of|in|instanceof|typeof|true|false|null|undefined|console|String|Number|Boolean|Object|Array|"
+
+const HL_TYPE_C = "|int|char|float|double|void|bool|size_t|uint8_t|int8_t|uint16_t|int16_t|uint32_t|int32_t|uint64_t|int64_t|String|Number|Boolean|Object|List|Map|Set|"
+
+const HL_KW_PY = "|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|True|False|None|self|"
+
+const HL_KW_JSON = "|true|false|null|"
+
+// ── 字符分类 ─────────────────────────────────────────
+
+fn hlIsDigit(cp: Int) -> Bool { return cp >= 48 && cp <= 57 }
+
+fn hlIsIdentStart(cp: Int) -> Bool {
+    if (cp >= 65 && cp <= 90) { return true }
+    if (cp >= 97 && cp <= 122) { return true }
+    if (cp == 95) { return true }
+    if (cp >= 128) { return true }       // 中文标识符
+    return false
+}
+
+fn hlIsIdentChar(cp: Int) -> Bool {
+    if (hlIsIdentStart(cp)) { return true }
+    return hlIsDigit(cp)
+}
+
+fn hlIsOpChar(c: String) -> Bool {
+    if (c == "=") { return true }
+    if (c == "+") { return true }
+    if (c == "-") { return true }
+    if (c == "*") { return true }
+    if (c == "/") { return true }
+    if (c == "%") { return true }
+    if (c == "<") { return true }
+    if (c == ">") { return true }
+    if (c == "!") { return true }
+    if (c == "&") { return true }
+    if (c == "|") { return true }
+    if (c == "^") { return true }
+    if (c == "~") { return true }
+    if (c == "?") { return true }
+    return false
+}
+
+fn hlHasKw(kwstr: String, w: String) -> Bool {
+    return strFind(kwstr, "|" + w + "|") >= 0
+}
+
+fn hlIndent(line: String) -> Int {
+    var i = 0
+    while (i < len(line)) {
+        let c = strAt(line, i)
+        if (c == " " || c == "\t") { i = i + 1 } else { return i }
+    }
+    return i
+}
+
+// ── 扫描辅助 ─────────────────────────────────────────
+
+fn hlEmit(out: Array, start: Int, n: Int, kind: Int) {
+    if (n > 0) { arrPush(out, [start, n, kind]) }
+}
+
+// 从引号处扫到闭合引号之后。未闭合时返回行尾（不跨行）。
+fn hlScanStr(line: String, start: Int, quote: String) -> Int {
+    var i = start + 1
+    while (i < len(line)) {
+        let c = strAt(line, i)
+        if (c == "\\") { i = i + 2; continue }
+        if (c == quote) { return i + 1 }
+        i = i + 1
+    }
+    return len(line)
+}
+
+fn hlScanNum(line: String, start: Int) -> Int {
+    var i = start
+    var seenDot = false
+    while (i < len(line)) {
+        let c = strAt(line, i)
+        let cp = strCode(c)
+        if (hlIsDigit(cp)) { i = i + 1; continue }
+        if (c == "." && !seenDot) { seenDot = true; i = i + 1; continue }
+        if ((cp >= 97 && cp <= 102) || (cp >= 65 && cp <= 70)) { i = i + 1; continue }
+        if (c == "+" || c == "-") {
+            let prev = strAt(line, i - 1)
+            if (prev == "e" || prev == "E") { i = i + 1; continue }
+            break
+        }
+        break
+    }
+    return i
+}
+
+// ── C 系（含 X）──────────────────────────────────────
+
+fn hlLineC(line: String, state: Int) -> Array {
+    let out = []
+    let n = len(line)
+    var st = state
+    var i = 0
+
+    // 块注释续行
+    if (st == 1) {
+        let close = strFind(line, "*/")
+        if (close < 0) {
+            hlEmit(out, 0, n, TK_CMT)
+            return [out, 1]
+        }
+        hlEmit(out, 0, close + 2, TK_CMT)
+        i = close + 2
+        st = 0
+    }
+
+    // 预处理指令：首个非空白是 '#'
+    let ind = hlIndent(line)
+    if (ind < n && strAt(line, ind) == "#") {
+        hlEmit(out, ind, n - ind, TK_PRE)
+        return [out, 0]
+    }
+
+    while (i < n) {
+        let c = strAt(line, i)
+        let two = strSub(line, i, i + 2)
+
+        if (two == "//") {
+            hlEmit(out, i, n - i, TK_CMT)
+            break
+        }
+        if (two == "/*") {
+            let close = strFindFrom(line, "*/", i + 2)
+            if (close < 0) {
+                hlEmit(out, i, n - i, TK_CMT)
+                return [out, 1]
+            }
+            hlEmit(out, i, close + 2 - i, TK_CMT)
+            i = close + 2
+            continue
+        }
+        if (c == "\"" || c == "'") {
+            let e = hlScanStr(line, i, c)
+            hlEmit(out, i, e - i, TK_STR)
+            i = e
+            continue
+        }
+        if (hlIsDigit(strCode(c))) {
+            let e = hlScanNum(line, i)
+            hlEmit(out, i, e - i, TK_NUM)
+            i = e
+            continue
+        }
+        if (hlIsIdentStart(strCode(c))) {
+            var j = i + 1
+            while (j < n && hlIsIdentChar(strCode(strAt(line, j)))) { j = j + 1 }
+            let w = strSub(line, i, j)
+            var k = TK_NORM
+            if (hlHasKw(HL_KW_C, w) || hlHasKw(HL_KW_X, w) || hlHasKw(HL_KW_ZH, w)) {
+                k = TK_KW
+            } else if (hlHasKw(HL_TYPE_C, w) || hlHasKw(HL_TYPE_X, w)) {
+                k = TK_TYPE
+            } else {
+                var q = j
+                while (q < n && strAt(line, q) == " ") { q = q + 1 }
+                if (q < n && strAt(line, q) == "(") { k = TK_FUNC }
+            }
+            if (k != TK_NORM) { hlEmit(out, i, j - i, k) }
+            i = j
+            continue
+        }
+        if (c == "{" || c == "}" || c == "(" || c == ")" || c == "[" || c == "]") {
+            i = i + 1
+            continue
+        }
+        if (hlIsOpChar(c)) {
+            hlEmit(out, i, 1, TK_OP)
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    return [out, st]
+}
+
+// ── JSON ───────────────────────────────────────────
+
+fn hlLineJSON(line: String, state: Int) -> Array {
+    let out = []
+    let n = len(line)
+    var st = state
+    var i = 0
+    if (st == 1) {
+        let close = strFind(line, "*/")
+        if (close < 0) {
+            hlEmit(out, 0, n, TK_CMT)
+            return [out, 1]
+        }
+        hlEmit(out, 0, close + 2, TK_CMT)
+        i = close + 2
+        st = 0
+    }
+    while (i < n) {
+        let c = strAt(line, i)
+        let two = strSub(line, i, i + 2)
+        if (two == "//") {
+            hlEmit(out, i, n - i, TK_CMT)
+            break
+        }
+        if (two == "/*") {
+            let close = strFindFrom(line, "*/", i + 2)
+            if (close < 0) {
+                hlEmit(out, i, n - i, TK_CMT)
+                return [out, 1]
+            }
+            hlEmit(out, i, close + 2 - i, TK_CMT)
+            i = close + 2
+            continue
+        }
+        if (c == "\"") {
+            let e = hlScanStr(line, i, "\"")
+            // 字符串后面跟 ':' → 这是键
+            var q = e
+            while (q < n && (strAt(line, q) == " " || strAt(line, q) == "\t")) { q = q + 1 }
+            if (q < n && strAt(line, q) == ":") {
+                hlEmit(out, i, e - i, TK_KEY)
+            } else {
+                hlEmit(out, i, e - i, TK_STR)
+            }
+            i = e
+            continue
+        }
+        if (hlIsDigit(strCode(c)) || (c == "-" && hlIsDigit(strCode(strAt(line, i + 1))))) {
+            let e = hlScanNum(line, i)
+            hlEmit(out, i, e - i, TK_NUM)
+            i = e
+            continue
+        }
+        if (hlIsIdentStart(strCode(c))) {
+            var j = i + 1
+            while (j < n && hlIsIdentChar(strCode(strAt(line, j)))) { j = j + 1 }
+            let w = strSub(line, i, j)
+            if (hlHasKw(HL_KW_JSON, w)) { hlEmit(out, i, j - i, TK_KW) }
+            i = j
+            continue
+        }
+        if (c == ":" || c == "," || c == "{" || c == "}" || c == "[" || c == "]") {
+            hlEmit(out, i, 1, TK_OP)
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    return [out, st]
+}
+
+// ── HTML / XML ──────────────────────────────────────
+
+// 解析从 i 开始的标签，返回标签之后的位置。
+fn hlHtmlTag(line: String, i: Int, out: Array) -> Int {
+    let n = len(line)
+    var j = i + 1
+    hlEmit(out, i, 1, TK_TAG)             // '<'
+    if (j < n && strAt(line, j) == "/") {
+        hlEmit(out, j, 1, TK_TAG)
+        j = j + 1
+    }
+    // 标签名
+    var ns = j
+    while (j < n) {
+        let c = strAt(line, j)
+        if (hlIsIdentChar(strCode(c)) || c == "-" || c == ":" || c == ".") {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    if (j > ns) { hlEmit(out, ns, j - ns, TK_TAG) }
+
+    // 属性区
+    while (j < n) {
+        let c = strAt(line, j)
+        if (c == ">") {
+            hlEmit(out, j, 1, TK_TAG)
+            j = j + 1
+            break
+        }
+        if (c == "\"" || c == "'") {
+            let e = hlScanStr(line, j, c)
+            hlEmit(out, j, e - j, TK_STR)
+            j = e
+            continue
+        }
+        if (hlIsIdentStart(strCode(c))) {
+            var s = j
+            while (j < n) {
+                let d = strAt(line, j)
+                if (hlIsIdentChar(strCode(d)) || d == "-" || d == ":") { j = j + 1 } else { break }
+            }
+            hlEmit(out, s, j - s, TK_ATTR)
+            continue
+        }
+        j = j + 1
+    }
+    return j
+}
+
+fn hlLineHTML(line: String, state: Int) -> Array {
+    let out = []
+    let n = len(line)
+    var st = state
+    var i = 0
+    if (st == 2) {
+        let close = strFind(line, "-->")
+        if (close < 0) {
+            hlEmit(out, 0, n, TK_CMT)
+            return [out, 2]
+        }
+        hlEmit(out, 0, close + 3, TK_CMT)
+        i = close + 3
+        st = 0
+    }
+    while (i < n) {
+        if (strSub(line, i, i + 4) == "<!--") {
+            let close = strFindFrom(line, "-->", i + 4)
+            if (close < 0) {
+                hlEmit(out, i, n - i, TK_CMT)
+                return [out, 2]
+            }
+            hlEmit(out, i, close + 3 - i, TK_CMT)
+            i = close + 3
+            continue
+        }
+        if (strAt(line, i) == "<") {
+            let j = hlHtmlTag(line, i, out)
+            if (j <= i) { i = i + 1 } else { i = j }
+            continue
+        }
+        i = i + 1
+    }
+    return [out, st]
+}
+
+// ── Python ─────────────────────────────────────────
+
+fn hlLinePy(line: String, state: Int) -> Array {
+    let out = []
+    let n = len(line)
+    var st = state
+    var i = 0
+
+    // 三引号续行
+    if (st == 3 || st == 5) {
+        var q = "'''"
+        if (st == 5) { q = "\"\"\"" }
+        let close = strFind(line, q)
+        if (close < 0) {
+            hlEmit(out, 0, n, TK_STR)
+            return [out, st]
+        }
+        hlEmit(out, 0, close + 3, TK_STR)
+        i = close + 3
+        st = 0
+    }
+
+    var afterDef = false
+    while (i < n) {
+        let c = strAt(line, i)
+        if (c == "#") {
+            hlEmit(out, i, n - i, TK_CMT)
+            break
+        }
+        let three = strSub(line, i, i + 3)
+        if (three == "'''" || three == "\"\"\"") {
+            let close = strFindFrom(line, three, i + 3)
+            if (close < 0) {
+                hlEmit(out, i, n - i, TK_STR)
+                if (three == "'''") { return [out, 3] }
+                return [out, 5]
+            }
+            hlEmit(out, i, close + 3 - i, TK_STR)
+            i = close + 3
+            continue
+        }
+        if (c == "\"" || c == "'") {
+            let e = hlScanStr(line, i, c)
+            hlEmit(out, i, e - i, TK_STR)
+            i = e
+            continue
+        }
+        if (c == "@") {
+            var j = i + 1
+            while (j < n && hlIsIdentChar(strCode(strAt(line, j)))) { j = j + 1 }
+            hlEmit(out, i, j - i, TK_ANNO)
+            i = j
+            continue
+        }
+        if (hlIsDigit(strCode(c))) {
+            let e = hlScanNum(line, i)
+            hlEmit(out, i, e - i, TK_NUM)
+            i = e
+            continue
+        }
+        if (hlIsIdentStart(strCode(c))) {
+            var j = i + 1
+            while (j < n && hlIsIdentChar(strCode(strAt(line, j)))) { j = j + 1 }
+            let w = strSub(line, i, j)
+            var k = TK_NORM
+            if (hlHasKw(HL_KW_PY, w)) { k = TK_KW }
+            else if (afterDef) { k = TK_FUNC }
+            else {
+                var q = j
+                while (q < n && strAt(line, q) == " ") { q = q + 1 }
+                if (q < n && strAt(line, q) == "(") { k = TK_FUNC }
+            }
+            if (k != TK_NORM) { hlEmit(out, i, j - i, k) }
+            if (w == "def" || w == "class") { afterDef = true } else { afterDef = false }
+            i = j
+            continue
+        }
+        if (hlIsOpChar(c)) {
+            hlEmit(out, i, 1, TK_OP)
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    return [out, st]
+}
+
+// ── Markdown ───────────────────────────────────────
+
+fn hlLineMD(line: String, state: Int) -> Array {
+    let out = []
+    let n = len(line)
+    let ind = hlIndent(line)
+    let body = strSub(line, ind, n)
+
+    if (state == 4) {
+        if (strStarts(body, "```")) {
+            hlEmit(out, ind, 3, TK_CMT)
+            return [out, 0]
+        }
+        hlEmit(out, 0, n, TK_CMT)
+        return [out, 4]
+    }
+    if (strStarts(body, "```")) {
+        hlEmit(out, ind, 3, TK_CMT)
+        return [out, 4]
+    }
+    if (len(body) == 0) { return [out, 0] }
+    if (strAt(body, 0) == "#") {
+        hlEmit(out, ind, n - ind, TK_KW)
+        return [out, 0]
+    }
+    if (strAt(body, 0) == ">") {
+        hlEmit(out, ind, n - ind, TK_CMT)
+        return [out, 0]
+    }
+
+    // 列表标记
+    if (strStarts(body, "- ") || strStarts(body, "* ") || strStarts(body, "+ ")) {
+        hlEmit(out, ind, 2, TK_KW)
+    } else {
+        var d = 0
+        while (d < len(body) && hlIsDigit(strCode(strAt(body, d)))) { d = d + 1 }
+        if (d > 0 && d < len(body) && strAt(body, d) == ".") {
+            hlEmit(out, ind, d + 1, TK_KW)
+        }
+    }
+
+    // 行内
+    var i = 0
+    while (i < n) {
+        let c = strAt(line, i)
+        if (c == "`") {
+            let e = strFindFrom(line, "`", i + 1)
+            if (e > i) {
+                hlEmit(out, i, e + 1 - i, TK_STR)
+                i = e + 1
+                continue
+            }
+        }
+        if (strSub(line, i, i + 2) == "**") {
+            let e = strFindFrom(line, "**", i + 2)
+            if (e > i) {
+                hlEmit(out, i, e + 2 - i, TK_BOLD)
+                i = e + 2
+                continue
+            }
+        }
+        if (c == "[") {
+            let mid = strFindFrom(line, "](", i + 1)
+            if (mid > i) {
+                let e = strFindFrom(line, ")", mid + 2)
+                if (e > mid) {
+                    hlEmit(out, i, e + 1 - i, TK_LINK)
+                    i = e + 1
+                    continue
+                }
+            }
+        }
+        i = i + 1
+    }
+    return [out, 0]
+}
+
+// ── INI / conf ─────────────────────────────────────
+
+fn hlLineINI(line: String, state: Int) -> Array {
+    let out = []
+    let n = len(line)
+    let ind = hlIndent(line)
+    if (ind >= n) { return [out, 0] }
+    let c0 = strAt(line, ind)
+    if (c0 == ";" || c0 == "#") {
+        hlEmit(out, ind, n - ind, TK_CMT)
+        return [out, 0]
+    }
+    if (c0 == "[") {
+        let close = strFindFrom(line, "]", ind + 1)
+        if (close < 0) {
+            hlEmit(out, ind, n - ind, TK_KEY)
+        } else {
+            hlEmit(out, ind, close + 1 - ind, TK_KEY)
+        }
+        return [out, 0]
+    }
+    let eq = strFind(line, "=")
+    if (eq < 0) { return [out, 0] }
+    hlEmit(out, ind, eq - ind, TK_KEY)
+
+    // 值里的引号串
+    var i = eq + 1
+    while (i < n) {
+        let c = strAt(line, i)
+        if (c == "\"" || c == "'") {
+            let e = hlScanStr(line, i, c)
+            hlEmit(out, i, e - i, TK_STR)
+            i = e
+            continue
+        }
+        i = i + 1
+    }
+    return [out, 0]
+}
+
+// ── 对外入口 ───────────────────────────────────────
+
+// 返回 [tokens, newState]。tokens 每项 [start, len, kind]，
+// 只包含需要着色的片段；没被覆盖的字符按普通正文绘制。
+fn hlLine(line: String, lang: Int, state: Int) -> Array {
+    if (lang == LANG_X)    { return hlLineC(line, state) }
+    if (lang == LANG_C)    { return hlLineC(line, state) }
+    if (lang == LANG_JSON) { return hlLineJSON(line, state) }
+    if (lang == LANG_HTML) { return hlLineHTML(line, state) }
+    if (lang == LANG_PY)   { return hlLinePy(line, state) }
+    if (lang == LANG_MD)   { return hlLineMD(line, state) }
+    if (lang == LANG_INI)  { return hlLineINI(line, state) }
+    let none = []
+    return [none, 0]
+}
+
+fn hlLangFromPath(path: String) -> Int {
+    var dot = 0 - 1
+    var i = len(path) - 1
+    while (i >= 0) {
+        let c = strAt(path, i)
+        if (c == ".") {
+            dot = i
+            i = 0 - 1
+        } else if (c == "/" || c == "\\") {
+            i = 0 - 1
+        } else {
+            i = i - 1
+        }
+    }
+    if (dot < 0) { return LANG_NONE }
+    let e = strLower(strSub(path, dot + 1, len(path)))
+    if (e == "xle" || e == "xlc" || e == "x") { return LANG_X }
+    if (e == "c" || e == "h" || e == "cpp" || e == "hpp" || e == "cc" || e == "cxx") { return LANG_C }
+    if (e == "java" || e == "js" || e == "ts" || e == "jsx" || e == "tsx" || e == "go" || e == "rs" || e == "cs" || e == "kt") { return LANG_C }
+    if (e == "json" || e == "jsonc") { return LANG_JSON }
+    if (e == "html" || e == "htm" || e == "xml" || e == "svg" || e == "xaml") { return LANG_HTML }
+    if (e == "py" || e == "pyw") { return LANG_PY }
+    if (e == "md" || e == "markdown") { return LANG_MD }
+    if (e == "ini" || e == "conf" || e == "toml" || e == "cfg" || e == "properties") { return LANG_INI }
+    return LANG_NONE
+}
+
+fn hlLangName(lang: Int) -> String {
+    if (lang == LANG_X)    { return "X" }
+    if (lang == LANG_C)    { return "C/C++/JS" }
+    if (lang == LANG_JSON) { return "JSON" }
+    if (lang == LANG_HTML) { return "HTML/XML" }
+    if (lang == LANG_PY)   { return "Python" }
+    if (lang == LANG_MD)   { return "Markdown" }
+    if (lang == LANG_INI)  { return "INI/conf" }
+    return "普通文本"
+}
+
+// Markdown 的围栏判定需要跨行状态从 0 开始；提供一个整篇预扫描，
+// 供视图在文档修改后一次性算出每行的起始状态。
+// 返回值：states[i] 是第 i 行**开始**时的状态。
+fn hlStates(lines: Array, lang: Int) -> Array {
+    let out = []
+    var st = 0
+    var i = 0
+    while (i < len(lines)) {
+        arrPush(out, st)
+        let r = hlLine(toString(lines[i]), lang, st)
+        st = toInt(r[1])
+        i = i + 1
+    }
+    return out
+}

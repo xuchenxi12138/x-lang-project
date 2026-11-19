@@ -1,0 +1,426 @@
+// ui/display/filepicker.xle — 文件选择器（目录浏览 + 选中路径）
+//
+// ── 为什么文件选择器只能自己实现 ────────────────────
+//
+// 桌面框架通常提供系统原生对话框（Windows 的 GetOpenFileName）。
+// 但当前窗口层没有这个能力 —— 公共 API 里没有任何「弹出系统
+// 对话框」的函数。所以必须用 fsList 自己列目录。
+//
+// ── 这个实现刻意做到什么程度 ────────────────────
+//
+// 它**不是**一个完整的文件管理器。刻意不做的：
+//
+//   · 不排序（按 fsList 的原始顺序，通常就是文件系统的顺序）
+//   · 不搜索、不过滤（过滤交给调用方在 setFilter 后自己筛）
+//   · 不支持多选
+//   · 不支持新建文件夹 / 重命名 / 删除
+//
+// 做的事情只有：列目录、进目录、返回上一层、选中一个文件或目录。
+// 这覆盖了「选一个配置文件的路径」这类真实需求，而复杂度控制在
+// 一个文件里。
+//
+// ── 路径分隔符 ─────────────────────────────
+//
+// 统一用 "/"。Windows 的 API 两种都接受，而 "/" 在拼接时不需要
+// 转义，也让代码在类 Unix 上不用改。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../control/field.xle" import Field, FIELD_PAD
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+from "listbase.xle" import ListBase, LIST_ROW_H
+
+// 路径栏高度。
+const FP_PATH_H = 36
+
+// 文件列表行高。
+const FP_ROW_H = 26
+
+class FilePicker extends Widget {
+    // 当前目录（绝对路径，以 / 结尾或不带，两种都能处理）。
+    dir: String,
+
+    // 当前目录下的条目（文件名 + 子目录名）。
+    entries: Array,
+
+    // 选中的条目索引。-1 表示没有。
+    selected: Int,
+
+    // 列表滚动偏移。
+    offset: Int,
+
+    // 只显示以这些后缀结尾的文件。空数组表示不过滤。
+    //
+    // ── 为什么过滤在选择器里做而不是在 fsList 之后 ─────
+    //
+    // 因为要过滤的通常还有「目录」—— 目录永远要显示（否则进不去）。
+    // 这个规则如果交给调用方，每个调用点都会写一遍「保留目录 +
+    // 匹配后缀」，而漏掉「保留目录」就会让用户进不去子目录。
+    exts: Array,
+
+    // 是否允许选中目录（默认只选文件）。
+    allowDir: Bool,
+
+    // 确认标志。调用方读它拿结果。
+    confirmed: Bool,
+
+    constructor(r: Rect, dir: String) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.dir       = dir
+        self.entries   = []
+        self.selected  = 0 - 1
+        self.offset    = 0
+        self.exts      = []
+        self.allowDir  = false
+        self.confirmed = false
+        self.style     = Style.plain()
+        self.reload()
+    }
+
+    static fn of(r: Rect, dir: String) -> FilePicker {
+        return new FilePicker(r, dir)
+    }
+
+    // 只列指定后缀（如 [".xle", ".xlc"]）。传空数组取消过滤。
+    fn setFilter(xs: Array) -> FilePicker {
+        self.exts = xs
+        self.reload()
+        return self
+    }
+
+    fn setAllowDir(v: Bool) -> FilePicker {
+        self.allowDir = v
+        return self
+    }
+
+    // ── 目录读取 ─────────────────────────────────
+
+    // 重新读目录。进入/退出目录、刷新时调。
+    fn reload() {
+        var out = []
+
+        // ".." 作为第一项（如果不是根目录）。这样「返回上一层」
+        // 就是选第一项，不需要额外的按钮。
+        if (len(self.dir) > 1) {
+            arrPush(out, "..")
+        }
+
+        let raw = fsList(self.dir)
+        var i = 0
+        while i < len(raw) {
+            let name = toString(raw[i])
+            let full = self.joinPath(self.dir, name)
+            if (fsIsDir(full)) {
+                // 目录永远显示，带一个后缀斜杠以便区分。
+                arrPush(out, name + "/")
+            } else if (self.matches(name)) {
+                arrPush(out, name)
+            }
+            i = i + 1
+        }
+
+        self.entries  = out
+        self.selected = 0 - 1
+        self.offset   = 0
+    }
+
+    // 文件名是否通过后缀过滤。
+    fn matches(name: String) -> Bool {
+        if (len(self.exts) == 0) { return true }
+        var i = 0
+        while i < len(self.exts) {
+            let e = strLower(toString(self.exts[i]))
+            if (strEnds(strLower(name), e)) { return true }
+            i = i + 1
+        }
+        return false
+    }
+
+    // 拼路径。处理 dir 已带结尾斜杠的情况。
+    fn joinPath(dir: String, name: String) -> String {
+        if (len(dir) == 0) { return name }
+        if (strEnds(dir, "/")) { return dir + name }
+        return dir + "/" + name
+    }
+
+    fn entryAt(i: Int) -> String {
+        if (i < 0 || i >= len(self.entries)) { return "" }
+        return toString(self.entries[i])
+    }
+
+    fn isDirEntry(i: Int) -> Bool {
+        let s = self.entryAt(i)
+        if (s == "..") { return true }
+        return strEnds(s, "/")
+    }
+
+    // 选中项的完整路径。
+    fn selectedPath() -> String {
+        if (self.selected < 0) { return "" }
+        let s = self.entryAt(self.selected)
+        if (s == "..") {
+            return self.parentDir()
+        }
+        return self.joinPath(self.dir, s)
+    }
+
+    fn parentDir() -> String {
+        var d = self.dir
+        // 去掉结尾斜杠（根 "/" 除外）。
+        if (len(d) > 1 && strEnds(d, "/")) {
+            d = strSub(d, 0, len(d) - 1)
+        }
+        let k = self.lastSlash(d)
+        if (k <= 0) { return "/" }
+        return strSub(d, 0, k)
+    }
+
+    fn lastSlash(s: String) -> Int {
+        var i = len(s) - 1
+        while i >= 0 {
+            if (strSub(s, i, i + 1) == "/") { return i }
+            i = i - 1
+        }
+        return 0 - 1
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    fn pathRect() -> Rect {
+        return rectOf(self.r.x, self.r.y, self.r.w, FP_PATH_H)
+    }
+
+    fn upRect() -> Rect {
+        return rectOf(self.r.x, self.r.y, 40, FP_PATH_H)
+    }
+
+    fn listRect() -> Rect {
+        return rectOf(self.r.x, self.r.y + FP_PATH_H,
+                      self.r.w, self.r.h - FP_PATH_H)
+    }
+
+    fn visibleRows() -> Int {
+        let lr = self.listRect()
+        if (FP_ROW_H <= 0) { return 0 }
+        return lr.h / FP_ROW_H
+    }
+
+    fn rowRect(i: Int) -> Rect {
+        let lr = self.listRect()
+        let y = lr.y + (i - self.offset) * FP_ROW_H
+        return rectOf(lr.x, y, lr.w, FP_ROW_H)
+    }
+
+    fn rowAt(mx: Int, my: Int) -> Int {
+        let lr = self.listRect()
+        if (!lr.contains(mx, my)) { return 0 - 1 }
+        let i = (my - lr.y) / FP_ROW_H + self.offset
+        if (i < 0 || i >= len(self.entries)) { return 0 - 1 }
+        return i
+    }
+
+    // ── 交互 ────────────────────────────────────
+
+    // 点某一项：目录就进去，文件就选中。
+    //
+    // ── 为什么目录是「单击进入」而不是「双击」 ──────
+    //
+    // 因为窗口层拿不到双击事件（只有 winPollClick 给单次点击）。
+    // 用单击进入虽然和系统对话框的习惯不同，但至少可用；而
+    // 假装支持双击（靠时间差判两次点击）在快速连点时会误进目录。
+    fn click(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+
+        // 返回上一层。
+        if (self.upRect().contains(mx, my)) {
+            self.dir = self.parentDir()
+            self.reload()
+            return true
+        }
+
+        let i = self.rowAt(mx, my)
+        if (i < 0) { return false }
+
+        if (self.isDirEntry(i)) {
+            if (self.entryAt(i) == "..") {
+                self.dir = self.parentDir()
+            } else {
+                self.dir = self.joinPath(self.dir, strSub(self.entryAt(i), 0, len(self.entryAt(i)) - 1))
+            }
+            self.reload()
+            return true
+        }
+
+        self.selected = i
+        return true
+    }
+
+    // 确定。选中文件（或允许时的目录）后置确认标志。
+    fn confirm() -> Bool {
+        if (self.selected < 0) { return false }
+        if (self.isDirEntry(self.selected) && !self.allowDir) { return false }
+        self.confirmed = true
+        return true
+    }
+
+    fn consume() {
+        self.confirmed = false
+    }
+
+    // 键盘：上下移动、Enter 进入/确认、Backspace 返回上层。
+    fn keyDown(key: String) -> Bool {
+        if (!self.vis) { return false }
+        if (key == "Up") {
+            if (self.selected > 0) {
+                self.selected = self.selected - 1
+                self.ensureVisible()
+            }
+            return true
+        }
+        if (key == "Down") {
+            if (self.selected < len(self.entries) - 1) {
+                self.selected = self.selected + 1
+                self.ensureVisible()
+            }
+            return true
+        }
+        if (key == "Enter") {
+            let i = self.selected
+            if (i < 0) { return true }
+            if (self.isDirEntry(i)) {
+                if (self.entryAt(i) == "..") {
+                    self.dir = self.parentDir()
+                } else {
+                    self.dir = self.joinPath(self.dir, strSub(self.entryAt(i), 0, len(self.entryAt(i)) - 1))
+                }
+                self.reload()
+            } else {
+                self.confirm()
+            }
+            return true
+        }
+        if (key == "Backspace") {
+            self.dir = self.parentDir()
+            self.reload()
+            return true
+        }
+        return false
+    }
+
+    fn ensureVisible() {
+        if (self.selected < 0) { return }
+        let vr = self.visibleRows()
+        if (self.selected < self.offset) {
+            self.offset = self.selected
+        }
+        if (self.selected >= self.offset + vr) {
+            self.offset = self.selected - vr + 1
+        }
+        if (self.offset < 0) { self.offset = 0 }
+    }
+
+    fn scroll(delta: Int) -> FilePicker {
+        self.offset = self.offset - delta * 3
+        let mx = len(self.entries) - self.visibleRows()
+        if (mx < 0) { mx = 0 }
+        if (self.offset > mx) { self.offset = mx }
+        if (self.offset < 0) { self.offset = 0 }
+        return self
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.surface)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, th.border)
+
+        // ── 路径栏 ──
+        let pr = self.pathRect()
+        winFillRect(pr.x, pr.y, pr.w, pr.h, th.bg)
+        winFillRect(pr.x, pr.y + pr.h - 1, pr.w, 1, th.border)
+
+        // 返回按钮：一个左箭头。
+        let ur = self.upRect()
+        let mx = winMouseX()
+        let my = winMouseY()
+        let onUp = ur.contains(mx, my)
+        if (onUp) {
+            winFillRound(ur.x + 4, ur.y + 6, ur.w - 8, ur.h - 12, 4, th.surfaceHover)
+        }
+        let ac = th.textDim
+        if (onUp) { ac = th.accent }
+        // 左箭头：一个三角形（三点）。
+        let ax = ur.x + ur.w / 2
+        let ay = ur.y + ur.h / 2
+        let arrow = [ax - 4, ay,  ax + 4, ay - 6,  ax + 4, ay + 6]
+        winPath(arrow, ac)
+
+        // 路径文字。超长时保留**尾部**（当前目录名比根路径有用）。
+        let tx = ur.x + ur.w + 6
+        let avail = pr.w - ur.w - 18
+        var shown = self.dir
+        if (winTextWidth(shown) > avail) {
+            shown = uiEllipsizeEnd(shown, avail)
+        }
+        let ty = pr.y + (pr.h - winTextHeight()) / 2
+        winText(tx, ty, shown, th.text)
+
+        // ── 列表 ──
+        let lr = self.listRect()
+        winClip(lr.x, lr.y, lr.w, lr.h)
+
+        let vr = self.visibleRows()
+        var i = self.offset
+        while i < len(self.entries) && i < self.offset + vr + 1 {
+            let rr = self.rowRect(i)
+            let isSel = (i == self.selected)
+            let onIt = rr.contains(mx, my)
+
+            if (isSel) {
+                winFillRect(rr.x, rr.y, rr.w, rr.h, th.accent)
+            } else if (onIt) {
+                winFillRect(rr.x, rr.y, rr.w, rr.h, th.surfaceHover)
+            }
+
+            let name = self.entryAt(i)
+            var tc = th.text
+            if (isSel) {
+                tc = th.onAccent
+            } else if (self.isDirEntry(i)) {
+                // 目录用主色，和文件的正文色区分开。
+                tc = th.accent
+            }
+            let ny = rr.y + (rr.h - winTextHeight()) / 2
+            winText(rr.x + 10, ny, name, tc)
+            i = i + 1
+        }
+
+        // 空目录提示。
+        if (len(self.entries) == 0) {
+            let msg = "(空目录)"
+            let w = winTextWidth(msg)
+            winText(lr.x + (lr.w - w) / 2, lr.y + lr.h / 2 - winTextHeight() / 2,
+                    msg, th.textDim)
+        }
+
+        winUnclip()
+
+        // 滚动条。
+        let mxo = len(self.entries) - vr
+        if (mxo > 0) {
+            let barH = lr.h * vr / len(self.entries)
+            let travel = lr.h - barH
+            let by = lr.y + self.offset * travel / mxo
+            winFillRound(lr.x + lr.w - 5, by, 4, barH, 2, th.border)
+        }
+    }
+}

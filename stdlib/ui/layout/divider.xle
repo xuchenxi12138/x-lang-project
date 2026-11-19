@@ -1,0 +1,52 @@
+// ui/layout/divider.xle — 分隔线
+//
+// 一条 1px 的线。水平或垂直。
+//
+// ── 为什么给分隔线一个类 ─────────────────────────
+//
+// 因为它需要参与布局（占 1px 高度/宽度），而「画一条线」的绘制
+// 原语不占空间。做成类之后，它就能像别的控件一样被 Cursor 推进
+// 分配空间，视觉上也就自动有了正确的间距。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// ── 为什么给分隔线一个类 ─────────────────────────
+//
+// 因为它需要参与布局（占 1px 高度/宽度），而「画一条线」的绘制
+// 原语不占空间。做成类之后，它就能像别的控件一样被 Cursor 推进
+// 分配空间，视觉上也就自动有了正确的间距。
+class Divider extends Widget {
+    vertical: Bool,
+
+    constructor(r: Rect, vertical: Bool) {
+        self.r        = r
+        self.vis      = true
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.vertical = vertical
+        self.style    = Style.plain()
+    }
+
+    static fn horizontal(r: Rect) -> Divider {
+        return new Divider(r, false)
+    }
+
+    static fn verticalAt(r: Rect) -> Divider {
+        return new Divider(r, true)
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        if (self.vertical) {
+            winFillRect(self.r.x, self.r.y, 1, self.r.h, th.border)
+        } else {
+            winFillRect(self.r.x, self.r.y, self.r.w, 1, th.border)
+        }
+    }
+}

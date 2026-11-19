@@ -1,0 +1,28 @@
+class annos : [Deprecated, Table, Route]
+has Table   : true
+has Nope    : false
+Table args  : [users]
+Route args  : [/api/users, GET, 3]
+Route kv    : [[null, /api/users], [method, GET], [priority, 3]]
+-- 字段 --
+field annos : [Column, Indexed]
+Column args : [user_name, 32]
+Column kv   : [[null, user_name], [len, 32]]
+Indexed args: []
+-- 方法 --
+method annos: [Deprecated, Log]
+Log args    : [warn]
+Log kv      : [[level, warn]]
+Deprecated args: []
+-- 注解不继承 --
+Plain class : []
+Plain has Table: false
+Admin class : [Table]
+Admin has Deprecated: false
+-- 字面量类型 --
+Config kv   : [[name, app], [port, 8080], [ratio, 0.75], [debug, true], [fallback, null], [negative, -7]]
+-- 按注决定行为 --
+User -> table users
+Plain -> not an entity
+Admin -> table admins
+entity count: 2

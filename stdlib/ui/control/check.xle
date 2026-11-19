@@ -1,0 +1,98 @@
+// ui/control/check.xle — 复选框（方框 + 对勾）
+//
+// ── 这一个文件里有什么 ──────────────────────────
+//
+// 只有 Check 一个类，加上它专用的私有辅助（thickLine）。
+// 共享的布局逻辑在 toggle.xle 的 Toggle 基类里。
+//
+// ── 为什么对勾不用字符 "✓" ─────────────────────
+//
+// 字体里有没有那个字形不可控。当前窗口层用的是系统默认字体，
+// 中文 Windows 上大概率有，但换个环境（比如精简的 Wine 容器）
+// 就可能画成一个方块 —— 而这种问题只在别人的机器上出现。
+//
+// 线段则永远画得出来。两条短直线拼成的对勾视觉上完全等价，
+// 代价是多几十行几何代码，但换来「在哪都长一样」。
+
+from "toggle.xle" import Toggle, CK_BOX, CK_GAP
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+class Check extends Toggle {
+    constructor(r: Rect, label: String, on: Bool) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.label     = label
+        self.on        = on
+        self.tintColor = UI_NONE
+        self.style     = Style.plain()
+    }
+
+    static fn of(r: Rect, label: String, on: Bool) -> Check {
+        return new Check(r, label, on)
+    }
+
+    fn drawIndicator(th: Theme, b: Rect) {
+        // 底：选中时用主色填充，未选中时用面板色 + 描边。
+        //
+        // 未选中态也要有描边而不是「什么都没有」—— 空白区域在
+        // 深色主题上会让用户找不到控件在哪。
+        let filled = self.on && self.enabled
+        var fill = th.surface
+        var border = th.border
+        var mark = th.onAccent
+
+        if (filled) {
+            fill = th.accent
+            if (self.hovered) { fill = th.accentDark }
+            border = th.accent
+        } else if (self.hovered && self.enabled) {
+            fill = th.surfaceHover
+        }
+
+        if (!self.enabled) {
+            fill = th.surface
+            border = th.border
+            mark = th.disabled
+        }
+
+        // 圆角 3：轻微圆角比直角柔和，比大圆角更像「复选框」。
+        winFillRound(b.x, b.y, b.w, b.h, 3, fill)
+        winBorderRound(b.x, b.y, b.w, b.h, 3, 1, border)
+
+        if (!self.on) { return }
+
+        // 对勾：从 (0.28, 0.52) 到 (0.44, 0.70) 再到 (0.72, 0.34)，
+        // 用相对坐标乘以边长，这样改 CK_BOX 时对勾自动缩放。
+        //
+        // ── 为什么是两条「四边形」而不是一条折线 ──────────
+        //
+        // winPath 画的是**填充多边形**，不是描边折线。所以一条
+        // 折线要么画成 0 像素宽（看不见），要么得自己算出带宽度
+        // 的外轮廓。这里选了「每段笔画用一个 4 点四边形近似」——
+        // 对勾的每段都是短直线，加宽后正好是个平行四边形，四边形
+        // 完全够用，而且不需要三角函数。
+        let t = 2                       // 笔画半宽
+        self.thickLine(b.x + b.w * 28 / 100, b.y + b.h * 52 / 100,
+                       b.x + b.w * 44 / 100, b.y + b.h * 70 / 100, t, mark)
+        self.thickLine(b.x + b.w * 44 / 100, b.y + b.h * 70 / 100,
+                       b.x + b.w * 72 / 100, b.y + b.h * 34 / 100, t, mark)
+    }
+
+    // 用填充四边形近似一条带宽度的线段。
+    //
+    // ── 为什么不做真正的垂直偏移 ──────────────────────
+    //
+    // 严格的加粗需要 (dy, -dx) / len * t 的法向偏移，要开方。
+    // 而对勾这类接近 45° 的短线，直接按 (±t, 0) 和 (0, ±t) 组合
+    // 出的平行四边形与法向偏移的视觉差别小于 1 像素。省掉一次
+    // 开方，在每帧几十个控件的场景下是划算的。
+    fn thickLine(x0: Int, y0: Int, x1: Int, y1: Int, t: Int, c: Int) {
+        let pts = [x0, y0 - t,  x1, y1 - t,  x1, y1 + t,  x0, y0 + t]
+        winPath(pts, c)
+    }
+}

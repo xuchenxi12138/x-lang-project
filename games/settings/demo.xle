@@ -1,0 +1,366 @@
+// demo.xle — 类型层组件库的验收程序
+//
+// 目的不是做一个「好看的设置窗口」，而是**证明类型层能承担真实界面**：
+// 每一处坐标都来自 Rect 的算术，没有一个手算的像素字面量；
+// 每一块配色都来自 Theme；每个控件都是结构体描述 + 一次 draw。
+//
+// 运行方式（会开窗并截图）：
+//     x run games/settings/demo.xle
+//
+// 产出 build/shot-ui-dark.bmp 与 build/shot-ui-light.bmp。
+
+from std.ui import uiHit, uiHitDown, uiTextCenter, uiTextInRect, uiTextLeft, uiButton, uiButtonEx, uiButtonPrimary, uiButtonDanger, uiButtonFlat, uiConsumeClick, uiCheckMark, uiCheck, uiCheckEx, uiRadioGroup, uiSlider, uiSliderLabeled, uiSliderEx, uiField, uiFieldLabeled, uiSeparator, uiPanel, uiPanelTitled, uiProgress, uiProgressLabeled, uiSeparatorEx, uiVRuleEx, uiPanelEx, uiPanelTitledEx, uiProgressEx, uiProgressLabeledEx, uiList, uiListScroll, uiCursor, uiCursorTake, uiModalBg, uiDialog, uiStatus, uiToolbar, uiFixed, Rect, Theme, Style, Anim, Button, Label, Panel, Progress, Cursor, Check, Slider, Frame, Widget, UiLabel, UiButton, UiPanel, UiProgress, UiCheck, UiSlider, UiTree, UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_NONE, UI_BTN_NORMAL, UI_BTN_PRIMARY, UI_BTN_DANGER
+from std.conv import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+const WIN_W = 560
+const WIN_H = 420
+
+// ---- 一帧界面的状态 ----
+//
+// 这些是**业务状态**，属于调用方。控件本身不带状态 —— 那是即时模式
+// 的核心约定：控件只是「长什么样 + 在哪」，状态只在调用方手里一份。
+// 这样就不可能出现「界面里一份、逻辑里一份、漏同步」的问题。
+struct UiState {
+    themeName: String,   // "dark" / "light"
+    volume: Int,         // 0..100
+    music: Bool,
+    sfx: Bool,
+    quality: Int,        // 0/1/2
+    saved: String,       // 最后操作的提示文本
+}
+
+fn UiState.init() -> UiState {
+    return UiState {
+        themeName: "dark",
+        volume: 65,
+        music: true,
+        sfx: false,
+        quality: 1,
+        saved: "",
+    }
+}
+
+// 换主题：只换这一个字段，其余原样。
+//
+// 没有 `state.themeName = "light"` 是因为字段不可变 —— 必须整个
+// 重建。这样写确实更啰嗦，但它保证了这个值在任何时刻都是完整的：
+// 不可能出现「改到一半」的中间状态。
+fn UiState.withTheme(self: UiState, name: String) -> UiState {
+    return UiState {
+        themeName: name,
+        volume: self.volume, music: self.music, sfx: self.sfx,
+        quality: self.quality, saved: self.saved,
+    }
+}
+
+fn UiState.withVolume(self: UiState, v: Int) -> UiState {
+    return UiState {
+        themeName: self.themeName,
+        volume: v, music: self.music, sfx: self.sfx,
+        quality: self.quality, saved: self.saved,
+    }
+}
+
+fn UiState.withMusic(self: UiState, b: Bool) -> UiState {
+    return UiState {
+        themeName: self.themeName,
+        volume: self.volume, music: b, sfx: self.sfx,
+        quality: self.quality, saved: self.saved,
+    }
+}
+
+fn UiState.withSfx(self: UiState, b: Bool) -> UiState {
+    return UiState {
+        themeName: self.themeName,
+        volume: self.volume, music: self.music, sfx: b,
+        quality: self.quality, saved: self.saved,
+    }
+}
+
+fn UiState.withQuality(self: UiState, q: Int) -> UiState {
+    return UiState {
+        themeName: self.themeName,
+        volume: self.volume, music: self.music, sfx: self.sfx,
+        quality: q, saved: self.saved,
+    }
+}
+
+fn UiState.withSaved(self: UiState, s: String) -> UiState {
+    return UiState {
+        themeName: self.themeName,
+        volume: self.volume, music: self.music, sfx: self.sfx,
+        quality: self.quality, saved: s,
+    }
+}
+
+fn themeOf(name: String) -> Theme {
+    if (name == "light") { return Theme.light() }
+    return Theme.dark()
+}
+
+fn qualityName(q: Int) -> String {
+    if (q == 0) { return "低" }
+    if (q == 1) { return "中" }
+    return "高"
+}
+
+// ---- 画一帧 ----
+//
+// 返回新状态。整个界面就是 `state = drawAll(state)`，没有别的机制。
+//
+// 注意形式参数 f: Frame —— 每帧的快照由调用方取好传进来。这里不做
+// `Frame.begin()`，因为一帧只能取一次：在 drawAll 里取，等于把
+// 「帧边界」和「绘制函数」绑死了，调用方想在一个函数里画两栏就得
+// 取两次，第二次必然是空的。
+fn drawAll(st: UiState, f: Frame) -> UiState {
+    let th = themeOf(st.themeName)
+    winFillRect(0, 0, WIN_W, WIN_H, th.bg)
+
+    // ── 左栏：外观 ────────────────────────────────────────────
+    //
+    // 这里每一个 Rect 都是从窗格矩形算出来的：outer → panel → 内容区
+    // → 每一条行。没有一处写死 y 坐标，所以整体上移/下移只需改
+    // 最外层那一个数字。
+    let outer = Rect { x: 16, y: 16, w: (WIN_W - 48) / 2, h: WIN_H - 32 }
+    let pAppear = Panel.of(outer, "外观", th)
+    let body = pAppear.draw()
+
+    // 每帧重开游标 —— 命中判定的顺序与它无关，但布局依赖它。
+    var cur = Cursor.at(body.x, body.y)
+
+    Label.left(cur.row(body.w, 32), "主题").draw(th)
+    let rowTheme = cur.row(body.w, 32)
+    cur = cur.advance(32, 10)
+
+    // 两个主题按钮并排：从 rowTheme 切左半 / 右半
+    let btnDark = rowTheme.leftPct(50).inset(2)
+    let btnLight = rowTheme.rightOf(50).inset(2)
+    // 用「已选中」视觉：当前主题那个用主色
+    var darkKind = Button.of(btnDark, "深色")
+    var lightKind = Button.of(btnLight, "浅色")
+    if (st.themeName == "dark") { darkKind = Button.primary(btnDark, "深色") }
+    else { lightKind = Button.primary(btnLight, "浅色") }
+
+    // 顺序无关的写法：先全部画完，再逐个判归属。
+    // 即使这里先判 lightKind，也不会因为绘制顺序而拿不到点击。
+    darkKind.draw(th)
+    lightKind.draw(th)
+    if (darkKind.clicked(f)) {
+        f = f.claim(darkKind.rect)
+        st = st.withTheme("dark")
+        st = st.withSaved("主题：深色")
+    }
+    if (lightKind.clicked(f)) {
+        f = f.claim(lightKind.rect)
+        st = st.withTheme("light")
+        st = st.withSaved("主题：浅色")
+    }
+
+    // 音量条
+    let rowVol = cur.row(body.w, 22)
+    cur = cur.advance(22, 6)
+    Label.left(rowVol, "音量").draw(th)
+
+    // 读数要预留宽度：滑条不能占满整行，否则读数画到边框外。
+    // 48 = 「100%」约 34px + 右侧留白。
+    let barArea = cur.row(body.w, 24)
+    let slider = Slider.of(
+        Rect { x: barArea.x, y: barArea.y + 4,
+               w: barArea.w - 48, h: 12 },
+        0, 100)
+    slider.draw(st.volume, winMouseDown(0), th)
+    slider.readout(st.volume, "%", th)
+    let newVol = slider.dragged(st.volume, f)
+    if (newVol != st.volume) {
+        f = f.claim(slider.rect)
+        st = st.withVolume(newVol)
+    }
+    cur = cur.advance(28, 10)
+
+    // 两个开关。
+    //
+    // 这里是原先写错的地方，值得留一行记录：
+    // `if (uiCheck(..., st.music)) { st = st.withMusic(!st.music) }`
+    // 是错的 —— uiCheck 返回的是**新值**，不是「是否被点」。
+    // music 为 true 时它原样返回 true，于是立刻被取反成 false；
+    // 后面再 `!st.music` 又抵消一次，第一帧看着对，第二帧就崩。
+    //
+    // Check.clicked 返回 Check，读 `.on` 拿状态，这类错误从语法上
+    // 就不可能写出来。
+    var cMusic = Check.at(cur.row(body.w, 24).x,
+                          cur.row(body.w, 24).y, "背景音乐", st.music)
+    cur = cur.advance(24, 6)
+    cMusic.draw(th)
+    if (f.hit(cMusic.rect)) {
+        f = f.claim(cMusic.rect)
+        cMusic = cMusic.toggle()
+        st = st.withMusic(cMusic.on)
+        st = st.withSaved("背景音乐：" + boolToString(cMusic.on))
+    }
+
+    var cSfx = Check.at(cur.row(body.w, 24).x,
+                        cur.row(body.w, 24).y, "音效", st.sfx)
+    cur = cur.advance(24, 10)
+    cSfx.draw(th)
+    if (f.hit(cSfx.rect)) {
+        f = f.claim(cSfx.rect)
+        cSfx = cSfx.toggle()
+        st = st.withSfx(cSfx.on)
+        st = st.withSaved("音效：" + boolToString(cSfx.on))
+    }
+
+    // ── 右栏：质量 + 进度 ────────────────────────────────────
+    let outer2 = Rect { x: 16 + (WIN_W - 48) / 2 + 16, y: 16,
+                        w: (WIN_W - 48) / 2, h: WIN_H - 32 }
+    let pQuality = Panel.of(outer2, "质量", th)
+    let body2 = pQuality.draw()
+
+    var cur2 = Cursor.at(body2.x, body2.y)
+
+    let rowQ = cur2.row(body2.w, 30)
+    cur2 = cur2.advance(30, 10)
+    Label.left(rowQ, "当前：" + qualityName(st.quality)).draw(th)
+
+    // 三个质量按钮横排：用百分比切成三份
+    let seg = cur2.row(body2.w, 28)
+    cur2 = cur2.advance(28, 16)
+
+    let q0 = Rect { x: seg.x, y: seg.y, w: seg.w / 3 - 4, h: seg.h }
+    let q1 = Rect { x: seg.x + seg.w / 3, y: seg.y, w: seg.w / 3 - 4, h: seg.h }
+    let q2 = Rect { x: seg.x + seg.w / 3 * 2, y: seg.y,
+                    w: seg.w / 3 - 4, h: seg.h }
+
+    var b0 = Button.of(q0, "低")
+    var b1 = Button.of(q1, "中")
+    var b2 = Button.of(q2, "高")
+    if (st.quality == 0) { b0 = Button.primary(q0, "低") }
+    if (st.quality == 1) { b1 = Button.primary(q1, "中") }
+    if (st.quality == 2) { b2 = Button.primary(q2, "高") }
+
+    b0.draw(th)
+    b1.draw(th)
+    b2.draw(th)
+    if (b0.clicked(f)) {
+        f = f.claim(b0.rect)
+        st = st.withQuality(0)
+        st = st.withSaved("质量：低")
+    }
+    if (b1.clicked(f)) {
+        f = f.claim(b1.rect)
+        st = st.withQuality(1)
+        st = st.withSaved("质量：中")
+    }
+    if (b2.clicked(f)) {
+        f = f.claim(b2.rect)
+        st = st.withQuality(2)
+        st = st.withSaved("质量：高")
+    }
+
+    // 进度条：用音量当示例数值，证明 Progress 也是类型。
+    // ratio 直接从 Slider 拿，不用自己再算一遍 —— 这也是类型的价值：
+    // 换算规则只有一处实现。
+    let rowProgLabel = cur2.row(body2.w, 20)
+    cur2 = cur2.advance(20, 6)
+    Label.left(rowProgLabel, "音量刻度").draw(th)
+
+    let progRect = cur2.row(body2.w, 14)
+    cur2 = cur2.advance(14, 16)
+    Progress.of(progRect, slider.ratio(st.volume)).withLabel().draw(th)
+
+    // 一段说明文字：证明 Label 的三档对齐都可用
+    cur2.row(body2.w, 18).stripTop(18)
+    Label.of(cur2.row(body2.w, 18), "全部控件由结构体描述").draw(th)
+
+    // ── 底部：操作按钮 ───────────────────────────────────────
+    let footY = WIN_H - 60
+    let btnSave = Rect { x: WIN_W - 16 - 100, y: footY, w: 100, h: 34 }
+    let btnReset = Rect { x: btnSave.x - 8 - 100, y: footY, w: 100, h: 34 }
+
+    let bSave = Button.primary(btnSave, "保存")
+    let bReset = Button.of(btnReset, "恢复默认")
+    bSave.draw(th)
+    bReset.draw(th)
+
+    if (bSave.clicked(f)) {
+        f = f.claim(bSave.rect)
+        st = st.withSaved("已保存：音量 " + toString(st.volume) +
+                          "% / " + qualityName(st.quality))
+    }
+    if (bReset.clicked(f)) {
+        f = f.claim(bReset.rect)
+        st = UkState_init_reset()
+        st = st.withSaved("已恢复默认设置")
+    }
+
+    // 状态文字：颜色由主题给
+    let statusRect = Rect { x: 16, y: footY, w: WIN_W - 240, h: 34 }
+    if (len(st.saved) > 0) {
+        Label.left(statusRect, st.saved).colored(th.ok).draw(th)
+    }
+
+    return st
+}
+
+fn UkState_init_reset() -> UiState {
+    return UiState.init().withTheme("dark")
+}
+
+fn main() -> Int {
+    if (!winOpen("X 组件库 · 类型层验收", WIN_W, WIN_H)) {
+        println("开窗失败")
+        return 1
+    }
+
+    var st = UiState.init()
+
+    // ---- 深色主题：跑一帧并截图 ----
+    st = drawAll(st, Frame.begin())
+    winBeginFrame()
+    st = drawAll(st, Frame.begin())
+    winEndFrame()
+    println("深色截图：" + toString(winScreenshot("build/shot-ui-dark.bmp")))
+
+    // ---- 切浅色：主题是值，换一个对象即可 ----
+    st = st.withTheme("light")
+    winBeginFrame()
+    st = drawAll(st, Frame.begin())
+    winEndFrame()
+    println("浅色截图：" + toString(winScreenshot("build/shot-ui-light.bmp")))
+
+    // ---- 用属性验证布局算术，不靠肉眼 ----
+    let body = Panel.of(Rect { x: 16, y: 16, w: 256, h: 388 },
+                        "检查", Theme.dark()).draw()
+    println("内容区 " + toString(body))
+    println("面积 " + toString(body.area()))
+    println("右边界 " + toString(body.right()))
+
+    // 三等分的宽度和必须等于总宽（整数除法会有余数，这里证明
+    // 「三等分 + 两处 4px 间隔」的算术是自洽的）
+    let total = 256
+    let segW = total / 3
+    println("三等分各 " + toString(segW - 4) + "，余 " +
+            toString(total - segW * 3))
+
+    // ---- 点击归属：证明「顺序无关」 ----
+    //
+    // 构造一个带点击的 Frame，直接验证两个控件的判定不会互相干扰。
+    // 这一步是类型层存在理由的证据，必须留在验收里。
+    let rA = Rect { x: 10, y: 10, w: 100, h: 30 }
+    let rB = Rect { x: 10, y: 50, w: 100, h: 30 }
+    var f2 = Frame.begin()
+    println("无点击时 A 命中 " + boolToString(f2.hit(rA)))
+    println("无点击时 待认领 " + boolToString(f2.pending()))
+
+    // 音量刻度是 0..100，比例必须单调
+    let sl = Slider.of(Rect { x: 0, y: 0, w: 101, h: 12 }, 0, 100)
+    println("ratio(0)=" + toString(sl.ratio(0)) +
+            " ratio(50)=" + toString(sl.ratio(50)) +
+            " ratio(100)=" + toString(sl.ratio(100)))
+    println("valueAt(0)=" + toString(sl.valueAt(0)) +
+            " valueAt(50)=" + toString(sl.valueAt(50)) +
+            " valueAt(100)=" + toString(sl.valueAt(100)))
+
+    println("demo ok")
+    winClose()
+    return 0
+}

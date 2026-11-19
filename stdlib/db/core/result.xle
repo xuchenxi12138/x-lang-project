@@ -1,0 +1,280 @@
+// db/core/result.xle — 查询结果集
+//
+// ── 为什么需要统一的结果集 ─────────────────────────
+//
+// MySQL 返回「列定义 + 行数组」，PostgreSQL 返回「字段描述 + 数据行」，
+// Redis 返回「RESP 嵌套数组」，MongoDB 返回「BSON 文档数组」，
+// Elasticsearch 返回「JSON 里的 hits.hits」。
+//
+// 五种形态各写一套取值逻辑 → 业务代码里到处是
+// `rows[0][2]`、`doc("title")`、`hit.source.name` 三种写法，
+// 换个数据库就要重写所有取数代码。
+//
+// 所以统一成：
+//
+//     rs.count()           行数
+//     rs.colCount()        列数
+//     rs.colName(i)        第 i 列的名字
+//     rs.cell(r, c)        第 r 行第 c 列的字符串值
+//     rs.cellByName(r, n)  按列名取值（最常用）
+//     rs.rows()            原始行数组（批量处理用）
+//
+// ── 为什么值统一成 String ─────────────────────────
+//
+// 因为不同数据库的类型系统无法对齐（MySQL 的 DECIMAL、Postgres 的
+// NUMERIC、Mongo 的 Decimal128 各有精度语义）。强行统一成一个
+// 数值类型会在精度上出错，而「字符串 + 显式转换」把精度问题
+// 交给调用方，且永远不会静默丢精度。
+
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+from "../../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+
+class ResultSet {
+    // 列名数组。
+    cols: Array,
+
+    // 行数据。每行是一个 Array，元素是 String（null 用 "" 表示，
+    // 是否为空用 isNull 单独判断）。
+    data: Array,
+
+    // 每行每列是否为 NULL。与 data 同形（行数组里装 Bool 数组）。
+    //
+    // ── 为什么 NULL 要单独一张表 ──────────────────────
+    //
+    // 因为 "" 和 NULL 在 SQL 里语义完全不同，而把 NULL 表示成 ""
+    // 会让 `WHERE x IS NULL` 的结果与 `WHERE x = ''` 无法区分。
+    // 另开一张表是最省事且不丢信息的方式。
+    nulls: Array,
+
+    // 受影响行数（INSERT / UPDATE / DELETE）或 0。
+    affected: Int,
+
+    // 最后插入的自增 id（MySQL LAST_INSERT_ID 等）。-1 表示不适用。
+    lastId: Int,
+
+    // 执行耗时（毫秒）。
+    elapsedMs: Int,
+
+    // 原始响应文本（调试用，可为空）。
+    raw: String,
+
+    // 是否成功。
+    ok: Bool,
+
+    // 错误信息。
+    error: String,
+
+    constructor() {
+        self.cols      = []
+        self.data      = []
+        self.nulls     = []
+        self.affected  = 0
+        self.lastId    = 0 - 1
+        self.elapsedMs = 0
+        self.raw       = ""
+        self.ok        = true
+        self.error     = ""
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    static fn empty() -> ResultSet {
+        return new ResultSet()
+    }
+
+    static fn fail(msg: String) -> ResultSet {
+        let r = new ResultSet()
+        r.ok    = false
+        r.error = msg
+        return r
+    }
+
+    // 从「列名 + 行数组」构造。
+    static fn make(cols: Array, rows: Array) -> ResultSet {
+        let r = new ResultSet()
+        r.cols = cols
+        r.data = rows
+        // 构造行时默认全非空；驱动解析时若遇到 NULL 会覆盖。
+        let nulls = []
+        var i = 0
+        while i < len(rows) {
+            let row = rows[i]
+            let marks = []
+            var j = 0
+            while j < len(row) {
+                arrPush(marks, false)
+                j = j + 1
+            }
+            arrPush(nulls, marks)
+            i = i + 1
+        }
+        r.nulls = nulls
+        return r
+    }
+
+    // ── 访问 ────────────────────────────────────
+
+    fn count() -> Int {
+        return len(self.data)
+    }
+
+    fn colCount() -> Int {
+        return len(self.cols)
+    }
+
+    fn colName(i: Int) -> String {
+        if (i < 0 || i >= len(self.cols)) { return "" }
+        return toString(self.cols[i])
+    }
+
+    // 列名 → 下标。找不到返回 -1。
+    fn colIndex(name: String) -> Int {
+        var i = 0
+        let n = strLower(name)
+        while i < len(self.cols) {
+            if (strLower(toString(self.cols[i])) == n) { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    fn cell(row: Int, col: Int) -> String {
+        if (row < 0 || row >= len(self.data)) { return "" }
+        let r = self.data[row]
+        if (col < 0 || col >= len(r)) { return "" }
+        return toString(r[col])
+    }
+
+    fn isNull(row: Int, col: Int) -> Bool {
+        if (row < 0 || row >= len(self.nulls)) { return true }
+        let marks = self.nulls[row]
+        if (col < 0 || col >= len(marks)) { return false }
+        return toBoolOr(toString(marks[col]), false)
+    }
+
+    fn cellByName(row: Int, name: String) -> String {
+        return self.cell(row, self.colIndex(name))
+    }
+
+    fn intAt(row: Int, col: Int) -> Int {
+        return toIntOr(self.cell(row, col), 0)
+    }
+
+    fn intByName(row: Int, name: String) -> Int {
+        return toIntOr(self.cellByName(row, name), 0)
+    }
+
+    fn floatAt(row: Int, col: Int) -> Float {
+        return toFloatOr(self.cell(row, col), 0.0)
+    }
+
+    fn boolAt(row: Int, col: Int) -> Bool {
+        let s = strLower(self.cell(row, col))
+        if (s == "1" || s == "true" || s == "t" || s == "yes") { return true }
+        return false
+    }
+
+    fn rows() -> Array {
+        return self.data
+    }
+
+    // 取第一行第一列。单值查询（COUNT(*)、SELECT MAX(x)）最常用。
+    fn scalar() -> String {
+        return self.cell(0, 0)
+    }
+
+    fn scalarInt() -> Int {
+        return toIntOr(self.scalar(), 0)
+    }
+
+    // 某一列的全部值（竖切）。做 IN 查询的输入很常用。
+    fn column(name: String) -> Array {
+        let c = self.colIndex(name)
+        let out = []
+        if (c < 0) { return out }
+        var i = 0
+        while i < len(self.data) {
+            arrPush(out, self.cell(i, c))
+            i = i + 1
+        }
+        return out
+    }
+
+    // ── 诊断 ────────────────────────────────────
+
+    fn describe() -> String {
+        if (!self.ok) { return "失败：" + self.error }
+        var s = toString(self.count()) + " 行"
+        if (self.colCount() > 0) {
+            s = s + " × " + toString(self.colCount()) + " 列"
+        }
+        if (self.affected > 0) {
+            s = s + "，影响 " + toString(self.affected) + " 行"
+        }
+        if (self.lastId >= 0) {
+            s = s + "，新 id=" + toString(self.lastId)
+        }
+        if (self.elapsedMs > 0) {
+            s = s + "（" + toString(self.elapsedMs) + "ms）"
+        }
+        return s
+    }
+
+    // 表格化输出（调试 / CLI 用）。
+    fn toText() -> String {
+        if (!self.ok) { return self.error }
+        if (self.count() == 0) {
+            return "(空结果集)" + " " + self.describe()
+        }
+        // 每列宽度 = max(列名宽, 该列所有值宽)
+        let widths = []
+        var c = 0
+        while c < len(self.cols) {
+            arrPush(widths, strDisplayWidth(self.colName(c)))
+            c = c + 1
+        }
+        var r = 0
+        while r < len(self.data) {
+            let row = self.data[r]
+            c = 0
+            while c < len(row) && c < len(widths) {
+                let w = strDisplayWidth(toString(row[c]))
+                if (w > toInt(widths[c])) { widths[c] = w }
+                c = c + 1
+            }
+            r = r + 1
+        }
+
+        var out = ""
+        c = 0
+        while c < len(self.cols) {
+            if (c > 0) { out = out + " | " }
+            out = out + strPadDisplayRight(self.colName(c), toInt(widths[c]))
+            c = c + 1
+        }
+        out = out + "\n"
+        // 分隔线
+        c = 0
+        while c < len(self.cols) {
+            if (c > 0) { out = out + "-+-" }
+            out = out + strRepeat("-", toInt(widths[c]))
+            c = c + 1
+        }
+        out = out + "\n"
+
+        r = 0
+        while r < len(self.data) {
+            c = 0
+            while c < len(self.cols) {
+                if (c > 0) { out = out + " | " }
+                var v = self.cell(r, c)
+                if (self.isNull(r, c)) { v = "NULL" }
+                out = out + strPadDisplayRight(v, toInt(widths[c]))
+                c = c + 1
+            }
+            out = out + "\n"
+            r = r + 1
+        }
+        return out
+    }
+}

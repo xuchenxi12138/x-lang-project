@@ -1,0 +1,245 @@
+// db/postgres/resultset.xle — PostgreSQL 结果集解析
+//
+// ── RowDescription（'T'）的布局 ─────────────────────
+//
+//   [2]  字段数 N
+//   每个字段：
+//     [NUL]  列名
+//     [4]    表 OID
+//     [2]    列号
+//     [4]    类型 OID ★
+//     [2]    类型长度（-1 = 变长）
+//     [4]    类型修饰（-1 = 无）
+//     [2]    格式码（0 = 文本，1 = 二进制）
+//
+// ── 类型 OID 是 PG 的核心 ──────────────────────────
+//
+// PG 的类型系统用 OID 标识，而内置类型的 OID 是**固定值**（和 MySQL
+// 的顺序编号完全不同 —— 它们是 pg_type 系统表的主键，历史原因导致
+// 编号散乱，比如 int4 是 23 而 text 是 25）。
+//
+// 好消息是：因为是固定值，客户端可以硬编码常用类型而不必查系统表。
+// 下面这张表覆盖了业务代码 99% 的场景。
+//
+// ── DataRow（'D'）的布局 ──────────────────────────
+//
+//   [2]  字段数 N
+//   每个字段：
+//     [4]  长度 L（-1 表示 NULL）
+//     [L]  数据（文本格式下是文本，二进制格式下是二进制）
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "../core/result.xle" import ResultSet
+from "message.xle" import pgBuildMsg, pgBuildStartup, pgReadMsg, pgTypeName, pgBuildQuery, pgBuildTerminate, pgBuildSync, pgParseError, pgReadCStr, pgBool
+
+// PG 内置类型 OID。
+//
+// ── 为什么这些数字如此散乱 ──────────────────────
+//
+// 因为它们就是 pg_type 表里的行号的历史遗留：bool=16 是最早的一批，
+// int4=23 紧接着，text=25，然后 varchar=1043 是后来加的 —— 新类型
+// 都排在 1000 之后（1043 varchar、1184 timestamptz、1700 numeric）。
+// 这个「分界线」有助于判断：OID < 1000 是老类型，> 1000 是后加的。
+const PG_OID_BOOL        = 16
+const PG_OID_BYTEA       = 17
+const PG_OID_CHAR        = 18
+const PG_OID_NAME        = 19
+const PG_OID_INT8        = 20
+const PG_OID_INT2        = 21
+const PG_OID_INT4        = 23
+const PG_OID_TEXT        = 25
+const PG_OID_OID         = 26
+const PG_OID_JSON        = 114
+const PG_OID_FLOAT4      = 700
+const PG_OID_FLOAT8      = 701
+const PG_OID_UNKNOWN     = 705
+const PG_OID_MONEY       = 790
+const PG_OID_BPCHAR      = 1042
+const PG_OID_VARCHAR     = 1043
+const PG_OID_DATE        = 1082
+const PG_OID_TIME        = 1083
+const PG_OID_TIMESTAMP   = 1114
+const PG_OID_TIMESTAMPTZ = 1184
+const PG_OID_INTERVAL    = 1186
+const PG_OID_TIMETZ      = 1266
+const PG_OID_NUMERIC     = 1700
+const PG_OID_UUID        = 2950
+const PG_OID_JSONB       = 3802
+const PG_OID_INT4RANGE   = 3904
+const PG_OID_INT8RANGE   = 3926
+const PG_OID_TEXTARRAY   = 1009
+const PG_OID_INT4ARRAY   = 1007
+const PG_OID_VARCHARARR  = 1015
+
+// 一列的描述。
+class PgColumn {
+    name: String,
+    tableOid: Int,
+    colNo: Int,
+    typeOid: Int,
+    typeLen: Int,
+    typeMod: Int,
+    format: Int,
+
+    constructor() {
+        self.name     = ""
+        self.tableOid = 0
+        self.colNo    = 0
+        self.typeOid  = 0
+        self.typeLen  = 0 - 1
+        self.typeMod  = 0 - 1
+        self.format   = 0
+    }
+
+    // 类型名。未知 OID 返回 "oid:<数字>"，便于排查。
+    fn typeName() -> String {
+        let t = self.typeOid
+        if (t == PG_OID_BOOL)        { return "BOOL" }
+        if (t == PG_OID_BYTEA)       { return "BYTEA" }
+        if (t == PG_OID_CHAR)        { return "CHAR" }
+        if (t == PG_OID_NAME)        { return "NAME" }
+        if (t == PG_OID_INT8)        { return "BIGINT" }
+        if (t == PG_OID_INT2)        { return "SMALLINT" }
+        if (t == PG_OID_INT4)        { return "INT" }
+        if (t == PG_OID_TEXT)        { return "TEXT" }
+        if (t == PG_OID_OID)         { return "OID" }
+        if (t == PG_OID_JSON)        { return "JSON" }
+        if (t == PG_OID_JSONB)       { return "JSONB" }
+        if (t == PG_OID_FLOAT4)      { return "REAL" }
+        if (t == PG_OID_FLOAT8)      { return "DOUBLE" }
+        if (t == PG_OID_UNKNOWN)     { return "UNKNOWN" }
+        if (t == PG_OID_MONEY)       { return "MONEY" }
+        if (t == PG_OID_BPCHAR)      { return "CHAR(n)" }
+        if (t == PG_OID_VARCHAR)     { return "VARCHAR" }
+        if (t == PG_OID_DATE)        { return "DATE" }
+        if (t == PG_OID_TIME)        { return "TIME" }
+        if (t == PG_OID_TIMETZ)      { return "TIMETZ" }
+        if (t == PG_OID_TIMESTAMP)   { return "TIMESTAMP" }
+        if (t == PG_OID_TIMESTAMPTZ) { return "TIMESTAMPTZ" }
+        if (t == PG_OID_INTERVAL)    { return "INTERVAL" }
+        if (t == PG_OID_NUMERIC)     { return "NUMERIC" }
+        if (t == PG_OID_UUID)        { return "UUID" }
+        if (t == PG_OID_INT4RANGE)   { return "INT4RANGE" }
+        if (t == PG_OID_INT8RANGE)   { return "INT8RANGE" }
+        if (t == PG_OID_TEXTARRAY)   { return "TEXT[]" }
+        if (t == PG_OID_INT4ARRAY)   { return "INT[]" }
+        if (t == PG_OID_VARCHARARR)  { return "VARCHAR[]" }
+        return "oid:" + toString(t)
+    }
+
+    fn isNumeric() -> Bool {
+        let t = self.typeOid
+        return t == PG_OID_INT2 || t == PG_OID_INT4 || t == PG_OID_INT8
+            || t == PG_OID_FLOAT4 || t == PG_OID_FLOAT8
+            || t == PG_OID_NUMERIC || t == PG_OID_OID || t == PG_OID_MONEY
+    }
+
+    fn describe() -> String {
+        return self.name + " " + self.typeName()
+    }
+}
+
+// 解析 RowDescription（'T' 的负载）。
+fn pgParseRowDescription(p: Array) -> Array {
+    let cols = []
+    if (len(p) < 2) { return cols }
+    let n = bbU16BE(p, 0)
+    var pos = 2
+    var i = 0
+    while i < n && pos < len(p) {
+        let c = new PgColumn()
+        let nm = pgReadCStr(p, pos)
+        c.name = toString(nm[0])
+        pos = toInt(nm[1])
+        if (pos + 18 > len(p)) {
+            arrPush(cols, c)
+            i = i + 1
+            continue
+        }
+        c.tableOid = bbU32BE(p, pos)
+        c.colNo    = bbU16BE(p, pos + 4)
+        c.typeOid  = bbU32BE(p, pos + 6)
+        c.typeLen  = bbU16BE(p, pos + 10)
+        c.typeMod  = bbU32BE(p, pos + 12)
+        c.format   = bbU16BE(p, pos + 16)
+        pos = pos + 18
+        arrPush(cols, c)
+        i = i + 1
+    }
+    return cols
+}
+
+// 解析 DataRow（'D' 的负载），返回 [值数组, NULL 标记数组]。
+fn pgParseDataRow(p: Array) -> Array {
+    let vals = []
+    let nulls = []
+    if (len(p) < 2) { return [vals, nulls] }
+    let n = bbU16BE(p, 0)
+    var pos = 2
+    var i = 0
+    while i < n {
+        if (pos + 4 > len(p)) {
+            // 报文不完整：补空值而不是崩溃
+            arrPush(vals, "")
+            arrPush(nulls, true)
+            i = i + 1
+            continue
+        }
+        let lenField = bbU32BE(p, pos)
+        pos = pos + 4
+        // ── -1 表示 NULL ─────────────────────
+        //
+        // 长度字段是**有符号** 4 字节，0xFFFFFFFF 表示 NULL。用无符号
+        // 读会得到 4294967295，然后试图读 4GB 数据 —— 卡死。
+        if (lenField == 0 - 1 || lenField == 4294967295) {
+            arrPush(vals, "")
+            arrPush(nulls, true)
+            i = i + 1
+            continue
+        }
+        let l = lenField
+        if (pos + l > len(p)) { l = len(p) - pos }
+        arrPush(vals, bbToText(bbSlice(p, pos, pos + l)))
+        arrPush(nulls, false)
+        pos = pos + l
+        i = i + 1
+    }
+    return [vals, nulls]
+}
+
+// 从 CommandComplete（'C'）的负载解析受影响行数。
+//
+// ── 格式 ────────────────────────────────────
+//
+// 负载是 NUL 结尾的标签，如 "INSERT 0 5"、"UPDATE 3"、"DELETE 2"、
+// "SELECT 10"、"CREATE TABLE"。最后一段是行数（CREATE 没有）。
+fn pgParseCommandTag(p: Array) -> Array {
+    let t = bbToText(p)
+    var s = t
+    // 去掉尾部的 NUL
+    while strEnds(s, strFromBytes([0])) {
+        s = strSub(s, 0, len(s) - 1)
+    }
+    let parts = strSplit(s, " ")
+    var tag = ""
+    var rows = 0 - 1
+    if (len(parts) > 0) { tag = toString(parts[0]) }
+    if (len(parts) > 0) {
+        let last = toString(parts[len(parts) - 1])
+        if (strIsInt(last)) { rows = strParseInt(last) }
+    }
+    return [tag, rows, s]
+}
+
+// 把列描述拼成 describe 用的字符串（存进 ResultSet.raw）。
+fn pgDescribe(cols: Array) -> String {
+    var out = ""
+    var i = 0
+    while i < len(cols) {
+        let c: PgColumn = cols[i]
+        if (i > 0) { out = out + "; " }
+        out = out + c.describe()
+        i = i + 1
+    }
+    return out
+}

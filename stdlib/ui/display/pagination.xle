@@ -1,0 +1,236 @@
+// ui/display/pagination.xle — 分页器
+//
+// ── 分页器的难点在「怎么省略」 ──────────────────────
+//
+// 100 页全列出来没人看得懂，所以必须省略。而省略的规则是分页器
+// 唯一的「算法」：
+//
+//   总页数 <= 7：全列
+//   否则：首页 ... 当前-1 当前 当前+1 ... 末页
+//
+// 边界情况特别多：当前页靠前时不该显示前置省略号（`1 2 3 4 5 ... 99`），
+// 靠后时不该显示后置省略号（`1 ... 95 96 97 98 99`），而且
+// 「1 ... 2 3」这种「省略号只省了一页」的情况要退化成「全列」。
+//
+// 这些规则写在一处，就不用在每个界面里重复推导。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 分页按钮的边长。
+const PG_SIZE = 32
+
+// 按钮之间的间隙。
+const PG_GAP = 4
+
+// 超过这个页数就开始省略。
+const PG_SIMPLE_MAX = 7
+
+class Pagination extends Widget {
+    // 总页数。
+    total: Int,
+
+    // 当前页（1 基，与用户看到的一致）。
+    current: Int,
+
+    // 每页大小（用于显示 "共 N 条"）。0 表示不显示。
+    pageSize: Int,
+
+    // 总记录数（用于显示 "共 N 条"）。0 表示不显示。
+    totalItems: Int,
+
+    constructor(r: Rect, total: Int) {
+        self.r          = r
+        self.vis        = true
+        self.enabled    = true
+        self.focused    = false
+        self.hovered    = false
+        self.total      = total
+        self.current    = 1
+        self.pageSize   = 0
+        self.totalItems = 0
+        self.style      = Style.plain()
+    }
+
+    static fn of(r: Rect, total: Int, current: Int) -> Pagination {
+        let p = new Pagination(r, total)
+        p.current = current
+        return p
+    }
+
+    fn setTotal(n: Int) -> Pagination {
+        self.total = n
+        if (self.current > n) { self.current = n }
+        if (self.current < 1) { self.current = 1 }
+        return self
+    }
+
+    // ── 省略算法 ─────────────────────────────────
+    //
+    // 返回一个 Array，元素是页码（Int）或 -1（省略号）。
+    //
+    // ── 为什么用 -1 当省略号 ────────────────────
+    //
+    // 因为数组元素必须是同一种类型。用 -1 作为哨兵值，绘制时
+    // 判 `< 0` 就画 "..."。这比「元素是字符串，数字转字符串
+    // 再转回来」简单得多。
+    fn pageList() -> Array {
+        let out = []
+        let n = self.total
+        if (n <= 0) { return out }
+        if (n <= PG_SIMPLE_MAX) {
+            var i = 1
+            while i <= n {
+                arrPush(out, i)
+                i = i + 1
+            }
+            return out
+        }
+
+        let cur = self.current
+        // 情况一：当前页靠前（1..5 都在前半段）。
+        if (cur <= 4) {
+            var i = 1
+            while i <= 5 {
+                arrPush(out, i)
+                i = i + 1
+            }
+            arrPush(out, 0 - 1)
+            arrPush(out, n)
+            return out
+        }
+
+        // 情况二：当前页靠后。
+        if (cur >= n - 3) {
+            arrPush(out, 1)
+            arrPush(out, 0 - 1)
+            var i = n - 4
+            while i <= n {
+                arrPush(out, i)
+                i = i + 1
+            }
+            return out
+        }
+
+        // 情况三：当前页在中间。
+        arrPush(out, 1)
+        arrPush(out, 0 - 1)
+        arrPush(out, cur - 1)
+        arrPush(out, cur)
+        arrPush(out, cur + 1)
+        arrPush(out, 0 - 1)
+        arrPush(out, n)
+        return out
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    // 第 i 个按钮（i 是 pageList 的下标）的矩形。
+    fn cellRect(i: Int) -> Rect {
+        let x = self.r.x + i * (PG_SIZE + PG_GAP)
+        return rectOf(x, self.r.y, PG_SIZE, PG_SIZE)
+    }
+
+    // 总需要的宽度。
+    fn requiredW() -> Int {
+        let n = len(self.pageList())
+        if (n <= 0) { return 0 }
+        return n * PG_SIZE + (n - 1) * PG_GAP
+    }
+
+    // 命中的按钮下标。-1 表示没命中。
+    fn indexAt(mx: Int, my: Int) -> Int {
+        if (!self.vis || !self.enabled) { return 0 - 1 }
+        if (!self.r.contains(mx, my)) { return 0 - 1 }
+        let rel = mx - self.r.x
+        let step = PG_SIZE + PG_GAP
+        let i = rel / step
+        if (i < 0) { return 0 - 1 }
+        if (i >= len(self.pageList())) { return 0 - 1 }
+        // 落在间隙上不算命中。
+        let local = rel % step
+        if (local > PG_SIZE) { return 0 - 1 }
+        return i
+    }
+
+    // 点击。返回新的当前页；没变化返回原来的。
+    fn click(mx: Int, my: Int) -> Int {
+        let i = self.indexAt(mx, my)
+        if (i < 0) { return self.current }
+        let pages = self.pageList()
+        let p = toInt(pages[i])
+        if (p < 0) { return self.current }   // 省略号不可点
+        if (p == self.current) { return self.current }
+        self.current = p
+        return p
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        let pages = self.pageList()
+        if (len(pages) == 0) { return }
+
+        let mxx = winMouseX()
+        let myy = winMouseY()
+        let hovIdx = self.indexAt(mxx, myy)
+
+        var i = 0
+        while i < len(pages) {
+            let cr: Rect = self.cellRect(i)
+            let p = toInt(pages[i])
+
+            if (p < 0) {
+                // 省略号：不画底，只画三个点。
+                let cy = cr.y + cr.h / 2
+                let cx = cr.x + cr.w / 2
+                winFillRect(cx - 6, cy, 2, 2, th.textDim)
+                winFillRect(cx - 1, cy, 2, 2, th.textDim)
+                winFillRect(cx + 4, cy, 2, 2, th.textDim)
+                i = i + 1
+                continue
+            }
+
+            let isCurrent = p == self.current
+            let isHover = i == hovIdx
+
+            // 底：当前页用主色，其余用面板色 / 悬停色。
+            var bg = th.surface
+            var fg = th.text
+            var hasBorder = true
+
+            if (isCurrent) {
+                bg = th.accent
+                fg = th.onAccent
+                hasBorder = false
+            } else if (isHover) {
+                bg = th.surfaceHover
+            }
+            if (!self.enabled) {
+                bg = th.surface
+                fg = th.disabled
+            }
+
+            winFillRound(cr.x, cr.y, cr.w, cr.h, 4, bg)
+            if (hasBorder) {
+                winBorderRound(cr.x, cr.y, cr.w, cr.h, 4, 1, th.border)
+            }
+
+            uiTextInRect(cr, toString(p), fg)
+            i = i + 1
+        }
+
+        // 「共 N 条」信息，画在分页器右侧。
+        if (self.totalItems > 0) {
+            let s = "共 " + toString(self.totalItems) + " 条"
+            let x = self.r.x + self.requiredW() + 16
+            winText(x, self.r.y + (self.r.h - winTextHeight()) / 2,
+                    s, th.textDim)
+        }
+    }
+}

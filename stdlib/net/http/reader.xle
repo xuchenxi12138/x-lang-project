@@ -1,0 +1,495 @@
+// net/http/reader.xle — 从 TCP 流里读 HTTP 报文
+//
+// ── 这个文件解决的核心问题：报文边界 ─────────────────
+//
+// TCP 是字节流，不保证「一次 recv 就是一条消息」。一段 HTTP 响应
+// 可能被切成任意多段到达，也可能两条响应粘在一起。所以必须：
+//
+//   1. 循环读直到「看到 \r\n\r\n」（头结束标志）
+//   2. 剩下的字节**不能丢** —— 它已经是 body 的开头
+//
+// 第 2 点是所有手写 HTTP 客户端最容易错的地方。忘了保留残留字节，
+// 症状是「响应体少前几个字节」，而在 body 很小时（{} 或 ok）表现
+// 为「JSON 解析失败」—— 排查方向会完全跑偏到 JSON 库上去。
+//
+// ── 为什么不复用 db/core/socket.xle 的 Conn ──────────
+//
+// 因为 Conn 的等待策略是「预算内必读满 N 字节」，而 HTTP 是「读到
+// 分隔符为止，长度未知」。两者的循环终止条件本质不同，硬合并会
+// 让 Conn 的接口变得含混（要么多一个「读到分隔符」的方法，要么
+// 让 readN 支持「读到 EOF」的语义）。
+
+from "../core/tcp_stream.xle" import TcpStream, TS_POLL_MS, TS_DEFAULT_WAIT_MS
+from "header.xle" import arrRemoveAt, Headers, HD_COLON, HD_MAX_LINE
+from "status.xle" import hsCommonCodes, hsReason, hsClass, hsHasNoBody, hsAdvice
+from "uri.xle" import uriIsUnreserved, uriPctEncodeByte, uriEncode, uriEncodePath, uriEncodeQueryValue, uriDecode, uriHexVal, uriFindSchemeColon, uriSplitAuthority, strLastFind, uriDirOf, uriNormalizePath, Uri
+
+// 头结束标志。
+fn hsCrlfCrlf() -> Array {
+    return [13, 10, 13, 10]
+}
+
+// 单行最大长度（含 \r\n）。与 header.xle 的 HD_MAX_LINE 一致。
+const HS_MAX_LINE = 8000
+
+// 响应头解析结果。
+class ResponseHead {
+    // 协议版本（"HTTP/1.1"）
+    version: String
+
+    // 状态码
+    status: Int
+
+    // 原因短语（可能为空，比如 `HTTP/1.1 200` 后面什么都没有）
+    reason: String
+
+    headers: Headers
+
+    // 声明了 chunked
+    chunked: Bool
+
+    // Content-Length，-1 表示没声明
+    contentLength: Int
+
+    constructor() {
+        self.version       = "HTTP/1.1"
+        self.status        = 0
+        self.reason        = ""
+        self.headers       = new Headers()
+        self.chunked       = false
+        self.contentLength = 0 - 1
+    }
+}
+
+class HsReader {
+    // ── 读头 ──────────────────────────────────────
+
+    // 从连接读到 \r\n\r\n 为止。
+    //
+    // 返回 [ok, headBytes, error]。headBytes **不含** 结尾的 \r\n\r\n。
+    //
+    // ── 为什么残留字节要从返回值里拿不到 ─────────────
+    //
+    // 因为读头和读 body 是两步，中间必须把「已经读超的字节」交接
+    // 出去。这里用了一个取巧但可靠的方案：**把残留字节塞回连接对象
+    // 的内部缓冲**。而 TcpStream 没有内部缓冲（它是无状态的）。
+    //
+    // 所以改用一个明确的方案：readHead 返回三元组
+    // [ok, headBytes, leftover]，其中 leftover 是 \r\n\r\n 之后的
+    // 字节。调用方必须把它传给 readBody。
+    static fn readHead(sock: TcpStream, waitMs: Int) -> Array {
+        var acc = []
+        let sep = hsCrlfCrlf()
+        var spent = 0
+
+        while true {
+            // 先看已有数据里有没有分隔符。**每次追加后都要检查** ——
+            // 因为一次 recv 可能就拿到了完整报文。
+            let at = bbFindSeq(acc, sep, 0)
+            if (at >= 0) {
+                let head = bbSlice(acc, 0, at)
+                let rest = bbSlice(acc, at + 4, len(acc))
+                return [true, head, rest]
+            }
+
+            // 没有分隔符，继续读。
+            let r = sock.recvOnce()
+            if (r[0] == true) {
+                let chunk: Array = r[1]
+                acc = bbConcat(acc, chunk)
+                spent = 0          // 有进展就重置预算
+                // 上限保护：防止对端狂发数据却没有分隔符把内存吃满
+                // （这是「无限头发送」攻击的形态）。
+                if (len(acc) > HS_MAX_LINE * 128) {
+                    return [false, [], "响应头超过 " +
+                            toString(HS_MAX_LINE * 128) + " 字节仍未结束，" +
+                            "可能不是 HTTP 服务，或对端在发垃圾数据"]
+                }
+                continue
+            }
+
+            // 没数据。判断是「暂时没有」还是「对端关了」。
+            if (!sock.alive()) {
+                // ── 对端关闭且没有分隔符 ─────────────
+                //
+                // 这里有一个必须区分的情况：acc 为空 vs 非空。
+                //   acc 为空 = 连上了又立刻关（服务端拒绝）
+                //   acc 非空 = 发了半个头就断（对端崩溃）
+                // 两者的排查方向完全不同，所以错误信息要分开。
+                if (len(acc) == 0) {
+                    return [false, [], "连接已关闭，没有收到任何响应" +
+                            "（服务端拒绝连接？端口上不是 HTTP 服务？）"]
+                }
+                return [false, [], "响应头不完整：收到 " + toString(len(acc)) +
+                        " 字节后连接被关闭（对端崩溃或超时断开）"]
+            }
+            if (spent >= waitMs) {
+                return [false, [], "等待响应超时（" + toString(waitMs) +
+                        "ms）：已收到 " + toString(len(acc)) + " 字节但头未结束"]
+            }
+            sleep(5)
+            spent = spent + 5
+        }
+        return [false, [], "不可达"]
+    }
+
+    // ── 解析头的字节 ───────────────────────────────
+
+    // 返回 [ok, ResponseHead, error]。
+    static fn parseHead(headBytes: Array) -> Array {
+        let text = bbToText(headBytes)
+        // 按 \n 切，再去掉每行末尾的 \r。
+        //
+        // ── 为什么先按 \n 切而不是先按 \r\n 切 ─────────
+        //
+        // 因为有些简陋的服务端只发 \n（不规范的 LF-only）。先按 \n
+        // 切能同时兼容两种，代价是每行要 trim 一次（很便宜）。
+        let rawLines = strSplit(text, "\n")
+        if (len(rawLines) == 0) {
+            return [false, new ResponseHead(), "响应头为空"]
+        }
+
+        let lines = []
+        var i = 0
+        while i < len(rawLines) {
+            let l: String = rawLines[i]
+            arrPush(lines, strTrimEnd(l))
+            i = i + 1
+        }
+
+        let statusLine: String = lines[0]
+        let parts = strSplit(statusLine, " ")
+        let segs = []
+        var j = 0
+        while j < len(parts) {
+            let p: String = parts[j]
+            if (len(p) > 0) { arrPush(segs, p) }
+            j = j + 1
+        }
+        if (len(segs) < 2) {
+            return [false, new ResponseHead(),
+                    "状态行格式错误：`" + statusLine + "`"]
+        }
+
+        let h = new ResponseHead()
+        h.version = segs[0]
+        let codeStr: String = segs[1]
+        let code = toIntOr(codeStr, 0)
+        if (code < 100 || code > 599) {
+            return [false, h, "状态码不合法：`" + codeStr + "`（应在 100~599）"]
+        }
+        h.status = code
+        // 原因短语可能包含空格（`404 Not Found Here`），把剩余段拼回。
+        var reason = ""
+        var k = 2
+        while k < len(segs) {
+            if (k > 2) { reason = reason + " " }
+            reason = reason + toString(segs[k])
+            k = k + 1
+        }
+        h.reason = reason
+
+        // 头部分：lines[1..]
+        let headerLines = []
+        var m = 1
+        while m < len(lines) {
+            arrPush(headerLines, lines[m])
+            m = m + 1
+        }
+        h.headers = Headers.parseLines(headerLines)
+
+        // 推导 chunked / contentLength
+        let te = strLower(h.headers.get("transfer-encoding"))
+        if (strFind(te, "chunked") >= 0) { h.chunked = true }
+        let cl = h.headers.get("content-length")
+        if (len(cl) > 0) {
+            let n = toIntOr(cl, 0 - 1)
+            if (n < 0) {
+                return [false, h, "Content-Length 不合法：`" + cl + "`"]
+            }
+            h.contentLength = n
+        }
+
+        // ── 两个都有 = 走私特征 ─────────────────
+        //
+        // 客户端侧同样要拒绝：如果响应里同时有两者，说明中间设备
+        // （代理/网关）在转发时改了报文，我们无法知道该信哪个。
+        // 按任一为准都可能读到错误的数据边界，进而把下一条响应
+        // 的开头当成 body 的一部分。
+        if (h.chunked && h.contentLength >= 0) {
+            return [false, h,
+                    "响应同时含 Transfer-Encoding: chunked 与 Content-Length —— " +
+                    "报文边界不可确定（中间设备可能改写了报文）"]
+        }
+
+        return [true, h, ""]
+    }
+
+    // ── 读 body ───────────────────────────────────
+
+    // 按 head 的声明读完整 body。
+    //
+    // leftover 是 readHead 交出来的「已读超的头之后字节」，必须先
+    // 用它当初始缓冲，否则 body 开头的字节就丢了。
+    //
+    // 返回 [ok, bodyBytes, error]。
+    static fn readBody(sock: TcpStream, head: ResponseHead,
+                       leftover: Array, waitMs: Int) -> Array {
+        if (head.chunked) {
+            return HsReader.readChunked(sock, leftover, waitMs)
+        }
+        if (head.contentLength >= 0) {
+            return HsReader.readFixed(sock, leftover, head.contentLength, waitMs)
+        }
+        // ── 既没有 CL 也没有 chunked ──────────────
+        //
+        // HTTP/1.1 里这只在「响应不该有 body」（已由 hsHasNoBody 挡掉）
+        // 时合法。到了这一步说明对端没声明长度，只能读到连接关闭为止
+        // —— 这是 HTTP/1.0 的行为。
+        //
+        // 因为本客户端发的是 Connection: close，服务端会关连接，
+        // 所以这个路径能正确结束。
+        return HsReader.readUntilClose(sock, leftover, waitMs)
+    }
+
+    // 按固定长度读。
+    static fn readFixed(sock: TcpStream, first: Array,
+                        need: Int, waitMs: Int) -> Array {
+        var acc = first
+        if (need == 0) { return [true, [], ""] }
+        var spent = 0
+        while len(acc) < need {
+            let r = sock.recvOnce()
+            if (r[0] == true) {
+                let chunk: Array = r[1]
+                acc = bbConcat(acc, chunk)
+                spent = 0
+                continue
+            }
+            if (!sock.alive()) {
+                return [false, [],
+                        "连接在响应体读完前关闭：已收 " + toString(len(acc)) +
+                        "/" + toString(need) + " 字节"]
+            }
+            if (spent >= waitMs) {
+                return [false, [],
+                        "读取响应体超时（" + toString(waitMs) + "ms）：已收 " +
+                        toString(len(acc)) + "/" + toString(need) + " 字节"]
+            }
+            sleep(5)
+            spent = spent + 5
+        }
+        // 可能读超（一次 recv 给了超过 need 的字节）。截断到 need，
+        // 多余的属于下一个响应（keep-alive），当前实现不复用连接，
+        // 所以直接丢弃。
+        return [true, bbSlice(acc, 0, need), ""]
+    }
+
+    // 读到连接关闭。
+    static fn readUntilClose(sock: TcpStream, first: Array, waitMs: Int) -> Array {
+        var acc = first
+        var spent = 0
+        while true {
+            let r = sock.recvOnce()
+            if (r[0] == true) {
+                let chunk: Array = r[1]
+                acc = bbConcat(acc, chunk)
+                spent = 0
+                continue
+            }
+            if (!sock.alive()) { return [true, acc, ""] }
+            if (spent >= waitMs) {
+                // ── 这里是「成功」而不是「失败」 ─────────
+                //
+                // 因为「没声明长度」时，读到超时是唯一可用的终止条件
+                // （除了连接关闭）。已收到的字节是完整的 —— 服务端
+                // 写完就等我们关，不关它就等着。所以把已收的当成
+                // 完整 body 返回。
+                return [true, acc, ""]
+            }
+            sleep(5)
+            spent = spent + 5
+        }
+        return [true, acc, ""]
+    }
+
+    // ── chunked 解码 ──────────────────────────────
+
+    // 解码 Transfer-Encoding: chunked 的 body。
+    //
+    // 格式（RFC 7230 §4.1）：
+    //
+    //   <hex 长度>[;扩展]\r\n
+    //   <该长度的字节>\r\n
+    //   ...
+    //   0\r\n
+    //   [trailer 头]\r\n
+    //   \r\n
+    //
+    // ── 三个容易错的点 ────────────────────────
+    //
+    // 【1】长度是**十六进制**，不是十进制。`1a` 是 26 字节。
+    // 【2】每个 chunk 的数据后面跟着 \r\n，那是分隔符，不属于数据。
+    //     忘了跳过它，下一个 chunk 的长度解析会从 \r 开始 ——
+    //     得到 0，于是「提前遇到终止块」静默截断。
+    // 【3】终止块 `0\r\n` 之后可能还有 trailer 头，然后是空的 \r\n。
+    //     不走完整个结构就关连接，某些服务端会记一笔错误。
+    static fn readChunked(sock: TcpStream, first: Array, waitMs: Int) -> Array {
+        var buf = first
+        let out = []
+        var spent = 0
+
+        while true {
+            // ── 找长度行 ────────────────────────
+            let nl = bbFindSeq(buf, [13, 10], 0)
+            while nl < 0 {
+                let r = sock.recvOnce()
+                if (r[0] == true) {
+                    let chunk: Array = r[1]
+                    buf = bbConcat(buf, chunk)
+                    spent = 0
+                    let nl2 = bbFindSeq(buf, [13, 10], 0)
+                    if (nl2 >= 0) { break }
+                    continue
+                }
+                if (!sock.alive()) {
+                    return [false, [], "chunked 长度行未读完连接即关闭"]
+                }
+                if (spent >= waitMs) {
+                    return [false, [], "读取 chunked 长度行超时"]
+                }
+                sleep(5)
+                spent = spent + 5
+            }
+            let nlAt = bbFindSeq(buf, [13, 10], 0)
+            if (nlAt < 0) {
+                return [false, [], "chunked 长度行缺失"]
+            }
+
+            let lineBytes = bbSlice(buf, 0, nlAt)
+            buf = bbSlice(buf, nlAt + 2, len(buf))
+
+            // 长度行里可能带扩展（`1a;name=value`），取分号前的部分。
+            let lineText = bbToText(lineBytes)
+            let semi = strFind(lineText, ";")
+            var hexPart = lineText
+            if (semi >= 0) { hexPart = strSub(lineText, 0, semi) }
+            hexPart = strTrim(hexPart)
+            // ── 为什么用 fromHex 而不是 strParseInt ────
+            //
+            // 因为 strParseInt 按十进制解析，`1a` 会解析失败（返回 0），
+            // 于是被当成终止块 —— 表现是 body 被截断成前几个 chunk。
+            let size = fromHex(hexPart)
+            if (size < 0) {
+                return [false, [], "chunked 长度不合法：`" + hexPart + "`"]
+            }
+
+            // 终止块
+            if (size == 0) {
+                // 走完 trailer。
+                let tr = HsReader.drainTrailer(sock, buf, waitMs)
+                return [true, out, ""]
+            }
+
+            // ── 读 size 字节 + 末尾 \r\n ──────────
+            let need = size + 2
+            while len(buf) < need {
+                let r = sock.recvOnce()
+                if (r[0] == true) {
+                    let chunk: Array = r[1]
+                    buf = bbConcat(buf, chunk)
+                    spent = 0
+                    continue
+                }
+                if (!sock.alive()) {
+                    return [false, [], "chunked 数据块未读完连接即关闭：需要 " +
+                            toString(need) + " 字节，只有 " + toString(len(buf))]
+                }
+                if (spent >= waitMs) {
+                    return [false, [], "读取 chunked 数据块超时"]
+                }
+                sleep(5)
+                spent = spent + 5
+            }
+
+            let data = bbSlice(buf, 0, size)
+            out2Append(out, data)
+            // 跳过数据后的 \r\n（见【2】）
+            buf = bbSlice(buf, size + 2, len(buf))
+        }
+        return [true, out, ""]
+    }
+
+    // 走完 chunked 的 trailer 部分。
+    //
+    // ── 这个函数曾经是最大的性能陷阱 ────────────────
+    //
+    // 第一版实现是「把剩余数据读干并丢弃，读到超时为止」。它功能上
+    // 正确（trailer 确实被丢掉了），但**每个 chunked 请求都会多等
+    // 满一个 waitMs** —— 默认 15 秒。
+    //
+    // 症状极难定位：响应本身完全正确，只是慢。而慢的位置在日志上
+    // 表现为「读 body 花了 15 秒」，让人以为是 body 很大或者网络慢。
+    // 实际 body 可能只有 11 字节。
+    //
+    // 正确做法是按 trailer 的结构判断结束：`0\r\n` 之后的 trailer
+    // 是零个或多个头行，最后跟一个**空的 \r\n**。所以只要 buf 里
+    // 出现了空行（\r\n 紧跟在某个 \r\n 之后，或 buf 就是 \r\n），
+    // trailer 就结束了。
+    //
+    // 但要小心：`0\r\n\r\n`（无 trailer）时，读 size 那一步已经把
+    // `0\r\n` 消费掉了，此时 buf 里是 `\r\n` —— 直接就是结束标志。
+    static fn drainTrailer(sock: TcpStream, buf: Array, waitMs: Int) {
+        var local = buf
+        var spent = 0
+        while true {
+            // 空行 = 结束。包含两种形态：
+            //   local 以 \r\n 开头        （无 trailer）
+            //   local 里有 \r\n\r\n       （有 trailer 且已读完）
+            if (len(local) >= 2) {
+                let first2 = bbSlice(local, 0, 2)
+                if (bbEq(first2, [13, 10])) { return }
+            }
+            let empty = bbFindSeq(local, [13, 10, 13, 10], 0)
+            if (empty >= 0) { return }
+
+            // 还没读到结束标志，继续读。
+            let r = sock.recvOnce()
+            if (r[0] == true) {
+                let chunk: Array = r[1]
+                local = bbConcat(local, chunk)
+                spent = 0
+                continue
+            }
+            // 对端已关：trailer 不会有更多内容了，正常结束。
+            if (!sock.alive()) { return }
+            // ── 超时也结束 ──────────────────────
+            //
+            // 因为 trailer 是可选且有界的一小段，读不到结束标志说明
+            // 对端实现不规范（漏了最后的 \r\n）。这时**不能**继续
+            // 等 —— 已收到的数据是完整的 body，等下去只是白等。
+            if (spent >= waitMs) { return }
+            sleep(5)
+            spent = spent + 5
+        }
+    }
+}
+
+// 把 src 追加进 dst（原地）。
+//
+// ── 为什么不用 bbConcat 再赋值 ────────────────────
+//
+// 因为 bbConcat 返回新数组。在循环里 `out = bbConcat(out, data)` 是
+// O(n²) 的复制（每次都要重拷已累积的全部数据）。用 arrPush 逐个追加
+// 是均摊 O(1)（Array 扩容是翻倍策略）。
+//
+// 对 1MB 的响应、64 个 chunk 来说，前者约拷 64 次平均 500KB = 32MB，
+// 后者约 1MB。差距在这个量级上还不算致命，但既然能便宜为什么要贵。
+fn out2Append(dst: Array, src: Array) {
+    var i = 0
+    let n = len(src)
+    while i < n {
+        arrPush(dst, bbAt(src, i))
+        i = i + 1
+    }
+}

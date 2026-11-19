@@ -1,0 +1,290 @@
+// ui/widget/widget.xle — 控件抽象基类
+//
+// ── 这一层存在的意义 ──────────────────────────────
+//
+// 40 多个组件如果各自管自己的矩形、可见性、命中判定、启用状态，
+// 那就是 40 份几乎相同但细节略有偏差的代码。而「略有偏差」正是
+// UI 库最贵的 bug 来源 —— 某个控件的 hit 忘了检查 vis，用户就会
+// 在隐藏的面板上点到按钮，而这种问题只有在特定叠放顺序下才出现。
+//
+// 所以基类要把**不变量**写一次：
+//
+//   · vis 为假 → 不画、不响应
+//   · enabled 为假 → 不响应
+//   · hit 必须同时满足「在矩形内」+ 上面两条
+//
+// 子类只需要关心两件事：自己长什么样（draw），被点了做什么（onClick）。
+//
+// ── 为什么 draw 是 abstract ──────────────────────
+//
+// 基类不知道一个按钮长什么样。`abstract` 在这里的作用不是「禁止
+// 实例化」（那只是附带效果），而是**强制子类给出 draw** —— 漏写
+// 是编译错误，而不是运行时画不出东西。
+//
+// ── 为什么没有 onUpdate ─────────────────────────
+//
+// 即时模式下每帧从头执行，没有「上一帧」的概念，也就没有需要
+// 增量更新的状态。需要动画的组件自己持有一个 Anim 值（见
+// core/anim.xle），在 draw 里现算 —— 这比给每个控件加
+// update(dt) 回调简单得多，也不会出现「update 里改了布局、
+// draw 用了旧值」这类顺序问题。
+
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+
+// ── 状态常量 ──────────────────────────────────────
+//
+// 用 Int 而不是 enum：语言还没有 enum，而字符串比较在绘制热路径
+// 上没必要。取值语义写在下面，子类按需取用。
+const WSTATE_NORMAL   = 0
+const WSTATE_HOVER    = 1
+const WSTATE_ACTIVE   = 2   // 按下
+const WSTATE_FOCUS    = 3   // 键盘焦点
+const WSTATE_DISABLED = 4
+
+// 焦点环宽度（像素）。统一在这里定义，避免每个组件画不同粗细，
+// 界面上出现「有的 1px 有的 2px」的焦点框。
+const W_FOCUS_W = 2
+
+abstract class Widget {
+    // 几何。用 Rect 而不是四个 Int —— 传参错位在类型层面不可能发生。
+    r: Rect,
+
+    // 是否参与绘制与命中。隐藏的控件仍占着 r，但不响应任何输入。
+    vis: Bool,
+
+    // 是否可用。禁用态：可见、可读、不可点。
+    //
+    // 与 vis 分开而不是合并成一个「有效」标志，因为两者的视觉语义
+    // 完全不同：vis=false 是「不存在」（不画），enabled=false 是
+    // 「在那但点不了」（要画成灰的）。
+    enabled: Bool,
+
+    // 样式。null 表示「用基类的默认样式」—— 子类构造时从主题派生。
+    //
+    // 用 class 的字段持有 struct 值是可以的（struct 值会内联进
+    // 类的字段槽），所以这里 `style: Style` 是值语义的一份拷贝，
+    // 改它不影响外部的原始样式。
+    style: Style,
+
+    // 是否有键盘焦点。由外部的焦点管理器设置。
+    focused: Bool,
+
+    // 指针是否悬停。由外部的鼠标状态设置，不由组件自己判断 ——
+    // 因为「悬停」需要知道鼠标位置，而那属于输入层。
+    //
+    // 为什么不是每帧在 draw 里算：一个控件可能被别的浮层遮住，
+    // 此时「鼠标在矩形内」不等于「悬停」，判定需要栈信息。交给
+    // 输入层统一算，组件只读结果。
+    hovered: Bool,
+
+    // 构造只接受几何：子类的标注、文字、配色各不相同，无法在基类
+    // 统一定义。所以基类只保证三条不变量：可见、可用、无焦点。
+    constructor(r: Rect) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.style   = Style.plain()
+    }
+
+    // 抽象方法：画自己。
+    //
+    // 没有返回值 —— 绘制就是副作用，返回 Bool 会诱使人把它当成
+    // 「是否被点」。判定交给 hit。
+    abstract fn draw(th: Theme)
+
+    // ── 几何 ──────────────────────────────────────
+
+    fn bounds() -> Rect {
+        return self.r
+    }
+
+    // ── 几何修改的两个注意点 ─────────────────────
+    //
+    // 1. `self.r = rectOf(x, y, self.r.w, self.r.h)` 会报
+    //    「.w 的宿主是 Null」：语言侧对「赋值目标自身的字段读取」
+    //    不做类型追踪。
+    // 2. `let old: Rect = self.r` 加注解也一样 —— 在赋值语句
+    //    右侧的上下文里，self 的字段类型同样丢失。
+    //
+    // 所以这里不在类内改 r，而是提供两个用 **参数** 传几何的
+    // 静态辅助（见文件末尾 widgetMoveTo / widgetResize）。容器
+    // （Stack）直接调它们，类自己的 moveTo 保留为便捷方法，
+    // 内部走同一个路径。
+    // ── 实现方式：拆成「读」和「写」两步 ──────────────
+    //
+    // 直接把 self.r 的字段读出来当新值的组成部分，在类方法里
+    // 会丢类型（`.w 的宿主是 Null`）。而拆两步就没事：
+    // 先把旧值读进一个**独立的**局部量（有注解），再从那个量
+    // 里取字段。
+    //
+    // 这和「b.x 里 b 不在赋值链上」无关 —— 关键在读取发生的
+    // 位置。在赋值语句右侧直接写 self.r.w 会丢，先落到局部量
+    // 上再取就不会。
+    fn moveTo(x: Int, y: Int) -> Widget {
+        let ow = self.r.w
+        let oh = self.r.h
+        self.r = rectOf(x, y, ow, oh)
+        return self
+    }
+
+    fn resize(w: Int, h: Int) -> Widget {
+        let ox = self.r.x
+        let oy = self.r.y
+        self.r = rectOf(ox, oy, w, h)
+        return self
+    }
+
+    // 就地改尺寸（不改位置）。overlay/弹层常用。
+    fn setSize(w: Int, h: Int) -> Widget {
+        return self.resize(w, h)
+    }
+
+    // ── 可见性与可用性 ──────────────────────────────
+
+    fn hide() -> Widget {
+        self.vis = false
+        return self
+    }
+
+    fn show() -> Widget {
+        self.vis = true
+        return self
+    }
+
+    fn setVisible(v: Bool) -> Widget {
+        self.vis = v
+        return self
+    }
+
+    fn disable() -> Widget {
+        self.enabled = false
+        return self
+    }
+
+    fn enable() -> Widget {
+        self.enabled = true
+        return self
+    }
+
+    fn setEnabled(v: Bool) -> Widget {
+        self.enabled = v
+        return self
+    }
+
+    // ── 命中 ─────────────────────────────────────
+    //
+    // 三条不变量在这里，只写一次。子类**不要**覆写它 —— 覆写就
+    // 意味着放弃一致性，而那正是基类存在的理由。
+    //
+    // 若某个控件需要不规则命中（圆形按钮、任意多边形），覆写
+    // hitShape 而不是 hit：hit 保留通用判定，子类只追加形状检查。
+    fn hit(mx: Int, my: Int) -> Bool {
+        if (!self.vis) { return false }
+        if (!self.enabled) { return false }
+        if (!self.r.contains(mx, my)) { return false }
+        return self.hitShape(mx, my)
+    }
+
+    // 形状细化。默认矩形就等于 r，所以基类直接返回真。
+    //
+    // 圆形按钮覆写成「到圆心距离 <= 半径」即可，不需要重写
+    // 可见性/可用性那三条 —— 这是把通用逻辑和形状逻辑分开的价值。
+    fn hitShape(mx: Int, my: Int) -> Bool {
+        return true
+    }
+
+    // 只判可见与可用，不判位置。用于「这块区域该不该响应输入」。
+    fn interactive() -> Bool {
+        return self.vis && self.enabled
+    }
+
+    // ── 样式 ─────────────────────────────────────
+
+    fn setStyle(s: Style) -> Widget {
+        self.style = s
+        return self
+    }
+
+    // 从主题派生一份新样式并设上。
+    fn useTheme(th: Theme) -> Widget {
+        self.style = Style.fromTheme(th)
+        return self
+    }
+
+    // 当前该用哪个填充色。把三态判断收在一处 —— 40 个组件各写一遍
+    // 同样的 if 链，早晚会有一个写错顺序（先判 hover 再判 active，
+    // 按下时颜色就不对）。
+    fn currentFill(th: Theme) -> Int {
+        return Style.fillFor(self.style, self.hovered, false, self.enabled)
+    }
+
+    // ── 焦点环 ───────────────────────────────────
+    //
+    // 键盘导航的最低要求。画在控件外侧而不是内侧：内侧会盖住内容，
+    // 而焦点环必须在不影响布局的前提下可见。
+    //
+    // 由需要它的组件在 draw 末尾调用，不强制所有组件画 ——
+    // 只是标签、分隔线这类不可聚焦的控件不需要。
+    fn drawFocusRing(th: Theme) {
+        if (!self.focused) { return }
+        if (!self.vis) { return }
+        let outer = Rect.inset(self.r, 0 - W_FOCUS_W)
+        winBorderRect(outer.x, outer.y, outer.w, outer.h, W_FOCUS_W, th.focus)
+    }
+
+    // ── 绘制辅助：背景 ────────────────────────────
+    //
+    // 90% 的组件第一步都是「画个带圆角和描边的背景」。写在这里
+    // 而不是每个子类各写一遍，好处是圆角夹紧、渐变回退这些细节
+    // 只实现一次。
+    fn drawBackground(th: Theme) {
+        let s = self.style
+        let fill = Style.fillFor(s, self.hovered, false, self.enabled)
+
+        // 阴影先画（在下面一层）。
+        if (s.shadow != UI_NONE) {
+            let sr = Rect.offset(self.r, s.shadowX, s.shadowY)
+            winFillRound(sr.x, sr.y, sr.w, sr.h, s.radius, s.shadow)
+        }
+
+        if (fill != UI_NONE) {
+            if (s.gradFrom != UI_NONE && s.gradTo != UI_NONE) {
+                winGradient(self.r.x, self.r.y, self.r.w, self.r.h,
+                            s.gradFrom, s.gradTo, s.gradVertical)
+            } else if (s.radius > 0) {
+                winFillRound(self.r.x, self.r.y, self.r.w, self.r.h,
+                             s.radius, fill)
+            } else {
+                winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, fill)
+            }
+        }
+
+        if (s.border != UI_NONE && s.borderW > 0) {
+            if (s.radius > 0) {
+                winBorderRound(self.r.x, self.r.y, self.r.w, self.r.h,
+                               s.radius, s.borderW, s.border)
+            } else {
+                winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h,
+                              s.borderW, s.border)
+            }
+        }
+    }
+
+    // ── 绘制辅助：居中文字 ─────────────────────────
+    //
+    // 控件的文字几乎总是居中或左对齐加内边距。两行封装省掉
+    // 每个 draw 里手算宽高。
+    fn drawTextCenter(s: String, color: Int) {
+        uiTextInRect(self.r, s, color)
+    }
+
+    fn drawTextLeft(s: String, pad: Int, color: Int) {
+        uiTextLeft(self.r, s, pad, color)
+    }
+}

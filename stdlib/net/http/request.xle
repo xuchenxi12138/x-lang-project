@@ -1,0 +1,308 @@
+from "../../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+from "../../db/codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "cookie.xle" import ckParseRequestHeader, ckGet, ckDelete, SetCookie
+
+// net/http/request.xle — 一个 HTTP 请求
+//
+// ── 请求对象的职责边界 ─────────────────────────────
+//
+// 它只负责「怎么把一个请求报文变成结构化数据」，以及「怎么安全地
+// 读它的各部分」。它**不负责**：
+//
+//   · 路由匹配（那是 router 的事，因为路由规则会变）
+//   · 读 body 的完整字节（body 是流，可能还没收完；缓冲策略属于
+//     server 层，因为只有 server 知道 TCP 连接的状态）
+//   · 认证（应用逻辑）
+//
+// 这个边界让 Request 可以被任意构造 —— 测试时可以手搓一个，不必
+// 开真连接。
+//
+// ── 报文的三个部分 ────────────────────────────────
+//
+//   GET /path?q=1 HTTP/1.1\r\n     ← 起始行
+//   Host: a.com\r\n                ← 头
+//   Content-Length: 5\r\n
+//   \r\n                           ← 空行（头结束）
+//   hello                          ← body
+//
+// 起始行里 `?` 后面的不叫 query 而叫 query string；`/path` 是
+// request-target。请求行用 origin-form（见 uri.xle 的 requestTarget）。
+
+from "uri.xle" import uriIsUnreserved, uriPctEncodeByte, uriEncode, uriEncodePath, uriEncodeQueryValue, uriDecode, uriHexVal, uriFindSchemeColon, uriSplitAuthority, strLastFind, uriDirOf, uriNormalizePath, Uri
+from "header.xle" import arrRemoveAt, Headers, HD_COLON, HD_MAX_LINE
+
+// 支持的 HTTP 方法。用字符串而不是枚举 —— 因为真实世界里有
+// 自定义方法（PROPFIND、MKCOL、PURGE 缓存清理），枚举会逼着
+// 实现方在遇到未知方法时丢掉它，而丢掉的后果是「405 但看不出为什么」。
+fn rqKnownMethods() -> Array {
+    return ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH",
+            "OPTIONS", "TRACE", "CONNECT"]
+}
+
+class Request {
+    // 方法，大写（"GET" / "POST" …）
+    method: String
+
+    // 原始请求目标（起始行第二段）。保留原样便于日志与调试。
+    //
+    // ── 为什么不只存解析后的 path+query ──────────────
+    //
+    // 因为签名（AWS SigV4 之类）是对**原始目标**算的，重新拼一遍
+    // 可能改变编码形式（%2F → /）导致签名不匹配。原样保留是唯一
+    // 不会错的策略。
+    target: String
+
+    // 协议版本，如 "HTTP/1.1"
+    version: String
+
+    // 解析后的 URI。
+    uri: Uri
+
+    // 头。
+    headers: Headers
+
+    // body（已收到的部分）。空数组表示没有 body。
+    //
+    // ── 为什么这里放「已收到的部分」而不是「全部」 ─────
+    //
+    // 因为 server 层可能边收边给（大上传）。Request 只忠实保存
+    // 当前拿到了什么，完整性由 server 按 Content-Length 判断。
+    body: Array
+
+    // 请求头里声明的 body 长度。-1 表示没有 Content-Length。
+    contentLength: Int
+
+    // 是否已分块传输（Transfer-Encoding: chunked）。
+    //
+    // ── 为什么要把这个单独标记 ───────────────────
+    //
+    // 因为 chunked 时 Content-Length 必须不存在（RFC 7230 §3.3.2），
+    // 而 body 的边界要靠 chunk 头（`<hex>\r\n<data>\r\n`）自己找。
+    // 如果两者同时出现，按 RFC 应视为走私攻击（request smuggling）
+    // 并拒绝 —— 这类攻击正是靠不同中间设备对「以哪个为准」的分歧。
+    chunked: Bool
+
+    // 远端地址（"ip:port"）。
+    remoteAddr: String
+
+    constructor() {
+        self.method        = "GET"
+        self.target        = "/"
+        self.version       = "HTTP/1.1"
+        self.uri           = new Uri()
+        self.headers       = new Headers()
+        self.body          = []
+        self.contentLength = 0 - 1
+        self.chunked       = false
+        self.remoteAddr    = ""
+    }
+
+    // ── 解析起始行 ────────────────────────────────
+    //
+    // 返回 [ok, error]。
+    //
+    // ── 为什么单独拆出来而不在 parseHead 里一并做 ────
+    //
+    // 因为起始行的畸形程度和头不同：头可以宽容（跳过畸形的），
+    // 起始行不行（不知道方法和目标就什么也做不了）。分开之后
+    // 「起始行错误」能报出精确的原因，而不是「报文解析失败」。
+    fn parseRequestLine(line: String) -> Array {
+        let raw = strTrimEnd(line)
+        // 按空格切成三段。目标里可能有编码的空格（%20），不会有裸空格。
+        let parts = strSplit(raw, " ")
+        // ── 为什么要过滤空段 ─────────────────────
+        //
+        // 因为畸形报文里可能有连续空格（`GET  /  HTTP/1.1`）。不过滤
+        // 会让第三段变成空串，版本判断失败。真实的恶意构造也常用多
+        // 空格来绕过按空格数判断的中间设备。
+        let segs = []
+        var i = 0
+        while i < len(parts) {
+            let p: String = parts[i]
+            if (len(p) > 0) { arrPush(segs, p) }
+            i = i + 1
+        }
+        if (len(segs) < 3) {
+            return [false, "请求行格式错误，期望 `METHOD target HTTP/x.y`，实际：`" +
+                    raw + "`"]
+        }
+        let m: String = segs[0]
+        let t: String = segs[1]
+        let v: String = segs[2]
+
+        if (!strStarts(v, "HTTP/")) {
+            return [false, "协议版本格式错误，期望 `HTTP/x.y`，实际：`" + v + "`"]
+        }
+        // 只接受 1.x。HTTP/0.9 没有头，HTTP/2 是二进制（不是文本帧）。
+        // 静默接受未知版本会让「客户端偷偷用 0.9 发无头请求」绕过
+        // 所有中间设备的头检查 —— 那是有名的请求走私手法。
+        if (v != "HTTP/1.0" && v != "HTTP/1.1") {
+            return [false, "不支持的 HTTP 版本 `" + v +
+                    "`（本实现只支持 HTTP/1.0 与 HTTP/1.1）"]
+        }
+
+        self.method  = strUpper(m)
+        self.target  = t
+        self.version = v
+        self.uri     = Uri.parse(t)
+        return [true, ""]
+    }
+
+    // ── 读完头之后的整理 ──────────────────────────
+    //
+    // 从 headers 推导 contentLength / chunked，并做一致性检查。
+    fn finalizeHead() -> Array {
+        let te = strLower(self.headers.get("transfer-encoding"))
+        if (strFind(te, "chunked") >= 0) {
+            self.chunked = true
+        }
+
+        let cl = self.headers.get("content-length")
+        if (len(cl) > 0) {
+            let n = toIntOr(cl, 0 - 1)
+            if (n < 0) {
+                return [false, "Content-Length 不是合法数字：`" + cl + "`"]
+            }
+            self.contentLength = n
+        }
+
+        // ── 两个都有 = 请求走私 ───────────────────
+        //
+        // RFC 7230 §3.3.3：如果 Transfer-Encoding 存在，Content-Length
+        // 必须被忽略。但「忽略」在不同实现里做法不同 —— 前端代理按
+        // CL 转发、后端按 TE 解析，于是同一个报文被解析成两个不同的
+        // 请求，第二个是攻击者塞进去的。
+        //
+        // 正确做法是直接拒绝（400），而不是选一个为准。
+        if (self.chunked && self.contentLength >= 0) {
+            return [false,
+                    "同时存在 Transfer-Encoding: chunked 和 Content-Length —— " +
+                    "这是请求走私（request smuggling）的典型特征，已拒绝"]
+        }
+
+        // ── HTTP/1.1 必须有 Host ──────────────────
+        //
+        // RFC 7230 §5.4：HTTP/1.1 的请求**必须**带 Host 头，缺失应
+        // 返回 400。因为 Host 决定虚拟主机路由，没有它服务端不知道
+        // 该交给哪个站点处理。
+        if (self.version == "HTTP/1.1" && !self.headers.has("host")) {
+            return [false, "HTTP/1.1 请求缺少 Host 头"]
+        }
+
+        return [true, ""]
+    }
+
+    // ── 便捷读取 ─────────────────────────────────
+
+    // 查询参数名/值（平行数组）。
+    fn queryParams() -> Array {
+        return rqParseQuery(self.uri.query)
+    }
+
+    // 按名字取查询参数。同名多个时取第一个。
+    fn queryOf(name: String, def: String) -> String {
+        let r = self.queryParams()
+        let names: Array  = r[0]
+        let values: Array = r[1]
+        return ckGet(names, values, name, def)
+    }
+
+    // 请求 cookie（平行数组）。
+    fn cookies() -> Array {
+        return ckParseRequestHeader(self.headers.get("cookie"))
+    }
+
+    fn cookieOf(name: String, def: String) -> String {
+        let r = self.cookies()
+        let names: Array  = r[0]
+        let values: Array = r[1]
+        return ckGet(names, values, name, def)
+    }
+
+    // body 当文本。
+    fn bodyText() -> String {
+        return bbToText(self.body)
+    }
+
+    // 路径（已解码）。
+    //
+    // ── 为什么用解码后的路径做路由匹配 ───────────────
+    //
+    // 因为路由规则是按「人写的路径」定义的（`/user/:id`），而客户端
+    // 可能编码成 `/%75ser/1`。不统一解码会让合法请求 404。
+    //
+    // 但必须**一次性**解码（uriDecode 只解一层），因为二次解码正是
+    // 目录穿越攻击的手法：`%252e%252e` 解一次成 `%2e%2e`，再解一次
+    // 才是 `..`。只解一层就把攻击输入留在字面形式上。
+    fn path() -> String {
+        return uriDecode(self.uri.path)
+    }
+
+    fn isMethod(m: String) -> Bool {
+        return self.method == strUpper(m)
+    }
+
+    // 客户端是否声明接受某种内容类型（Accept 头粗略匹配）。
+    fn acceptsContentType(ct: String) -> Bool {
+        let acc = strLower(self.headers.get("accept"))
+        if (len(acc) == 0) { return true }        // 没写 = 什么都接受
+        if (strFind(acc, "*/*") >= 0) { return true }
+        return strFind(acc, strLower(ct)) >= 0
+    }
+
+    fn describe() -> String {
+        return "Request " + self.method + " " + self.target + " " + self.version +
+               " (" + toString(self.headers.count()) + " 头, " +
+               toString(len(self.body)) + " body 字节" +
+               ", from " + self.remoteAddr + ")"
+    }
+}
+
+// 解析查询串成平行数组。
+//
+// ── 为什么拆成独立函数而不放在 Request 里 ─────────────
+//
+// 因为 Response 侧也要拼查询串，而拼和拆共用同一套编码规则。
+// 放在这里能让 uri.xle 不依赖 header.xle（否则会形成循环 import）。
+fn rqParseQuery(q: String) -> Array {
+    let names  = []
+    let values = []
+    if (len(q) == 0) { return [names, values] }
+
+    let parts = strSplit(q, "&")
+    var i = 0
+    while i < len(parts) {
+        let seg: String = parts[i]
+        if (len(seg) > 0) {
+            let at = strFind(seg, "=")
+            if (at >= 0) {
+                let rawName  = strSub(seg, 0, at)
+                let rawValue = strSub(seg, at + 1, len(seg))
+                arrPush(names, uriDecode(rqPlusToSpace(rawName)))
+                arrPush(values, uriDecode(rqPlusToSpace(rawValue)))
+            } else {
+                // `?flag` —— 只有名字没有值。按空值处理。
+                arrPush(names, uriDecode(rqPlusToSpace(seg)))
+                arrPush(values, "")
+            }
+        }
+        i = i + 1
+    }
+    return [names, values]
+}
+
+// 把查询串里的 `+` 当空格。
+//
+// ── 为什么只在查询串里做 ─────────────────────────
+//
+// 因为 `+` 代表空格是 application/x-www-form-urlencoded 的规则，
+// 作用范围就是查询串和表单 body。路径里的 `+` 是**字面加号**
+// （`/a+b` 和 `/a b` 是不同资源）。
+//
+// 在路径里也替换会让 `/a+b` 变成 `/a b`，然后 404 —— 或者更糟，
+// 匹配到本该是另一个资源的路由。
+fn rqPlusToSpace(s: String) -> String {
+    if (strFind(s, "+") < 0) { return s }
+    return strReplace(s, "+", " ")
+}

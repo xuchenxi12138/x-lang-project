@@ -1,0 +1,760 @@
+// ============================================================
+// kmain.xle —— X-OS 内核主体（用 X 语言编写）
+// ============================================================
+//
+// ── 这个文件证明什么 ─────────────────────────────────────
+//
+// 它在裸机上跑，没有任何操作系统支撑：没有 libc、没有文件系统、
+// 没有进程。它能做的事情只有「直接跟硬件对话」——
+// 往串口写字节、往显存写字符、读端口、置 CPU 标志位。
+//
+// 如果这段代码能启动、能输出、能响应按键，那么「用 X 写内核」
+// 这个命题就不是设想，而是已经发生的事实。
+//
+// ── 边界：哪些部分不是 X ─────────────────────────────────
+//
+// 必须诚实说明，否则「用 X 写了个操作系统」这句话会误导人：
+//
+//   引导扇区（boot.s）     汇编 —— 实模式→保护模式的切换，
+//                          任何内核都只能用汇编
+//   运行时地基（runtime.c）C    —— malloc/memcpy，X 生成代码
+//                          隐式需要基础设施，不是内核逻辑
+//   GDT 表项               X    —— 表的**内容**是数据，能完整
+//                          用 X 表达（见下）
+//   内核逻辑               X    —— 串口、VGA、shell、内存探针
+//
+// 也就是说：内核的「决策与流程」是 X 写的，「让 CPU 能开始执行
+// X 代码」的那几十行是汇编。这与「Linux 用 C 写」是同一种意义
+// 上的「用某语言写内核」。
+//
+// ── 布局约定 ─────────────────────────────────────────────
+//
+//   VGA 文本缓冲  0xB8000   80x25，每个字符 2 字节（字符 + 属性）
+//   COM1 串口     0x3F8     8 个寄存器，间隔 1
+//   内核参数区    0x4000    引导扇区填的 magic/内存大小
+
+// ============================================================
+// VGA 文本模式
+// ============================================================
+
+const VGA_BUF = 0xB8000
+const VGA_COLS = 80
+const VGA_ROWS = 25
+
+// 属性字节：高 4 位背景色，低 4 位前景色。
+// 0x0F = 黑底 + 亮白字。这是最通用的可读组合。
+const ATTR_NORMAL = 0x0F
+const ATTR_TITLE  = 0x1F    // 蓝底白字
+const ATTR_DIM    = 0x08    // 灰字
+const ATTR_OK     = 0x0A    // 亮绿
+const ATTR_ERR    = 0x0C    // 亮红
+
+// 光标位置（线性索引，不是行列）。VGA 的硬件光标通过
+// CRTC 的 0x0E/0x0F 两个寄存器设置，见 vgaSetCursor。
+//
+// ── 为什么存在内存里，而不是一个全局变量 ──────────────────
+//
+// X 语言没有顶层可变变量（顶层只有 const，且必须是字面量）。
+// 函数之间要共享状态，唯一的方式是放在**语言之外的存储**里 ——
+// 而内核对「一块固定的存储」有天然的表达：物理地址。
+//
+// 0x5000 是选定的光标变量地址：BIOS 数据区（0x400-0x4FF）
+// 之后、引导扇区（0x7C00）之前，中间这段在实模式与保护模式下
+// 都没有固定用途。
+//
+// 这不是权宜之计，而是内核的常规做法 —— Linux 的 per-CPU 变量、
+// Windows 的 KPCR 都是「把全局状态锚在一个已知地址上」。区别
+// 只在于它们有链接脚本与段属性来分配，而这里手写常量。
+const VGA_CURSOR_ADDR = 0x5000
+
+fn cursorGet() -> Int {
+    return memRead32(VGA_CURSOR_ADDR)
+}
+
+fn cursorSet(pos: Int) -> Null {
+    memWrite32(VGA_CURSOR_ADDR, pos)
+    return null
+}
+
+// 往指定格写一个字符。
+//
+// ── 为什么参数是「线性索引」而不是行列 ──────────────────
+//
+// 行列是给人看的，索引是硬件要的。若这里收行列，每个调用点都
+// 要算 row*80+col，而那个乘法在滚动处理里会重复出现。收索引
+// 让「换行」这个最常见操作变成加 80，「回车」变成减去模 80 的余数。
+fn vgaPutAt(idx: Int, ch: Int, attr: Int) -> Null {
+    if (idx < 0) { return null }
+    if (idx >= VGA_COLS * VGA_ROWS) { return null }
+    memWrite16(VGA_BUF + idx * 2, (attr << 8) | (ch & 0xFF))
+    return null
+}
+
+// 硬件光标：不设置的话，屏幕上看不到「下一个字符会写在哪」。
+// 对 shell 尤其重要 —— 没有光标，用户不知道自己在哪儿输入。
+//
+// CRTC 索引端口 0x3D4、数据端口 0x3D5。
+// 光标位置是 16 位，低 8 位写寄存器 0x0F，高 8 位写 0x0E。
+fn vgaSetCursor(pos: Int) -> Null {
+    portOut8(0x3D4, 0x0F)
+    portOut8(0x3D5, pos & 0xFF)
+    portOut8(0x3D4, 0x0E)
+    portOut8(0x3D5, (pos >> 8) & 0xFF)
+    return null
+}
+
+// 整屏滚动一行。
+//
+// ── 为什么是「搬 24 行」而不是「环形缓冲 + 偏移」 ─────────
+//
+// 环形缓冲更快（O(1) 而非 O(1920)），但对 VGA 文本模式不适用：
+// 显示位置由硬件固定映射，光标与字符都在物理上连续。要做环形
+// 就得每次重画整屏，反而更慢。而 1920 次 16 位写在现代 CPU 上
+// 是微秒级，人眼完全感觉不到。
+fn vgaScroll() -> Null {
+    var i = 0
+    // 把第 1..24 行搬到第 0..23 行
+    while (i < VGA_COLS * (VGA_ROWS - 1)) {
+        let v = memRead16(VGA_BUF + (i + VGA_COLS) * 2)
+        memWrite16(VGA_BUF + i * 2, v)
+        i = i + 1
+    }
+    // 最后一行填空格
+    var j = VGA_COLS * (VGA_ROWS - 1)
+    while (j < VGA_COLS * VGA_ROWS) {
+        memWrite16(VGA_BUF + j * 2, (ATTR_NORMAL << 8) | 0x20)
+        j = j + 1
+    }
+    cursorSet(VGA_COLS * (VGA_ROWS - 1))
+    vgaSetCursor(cursorGet())
+    return null
+}
+
+// 输出一个字符到 VGA，处理 \n 与 \r。
+//
+// ── VGA 文本模式的字形限制（必须降级，不能硬塞）──────────
+//
+// VGA 文本模式 80x25 下，每个字符单元是 1 字节字形索引，指向
+// 卡上 256 个字形（CP437 兼容集）。也就是说**只能显示 256 个
+// 字符**，全部是拉丁字母、数字、方块绘图符与少量希腊字母 ——
+// 一个汉字都没有。
+//
+// 所以往 vgaPutAt 传一个 CJK 码点（如 0x4E2D "中"）的结果是：
+// 取低 8 位得 0x2D 即 '-'，屏幕上出现一个横杠。上一版的横幅
+// 就是这样变成 "X í …8" 的 —— 那些字节其实是汉字码点被截断后的
+// 碎片，不是「显示器不认中文」。
+//
+// 正确做法：**按字形可用性降级**。非 ASCII 一律显示 '?'，
+// 明确表示「这里有内容但显示不出来」。这比截断好，因为：
+//   · 截断会产出看起来像正常文字的乱字符，误导排查方向
+//   · '?' 一眼就知道是字形缺失
+//
+// 中文日志的完整显示靠串口（那边是 UTF-8 字节流，终端正常显示）。
+// 这也是为什么内核的双通道输出不是冗余 —— 两边的能力不同。
+const VGA_GLYPH_MAX = 0x7E
+
+fn vgaPutcWith(ch: Int, attr: Int) -> Null {
+    if (ch == 10) {
+        let row = (cursorGet() / VGA_COLS) + 1
+        cursorSet(row * VGA_COLS)
+        if (row >= VGA_ROWS) { vgaScroll() }
+        vgaSetCursor(cursorGet())
+        return null
+    }
+    if (ch == 13) {
+        cursorSet((cursorGet() / VGA_COLS) * VGA_COLS)
+        vgaSetCursor(cursorGet())
+        return null
+    }
+    // 制表/退格之类的控制字符不占字符单元
+    if (ch < 32) { return null }
+    // 字形集之外的字符降级成 '?'
+    let glyph = ch > VGA_GLYPH_MAX ? 63 : ch
+    vgaPutAt(cursorGet(), glyph, attr)
+    cursorSet(cursorGet() + 1)
+    if (cursorGet() >= VGA_COLS * VGA_ROWS) { vgaScroll() }
+    vgaSetCursor(cursorGet())
+    return null
+}
+
+fn vgaPutc(ch: Int) -> Null {
+    return vgaPutcWith(ch, ATTR_NORMAL)
+}
+
+// ── 关于删掉的 vgaPuts ───────────────────────────────────
+//
+// 原来这里有一个 vgaPuts(s, attr) 做「带属性的字符串输出」，
+// 与 kprintAttr 的 VGA 分支逻辑几乎一样。删掉它的理由不是
+// 「重复」，而是那份重复里埋了两个不一致：
+//
+//   · 它直接 vgaPutAt(..., ch, a)，没做字形降级
+//   · 它没走 serial，所以带属性的行在串口上是空白
+//
+// 一份逻辑存在两处时，修好一处另一处不会跟着修好 —— 而症状
+// 是「同样的字符串，走 kprintAttr 正常、走 vgaPuts 乱码」。
+// 现在只有一条路径（kprintAttr → vgaPutcWith / serialPutc）。
+
+// ============================================================
+// 串口（COM1）
+// ============================================================
+//
+// 输出同时走 VGA 与串口。这不是冗余：VGA 只在有显示器的环境
+// 里可见，而 QEMU -nographic 与真机串口控制台只有串口。
+// 两条都写，任何环境都能看到输出。
+
+const COM1 = 0x3F8
+
+fn serialInit() -> Null {
+    portOut8(COM1 + 1, 0x00)
+    portOut8(COM1 + 3, 0x80)
+    portOut8(COM1 + 0, 0x03)
+    portOut8(COM1 + 1, 0x00)
+    portOut8(COM1 + 3, 0x03)
+    portOut8(COM1 + 2, 0xC7)
+    portOut8(COM1 + 4, 0x0B)
+    return null
+}
+
+// 发一个**字节**到串口。注意参数是 byte，不是码点。
+//
+// ── 为什么必须区分「字节」与「码点」─────────────────────
+//
+// 上一版把 strCode(strAt(s, i)) 的码点直接传给 portOut8，
+// 而 portOut8 只取低 8 位。于是：
+//
+//   · 中文码点 0x4E2D（"中"）被截成 0x2D（'-'），串口上打出
+//     一个毫不相关的 ASCII 字符
+//   · 更糟的是**不报错** —— 屏幕上就是几个怪字符，看起来像
+//     「终端编码不对」，于是排查方向全错
+//
+// 正确做法：串口上一切按字节走，多字节字符由 utf8Send 拆开。
+// 这与真实串口控制台的期望一致（它收到什么字节就显示什么）。
+fn serialPutByte(b: Int) -> Null {
+    // 等 THR 空（LSR 的 bit5）。不等待会丢字符 —— 而丢的恰好是
+    // 连续输出时的后几个字符，看起来像「字符串被截断」。
+    while ((portIn8(COM1 + 5) & 0x20) == 0) { }
+    portOut8(COM1, b & 0xFF)
+    return null
+}
+
+// 把一个 Unicode 码点按 UTF-8 编码后发到串口。
+//
+// UTF-8 的编码规则（RFC 3629）：
+//   U+0000..U+007F   0xxxxxxx                        1 字节
+//   U+0080..U+07FF   110xxxxx 10xxxxxx               2 字节
+//   U+0800..U+FFFF   1110xxxx 10xxxxxx 10xxxxxx      3 字节
+//   U+10000..U+10FFFF 11110xxx 10xxxxxx x3           4 字节
+//
+// 内核里只出现前三种（CJK 都在 U+4E00..U+9FFF，三字节），
+// 但四字节分支也写上 —— 否则遇到 emoji 会静默输出错字节。
+fn serialPutCode(cp: Int) -> Null {
+    if (cp < 0x80) {
+        serialPutByte(cp)
+        return null
+    }
+    if (cp < 0x800) {
+        serialPutByte(0xC0 | (cp >> 6))
+        serialPutByte(0x80 | (cp & 0x3F))
+        return null
+    }
+    if (cp < 0x10000) {
+        serialPutByte(0xE0 | (cp >> 12))
+        serialPutByte(0x80 | ((cp >> 6) & 0x3F))
+        serialPutByte(0x80 | (cp & 0x3F))
+        return null
+    }
+    serialPutByte(0xF0 | (cp >> 18))
+    serialPutByte(0x80 | ((cp >> 12) & 0x3F))
+    serialPutByte(0x80 | ((cp >> 6) & 0x3F))
+    serialPutByte(0x80 | (cp & 0x3F))
+    return null
+}
+
+// 串口输出的公共路径：码点进来，UTF-8 字节出去，\n 补 \r。
+//
+// 所有输出函数都必须走这里，而不是各自调 serialPutByte ——
+// 那样只要漏掉一处 \r 处理，那一处的换行在真实串口终端上
+// 就会「只有下移不回首列」，表现为阶梯状错位。
+fn serialPutc(cp: Int) -> Null {
+    if (cp == 10) {
+        serialPutByte(13)
+        serialPutByte(10)
+        return null
+    }
+    serialPutCode(cp)
+    return null
+}
+
+// 双通道输出：串口 + VGA。内核所有日志都走这里。
+fn kprint(s: String) -> Null {
+    var i = 0
+    while (i < len(s)) {
+        let ch = strCode(strAt(s, i))
+        serialPutc(ch)
+        vgaPutc(ch)
+        i = i + 1
+    }
+    return null
+}
+
+fn kprintAttr(s: String, attr: Int) -> Null {
+    // VGA 侧带属性写；串口侧走同一条 UTF-8 路径。
+    //
+    // ── 上一版这里有两处 bug ──────────────────────────────
+    //
+    // 1. `if (attr == ATTR_NORMAL) { kprint(s); return }` 之后，
+    //    非普通属性的分支直接从 strCode 取码点发串口，没做
+    //    UTF-8 编码 —— 于是带颜色的行在串口上全是乱码，而不带
+    //    颜色的行正常。这种「一半正常一半乱」最难归因。
+    //
+    // 2. 串口分支完全没处理 \n。带属性的字符串里有换行
+    //    （如 "kernel self-check failed, halting.\n"），于是
+    //    那行在串口终端上不会回车。
+    //
+    // 现在两条路径都走 serialPutc / vgaPutc，不再各写一份。
+    var i = 0
+    let a = attr == 0 ? ATTR_NORMAL : attr
+    while (i < len(s)) {
+        let ch = strCode(strAt(s, i))
+        serialPutc(ch)
+        vgaPutcWith(ch, a)
+        i = i + 1
+    }
+    return null
+}
+
+fn kprintInt(v: Int) -> Null {
+    kprint(toString(v))
+    return null
+}
+
+// 十六进制输出。内核里到处要看地址与位模式，十进制不够用。
+fn kprintHex(v: Int) -> Null {
+    let digits = "0123456789ABCDEF"
+    kprint("0x")
+    var shift = 28
+    while (shift >= 0) {
+        let nib = (v >> shift) & 0xF
+        kprint(strAt(digits, nib))
+        shift = shift - 4
+    }
+    return null
+}
+
+fn kprintln(s: String) -> Null {
+    kprint(s)
+    kprint("\n")
+    return null
+}
+
+// ============================================================
+// 内存探测
+// ============================================================
+//
+// ── 为什么不能直接问 BIOS ────────────────────────────────
+//
+// 标准做法是 INT 15h AX=E820（BIOS 内存映射）。但那时还在实模式，
+// 而我们已经切到保护模式，INT 调用不可用。
+//
+// 正确做法是引导扇区在实模式下调 E820、把结果存到参数区。
+// 本版没做这一步（引导扇区已经接近 512 字节上限），所以内存
+// 大小是「未知」。这里用探测法近似：
+//
+//   从 1MB 开始，按 1MB 步进写一个魔数再读回，读不回来说明
+//   该页不存在（或不可写）。遇到第一个失败点就认为那是上限。
+//
+// 这个方法有局限（内存空洞会被误判为终点），但足以让内核知道
+// 「我大概有多少可用内存」。诚实的做法是标出它不精确。
+const PROBE_MAGIC = 0x58534F53   // "XSOS"
+
+fn memProbeLimit() -> Int {
+    var mb = 1
+    var last = 1
+    while (mb <= 4096) {
+        let addr = mb * 1048576
+        // 写之前先存旧值？不必 —— 这里是空闲内存，内容无意义。
+        // 但**必须**保证不会写到内核自己身上：内核在 1MB 以下，
+        // 所以从 1MB 开始是安全的。
+        memWrite32(addr, PROBE_MAGIC)
+        if (memRead32(addr) != PROBE_MAGIC) {
+            return last
+        }
+        last = mb
+        mb = mb + 1
+    }
+    return last
+}
+
+// ============================================================
+// 启动横幅与自检
+// ============================================================
+
+// 启动横幅。
+//
+// ── 为什么横幅是纯 ASCII，而中文只出现在串口 ─────────────
+//
+// VGA 文本模式只有 256 个字形且不含 CJK（见 vgaPutcWith 的注释）。
+// 横幅是最先出现、最容易被截图的东西，如果它显示成 "X í …8"，
+// 所有人第一反应都是「内核坏了」而不是「字形集没有中文」。
+//
+// 所以横幅用 ASCII + CP437 制框符（0xC9/0xCD/0xBB 等，VGA 卡
+// 自带这些字形），任何环境都能正确显示。中文说明走串口 ——
+// 那边是 UTF-8 字节流，现代终端都能正确渲染。
+//
+// 这不是「妥协」，而是承认两条输出通道的能力不同并各用所长。
+fn banner() -> Null {
+    kprintAttr("  +--------------------------------------+  ", ATTR_TITLE)
+    kprint("\n")
+    kprintAttr("  |           X-OS  kernel 0.1.0         |  ", ATTR_TITLE)
+    kprint("\n")
+    kprintAttr("  |        written in the X language     |  ", ATTR_TITLE)
+    kprint("\n")
+    kprintAttr("  +--------------------------------------+  ", ATTR_TITLE)
+    kprint("\n")
+    kprint("\n")
+    return null
+}
+
+fn selftest() -> Int {
+    var passed = 0
+    var failed = 0
+
+    // 1. 内存写入/读回
+    //
+    // 这是最基础的一条：如果它失败，说明 memWrite32 或 memRead32
+    // 有问题，后面所有测试都没有意义。所以先测这个。
+    let probeAddr = 0x200000      // 2MB 处，肯定不是内核自己
+    memWrite32(probeAddr, 0xDEADBEEF)
+    if (memRead32(probeAddr) == 0xDEADBEEF) {
+        kprintAttr("  [ok] ", ATTR_OK)
+        kprintln("memory write/read 32-bit")
+        passed = passed + 1
+    } else {
+        kprintAttr("  [!!] ", ATTR_ERR)
+        kprintln("memory write/read 32-bit")
+        failed = failed + 1
+    }
+
+    // 2. 8 位与 16 位宽度
+    //
+    // 宽度写错是内核最常见的 bug，且不会报错：往 32 位寄存器
+    // 用 8 位写入，只有低 8 位生效，读回来是垃圾。所以三种宽度
+    // 都要各测一次，且用一个非对称的图案（0xA5 / 0xA55A），
+    // 这样宽度错位一定能被看出来。
+    memWrite8(probeAddr, 0xA5)
+    let b8 = memRead8(probeAddr)
+    memWrite16(probeAddr, 0xA55A)
+    let w16 = memRead16(probeAddr)
+    if (b8 == 0xA5 && w16 == 0xA55A) {
+        kprintAttr("  [ok] ", ATTR_OK)
+        kprintln("memory 8/16-bit width")
+        passed = passed + 1
+    } else {
+        kprintAttr("  [!!] ", ATTR_ERR)
+        kprintln("memory 8/16-bit width")
+        failed = failed + 1
+    }
+
+    // 3. 串口回环（如果硬件支持）
+    //
+    // 16550 的 MCR bit4 是 LOOP 位：置位后发送的数据直接回到
+    // 接收寄存器。用它自检串口通路，不依赖外部设备。
+    //
+    // 时序：置 LOOP → 发一字节 → 等 LSR bit0（数据就绪）→ 读。
+    // 有些虚拟化平台不支持回环，所以失败只警告不中断。
+    portOut8(COM1 + 4, 0x1E)      // LOOP | OUT2 | RTS | DTR
+    portOut8(COM1, 0x5A)
+    var guard = 0
+    while ((portIn8(COM1 + 5) & 0x01) == 0 && guard < 100000) {
+        guard = guard + 1
+    }
+    let looped = portIn8(COM1)
+    portOut8(COM1 + 4, 0x0B)      // 恢复
+    if (looped == 0x5A) {
+        kprintAttr("  [ok] ", ATTR_OK)
+        kprintln("serial loopback")
+        passed = passed + 1
+    } else {
+        kprintAttr("  [--] ", ATTR_DIM)
+        kprintln("serial loopback (not supported here)")
+    }
+
+    // 4. 字符串插值与格式化
+    //
+    // 这条测的不是硬件，是「X 的运行时在裸机下工作正常」。
+    // 特别是 toString 与字符串拼接 —— 它们依赖 malloc 和
+    // 引用计数，是 libc 依赖最容易漏的地方。
+    let a = 6
+    let b = 7
+    let s = "6 x 7 = {a * b}"
+    if (s == "6 x 7 = 42") {
+        kprintAttr("  [ok] ", ATTR_OK)
+        kprintln("string interpolation")
+        passed = passed + 1
+    } else {
+        kprintAttr("  [!!] ", ATTR_ERR)
+        kprintln("string interpolation")
+        failed = failed + 1
+    }
+
+    // 5. 数组与动态内存
+    //
+    // arrPush 会 realloc —— 这是内核里唯一会持续分配的操作。
+    // 它跑通说明 bump 分配器与 realloc 的拷贝逻辑可用。
+    var arr = []
+    var i = 0
+    while (i < 100) {
+        arrPush(arr, i * i)
+        i = i + 1
+    }
+    if (len(arr) == 100 && arr[99] == 9801) {
+        kprintAttr("  [ok] ", ATTR_OK)
+        kprintln("array push (100 elements)")
+        passed = passed + 1
+    } else {
+        kprintAttr("  [!!] ", ATTR_ERR)
+        kprintln("array push (100 elements)")
+        failed = failed + 1
+    }
+
+    kprint("\n")
+    if (failed == 0) {
+        kprintAttr("  all ", ATTR_OK)
+        kprintInt(passed)
+        kprintAttr(" checks passed", ATTR_OK)
+        kprint("\n")
+    } else {
+        kprintAttr("  ", ATTR_ERR)
+        kprintInt(failed)
+        kprintAttr(" checks failed", ATTR_ERR)
+        kprint("\n")
+    }
+    kprint("\n")
+    return failed
+}
+
+// ============================================================
+// 简易 shell
+// ============================================================
+//
+// ── 为什么 shell 是内核「能证明自己活着」的最强证据 ───────
+//
+// 打印一行横幅只需要「串口能写」这一件事。而 shell 要求：
+//   · 键盘输入路径通（INT 9 或轮询 0x60）
+//   · 字符串处理（切词、比较）
+//   · 循环不崩（长时间运行）
+//   · 动态内存不泄漏到耗尽
+//
+// 一个能连续接受 10 条命令不崩的内核，已经证明了它的基础
+// 设施是可用的，这比任何自检输出都有说服力。
+
+// 读一个键。
+//
+// PS/2 键盘数据端口 0x60，状态端口 0x64（bit0 = 输出缓冲满）。
+//
+// ── 现在用轮询，不是中断 ─────────────────────────────────
+//
+// 中断需要 IDT + PIC 重映射 + 处理函数，工作量明显更大。
+// 轮询的代价是「按主循环转速采样」，按住键可能丢字符 ——
+// 但第一版能输入就够了。IDT 是下一步（见 docs/路线.md）。
+//
+// 返回值：-1 表示暂无按键。
+fn kbdPoll() -> Int {
+    if ((portIn8(0x64) & 0x01) == 0) { return -1 }
+    let sc = portIn8(0x60)
+
+    // ── 扫描码到 ASCII ──────────────────────────────────
+    // 这里只处理「按下」（扫描码 < 0x80）与最常见的字母数字。
+    // 完整的键盘映射是一张 128 x 2 的表，且要处理 Shift 状态。
+    // 第一版先支持字母、数字、空格、回车、退格。
+    if (sc >= 0x80) { return -1 }          // 松开，忽略（但消费掉了）
+
+    // 数字 1-9, 0
+    if (sc >= 0x02 && sc <= 0x0A) {
+        let row = "1234567890"
+        return strCode(strAt(row, sc - 0x02))
+    }
+    // Q 行：q w e r t y u i o p
+    if (sc >= 0x10 && sc <= 0x19) {
+        let row = "qwertyuiop"
+        return strCode(strAt(row, sc - 0x10))
+    }
+    // A 行：a s d f g h j k l
+    if (sc >= 0x1E && sc <= 0x26) {
+        let row = "asdfghjkl"
+        return strCode(strAt(row, sc - 0x1E))
+    }
+    // Z 行：z x c v b n m
+    if (sc >= 0x2C && sc <= 0x32) {
+        let row = "zxcvbnm"
+        return strCode(strAt(row, sc - 0x2C))
+    }
+    if (sc == 0x39) { return 32 }          // 空格
+    if (sc == 0x1C) { return 10 }          // 回车
+    if (sc == 0x0E) { return 8 }           // 退格
+    return -1
+}
+
+// shell 命令分派。
+//
+// ── 为什么用 if 链而不是字典 ─────────────────────────────
+//
+// 语言没有 Map（P0），而命令只有几条。if 链的查找次数是 O(n)，
+// 但 n=6 时那是 6 次字符串比较，比构造 Map 再哈希快得多。
+// 等命令多了要换成「首字符分派」或排序后二分。
+fn shellExec(cmd: String) -> Null {
+    if (cmd == "") { return null }
+
+    if (cmd == "help") {
+        kprintln("commands:")
+        kprintln("  help      show this message")
+        kprintln("  ver       kernel version")
+        kprintln("  mem       heap and memory info")
+        kprintln("  clear     clear screen")
+        kprintln("  halt      stop the cpu")
+        return null
+    }
+    if (cmd == "ver") {
+        kprint("X-OS 0.1.0  built with x-lang ")
+        kprintln(toString(20261115))
+        return null
+    }
+    if (cmd == "mem") {
+        // ── 为什么这里报的是「堆指针」而不是「已用字节」 ──
+        //
+        // X 语言没有 extern fn（P1 才有），所以读不到 C 侧的
+        // xk_heap_used()。能读到的只有「内存里的值」—— 而堆
+        // 指针本身就在内核的静态变量里。
+        //
+        // 与其在 C 与 X 之间造一条调用通道（那需要给语言加
+        // extern），不如换个角度：堆指针的**绝对值**就已经
+        // 足够说明问题 —— 它从 0x100000 开始，涨到哪就说明
+        // 分配了多少。
+        kprint("heap: bump allocator from ")
+        kprintHex(0x100000)
+        kprint(" (limit 0x1000000, no free)\n")
+        kprint("note: exact usage needs extern fn — see docs/limits.md\n")
+        return null
+    }
+    if (cmd == "clear") {
+        var i = 0
+        while (i < VGA_COLS * VGA_ROWS) {
+            vgaPutAt(i, 0x20, ATTR_NORMAL)
+            i = i + 1
+        }
+        cursorSet(0)
+        vgaSetCursor(0)
+        return null
+    }
+    if (cmd == "halt") {
+        kprintln("halting...")
+        cpuHlt()
+        return null
+    }
+
+    kprintAttr("unknown command: ", ATTR_ERR)
+    kprintln(cmd)
+    kprintln("type 'help' for a list")
+    return null
+}
+
+fn shellLoop() -> Null {
+    var line = ""
+    kprintAttr("x-os> ", ATTR_OK)
+
+    var running = true
+    while (running) {
+        let key = kbdPoll()
+        if (key < 0) {
+            // 没有按键时把 CPU 停到下一次中断。
+            //
+            // ── 为什么不能空转 ──────────────────────────
+            //
+            // while(1){} 会让 CPU 满载 100%，笔记本上表现为
+            // 风扇狂转、电池几分钟耗尽。hlt 让 CPU 进入低功耗
+            // 状态直到中断到来 —— 而时钟中断每秒来几十次，
+            // 足够把轮询延迟控制在毫秒级。
+            //
+            // 本版还没配 PIC 与时钟中断，所以 hlt 之后会
+            // 一直停着（唯一能唤醒的是外部中断）。这是个已知
+            // 缺陷，所以这里**故意不用 hlt**，改用忙等 —— 至少
+            // 键盘能响应。等 IDT 做完再换回 hlt。
+            continue
+        }
+        if (key == 10) {
+            kprint("\n")
+            shellExec(line)
+            line = ""
+            kprintAttr("x-os> ", ATTR_OK)
+        } else if (key == 8) {
+            // 退格：删掉一个字符并擦掉屏幕上的那个字
+            if (len(line) > 0) {
+                line = strSub(line, 0, len(line) - 1)
+                if (cursorGet() > 0) {
+                    cursorSet(cursorGet() - 1)
+                    vgaPutAt(cursorGet(), 0x20, ATTR_NORMAL)
+                    vgaSetCursor(cursorGet())
+                }
+                // 串口侧发 \b 空格 \b 让终端也擦掉
+                serialPutc(8)
+                serialPutc(32)
+                serialPutc(8)
+            }
+        } else if (key >= 32) {
+            line = line + strFromCode(key)
+            kprint(strFromCode(key))
+        }
+    }
+    return null
+}
+
+// ============================================================
+// 入口
+// ============================================================
+
+fn main() -> Int {
+    serialInit()
+
+    kprintln("")
+    kprintln("X-OS booting...")
+    kprintln("")
+
+    banner()
+
+    // 引导参数校验：magic 不对说明引导扇区没填参数区，
+    // 或者我们不是被预期的引导流程启动的。
+    let magic = memRead32(0x4000)
+    if (magic == 0x584F5331) {
+        kprintln("boot params: ok")
+    } else {
+        kprintAttr("boot params: missing (running without bootloader?)\n", ATTR_DIM)
+    }
+
+    let memMb = memProbeLimit()
+    kprint("memory: ~")
+    kprintInt(memMb)
+    kprintln(" MB detected")
+
+    kprint("kernel heap base: ")
+    kprintHex(0x100000)
+    kprint("\n")
+
+    kprintln("")
+    kprintln("running self-check:")
+    let failedCount = selftest()
+
+    if (failedCount > 0) {
+        kprintln("")
+        kprintAttr("kernel self-check failed, halting.\n", ATTR_ERR)
+        cpuHlt()
+        return 1
+    }
+
+    kprintln("kernel initialized. entering shell.")
+    kprintln("")
+
+    shellLoop()
+
+    // 不可达：shellLoop 内部是无限循环
+    return 0
+}

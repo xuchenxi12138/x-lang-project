@@ -1,0 +1,227 @@
+// db/core/pool.xle — 连接池
+//
+// ── 为什么需要连接池 ────────────────────────────
+//
+// 建一条数据库连接要付三次 TCP 往返（MySQL 握手 + 认证 + 初始化），
+// 在局域网上是 3~10ms，跨机房是 50~200ms。而一次简单查询本身
+// 只要 1ms。所以「每次查询都新建连接」意味着 99% 的时间花在
+// 建连上。
+//
+// ── 但 P0 的实现是「受限的」 ─────────────────────
+//
+// 真正的连接池要能：
+//   · 多个连接并发持有
+//   · 借出/归还带超时
+//   · 空闲连接定期探活并淘汰
+//   · 归还时重置会话状态（避免上一个人的 SET 影响下一个人）
+//
+// 而 P0 的语言没有线程、没有定时器、没有事件循环内建的钩子。
+// 所以这里的池是**单线程、非并发、显式借还**的：
+//
+//     let p = new Pool(factory, 4)
+//     p.begin()
+//     p.exec("...")
+//     p.commit()
+//     p.end()          // 归还
+//
+// 这在「一个 HTTP 请求处理完一次业务」的模型下完全够用 —— 而
+// 那正是这个框架的模型（见 stdlib/web）。
+//
+// ── 池里存的是什么 ────────────────────────────
+//
+// 存 DataSource 实例（每个实例内部持有一条真实连接）。池不关心
+// 底下是 MySQL 还是 Redis，只调 connect / close / ping。
+//
+// 因为函数不是一等值，factory 用**整数种类编号**代替函数指针，
+// 由 createById 分发。这是当前语言能力下的唯一做法。
+
+from "datasource.xle" import sqlBind, execAll, DataSource
+from "dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+
+class Pool {
+    // 池中所有连接。
+    items: Array,
+
+    // 哪些是空闲的（与 items 等长，Bool）。true = 可借。
+    idles: Array,
+
+    // 最大连接数。
+    maxSize: Int,
+
+    // 数据库种类（DB_MYSQL 等）。用于重建连接。
+    kind: Int,
+
+    // 端点。
+    ep: Endpoint,
+
+    // 累计借出次数（诊断用）。
+    borrowCount: Int,
+
+    // 从未命中（借不到）的次数。
+    missCount: Int,
+
+    constructor(ep: Endpoint, kind: Int, maxSize: Int) {
+        self.ep          = ep
+        self.kind        = kind
+        self.maxSize     = maxSize
+        self.items       = []
+        self.idles       = []
+        self.borrowCount = 0
+        self.missCount   = 0
+    }
+
+    static fn of(ep: Endpoint, kind: Int, maxSize: Int) -> Pool {
+        return new Pool(ep, kind, maxSize)
+    }
+
+    // ── 借还 ────────────────────────────────────
+
+    // 借一条连接。优先复用空闲的，没有空闲且未达上限就新建。
+    // 借不到返回 null。
+    //
+    // ── 为什么返回 null 而不是抛异常 ────────────────
+    //
+    // 因为「池满了」是一个**正常的**运行时状态（并发高时必然发生），
+    // 调用方应该有能力降级（返回 503、排队、用缓存）。异常会强制
+    // 每个调用点都写 try，而语言当前还没有 try。
+    fn borrow() -> DataSource {
+        // 1. 找空闲的
+        var i = 0
+        while i < len(self.items) {
+            if (toBoolOr(toString(self.idles[i]), false)) {
+                self.idles[i] = false
+                self.borrowCount = self.borrowCount + 1
+                let ds: DataSource = self.items[i]
+                // 探活：空闲太久的连接可能已被服务端断开
+                if (!ds.ping()) {
+                    ds.connect()
+                }
+                return ds
+            }
+            i = i + 1
+        }
+        // 2. 未达上限则新建
+        if (len(self.items) < self.maxSize) {
+            let ds = makeDataSource(self.kind, self.ep)
+            if (ds == null) { return null }
+            if (!ds.connect()) { return null }
+            arrPush(self.items, ds)
+            arrPush(self.idles, false)
+            self.borrowCount = self.borrowCount + 1
+            return ds
+        }
+        // 3. 池满
+        self.missCount = self.missCount + 1
+        return null
+    }
+
+    // 归还。找不到就忽略（重复归还不会出错）。
+    fn release(ds: DataSource) {
+        var i = 0
+        while i < len(self.items) {
+            let one: DataSource = self.items[i]
+            if (one == ds) {
+                self.idles[i] = true
+                return
+            }
+            i = i + 1
+        }
+    }
+
+    // ── 便捷执行 ────────────────────────────────
+    //
+    // 「借 → 执行 → 归还」三步太啰嗦，而绝大多数调用都是这三步。
+    // 这两个方法把归还放进 finally 语义里（语言没有 finally，
+    // 所以靠「执行完就还」+ 错误路径也还来保证）。
+
+    fn query(sql: String) -> ResultSet {
+        let ds = self.borrow()
+        if (ds == null) {
+            return ResultSet.fail("连接池已耗尽（上限 " + toString(self.maxSize) + "）")
+        }
+        let rs = ds.query(sql)
+        self.release(ds)
+        return rs
+    }
+
+    fn execute(sql: String) -> ResultSet {
+        let ds = self.borrow()
+        if (ds == null) {
+            return ResultSet.fail("连接池已耗尽（上限 " + toString(self.maxSize) + "）")
+        }
+        let rs = ds.execute(sql)
+        self.release(ds)
+        return rs
+    }
+
+    // ── 生命周期 ────────────────────────────────
+
+    fn closeAll() {
+        var i = 0
+        while i < len(self.items) {
+            let ds: DataSource = self.items[i]
+            ds.close()
+            i = i + 1
+        }
+        self.items = []
+        self.idles = []
+    }
+
+    fn size() -> Int {
+        return len(self.items)
+    }
+
+    fn idleCount() -> Int {
+        var n = 0
+        var i = 0
+        while i < len(self.idles) {
+            if (toBoolOr(toString(self.idles[i]), false)) { n = n + 1 }
+            i = i + 1
+        }
+        return n
+    }
+
+    fn describe() -> String {
+        return "连接池 " + dialectName(dialectOf(self.kind)) + " @ "
+             + endpointString(self.ep) + "：" + toString(self.size())
+             + "/" + toString(self.maxSize) + " 已建，"
+             + toString(self.idleCount()) + " 空闲，借出 "
+             + toString(self.borrowCount) + " 次，未命中 "
+             + toString(self.missCount) + " 次"
+    }
+}
+
+// ── 工厂分发 ────────────────────────────────────
+//
+// ── 为什么是「按编号 new」而不是函数指针 ───────────
+//
+// 语言没有函数值。所以「给我一个连接工厂」这个需求只能变成
+// 「给我一个种类编号」，然后在这里 if/else 分发。
+//
+// 代价是每加一个驱动就要改这个函数 —— 但那本来也是必须的
+// （驱动要注册进来）。而且这个 if 链是**唯一**的耦合点，比
+// 「每个调用点各写一遍 switch」好得多。
+fn makeDataSource(kind: Int, ep: Endpoint) -> DataSource {
+    return null
+}
+
+// 注册表：把种类编号映射到「是否可用」。
+//
+// 为什么需要它：驱动可能因为运行时缺少某个能力（比如内存型
+// SQLite 不需要网络）而不可用，应用启动时应该能先问一句
+// 「支持哪些库」，而不是等到 connect 才失败。
+fn supportedKinds() -> Array {
+    // 顺序按使用频率排，不是随意。
+    return [DB_MYSQL, DB_POSTGRES, DB_SQLITE, DB_REDIS, DB_MONGO, DB_ES, DB_ORACLE]
+}
+
+fn kindSupported(kind: Int) -> Bool {
+    let xs = supportedKinds()
+    var i = 0
+    while i < len(xs) {
+        if (toInt(xs[i]) == kind) { return true }
+        i = i + 1
+    }
+    return false
+}

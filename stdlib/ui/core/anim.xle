@@ -1,0 +1,199 @@
+// ui/core/anim.xle — 动画（按时间插值的值对象）
+//
+// ── 即时模式下的动画该长什么样 ────────────────────
+//
+// 状态机式的动画（onStart / onUpdate / onComplete + 内部计时器）
+// 需要一个**长期存活且可变**的对象。而即时模式每帧重建一切，
+// 状态机里的计时器要么存在外部，要么就得让控件有身份 ——
+// 后者正是即时模式要避免的东西。
+//
+// 所以这里用最朴素也最稳的形式：**一个值 + 一个时间区间**。
+//
+//     let a = Anim.at(0.0, 1.0, 0.3)
+//     let v = a.value()      // 每帧算一次，0 到 1
+//
+// 没有回调、没有内部状态推进、没有生命周期。t0 是创建时刻，
+// value() 用 winTime() 现算 —— 同一个 Anim 值在任何帧调用
+// 都会得到「按真实时间应得的值」，所以它天然可以在多控件间
+// 共享，也天然能被拷贝。
+//
+// 代价：Anim 必须被**持有**（存在某个跨帧存活的地方）。这是
+// 调用方的责任，也是唯一无法避免的一点 —— 时间的流逝本身
+// 就需要一个「从什么时候开始」的记录。
+//
+// ── 缓动曲线为什么手写而不是查表 ────────────────────
+//
+// 二次曲线足够，而且闭式公式让「任意时刻求值」成立（查表要给
+// 每个阶段建表，表的精度又成了新参数）。真要更好的曲线，
+// cubic 版本也只是改两行。
+
+// ---- 动画（Anim）----
+//
+// ============================================================
+// 设计说明：为什么动画是「按时间插值」而不是状态机
+// ============================================================
+//
+// ── 即时模式下的动画该长什么样 ──────────────────────────────
+//
+// 状态机式的动画（onStart / onUpdate / onComplete + 内部计时器）
+// 需要一个**长期存活且可变**的对象。而即时模式每帧重建一切，
+// 状态机里的计时器要么存在外部，要么就得让控件有身份 ——
+// 后者正是即时模式要避免的东西。
+//
+// 所以这里用最朴素也最稳的形式：**一个值 + 一个时间区间**。
+//
+//     let a = Anim.at(0.0, 1.0, 0.3)
+//     let v = a.value()      // 每帧算一次，0 到 1
+//
+// 没有回调、没有内部状态推进、没有生命周期。t0 是创建时刻，
+// value() 用 winTime() 现算 —— 同一个 Anim 值在任何帧调用
+// 都会得到「按真实时间应得的值」，所以它天然可以在多控件间
+// 共享，也天然能被拷贝。
+//
+// 代价：Anim 必须被**持有**（存在某个跨帧存活的地方）。这是
+// 调用方的责任，也是唯一无法避免的一点 —— 时间的流逝本身
+// 就需要一个「从什么时候开始」的记录。
+//
+// ── 缓动曲线为什么手写而不是查表 ────────────────────────────
+//
+// 二次曲线足够，而且闭式公式让「任意时刻求值」成立（查表要给
+// 每个阶段建表，表的精度又成了新参数）。真要更好的曲线，
+// cubic 版本也只是改两行。
+struct Anim {
+    a: Float,        // 起点值
+    b: Float,        // 终点值
+    t0: Float,       // 起始时刻（winTime）
+    dur: Float,      // 时长（秒）
+    ease: Int,       // 0=线性 1=easeIn 2=easeOut 3=easeInOut
+}
+
+// 缓动：把线性 0~1 映射成曲线 0~1。
+//
+// 三个公式都保证 e(0)=0、e(1)=1 —— 这是动画不「跳」的前提。
+fn Anim.easeApply(kind: Int, t: Float) -> Float {
+    if (kind == 1) {
+        return t * t                       // easeIn：慢起
+    }
+    if (kind == 2) {
+        return t * (2.0 - t)               // easeOut：快起慢停
+    }
+    if (kind == 3) {
+        // easeInOut：前半加速、后半减速。用 2t² / 1-2(1-t)²
+        // 而不是三次贝塞尔 —— 后者要解方程才能求值，而这个
+        // 每帧都要算。
+        if (t < 0.5) { return 2.0 * t * t }
+        let u = 1.0 - t
+        return 1.0 - 2.0 * u * u
+    }
+    return t                               // 线性
+}
+
+fn Anim.at(a: Float, b: Float, dur: Float) -> Anim {
+    return Anim {
+        a: a, b: b,
+        t0: winTime(),
+        dur: dur,
+        ease: 2,      // 默认 easeOut：UI 里最常用的是「快速出现、缓缓停住」
+    }
+}
+
+// 起止都是 0~1 的简化版（主用于透明度、进度）。
+fn Anim.unit(dur: Float) -> Anim {
+    return Anim.at(0.0, 1.0, dur)
+}
+
+fn Anim.withEase(self: Anim, kind: Int) -> Anim {
+    return Anim {
+        a: self.a, b: self.b,
+        t0: self.t0, dur: self.dur,
+        ease: kind,
+    }
+}
+
+// 改起点时刻（用于手动推迟开始）。
+fn Anim.startedAt(self: Anim, t: Float) -> Anim {
+    return Anim {
+        a: self.a, b: self.b,
+        t0: t, dur: self.dur,
+        ease: self.ease,
+    }
+}
+
+// 当前进度 0.0~1.0（未缓动）。用于「是不是结束了」之外的自定义插值。
+fn Anim.progress(self: Anim) -> Float {
+    let el = winTime() - self.t0
+    if (self.dur <= 0.0) { return 1.0 }
+    var k = el / self.dur
+    if (k < 0.0) { k = 0.0 }
+    if (k > 1.0) { k = 1.0 }
+    return k
+}
+
+// 当前值（已缓动）。
+fn Anim.value(self: Anim) -> Float {
+    let k = Anim.easeApply(self.ease, self.progress())
+    return self.a + (self.b - self.a) * k
+}
+
+// 当前值，转成 Int。位置、尺寸、颜色分量这类整数场景用这个，
+// 省掉调用点每处的 toInt。
+fn Anim.valueInt(self: Anim) -> Int {
+    return toInt(Anim.value(self))
+}
+
+fn Anim.done(self: Anim) -> Bool {
+    return Anim.progress(self) >= 1.0
+}
+
+// ── 便捷构造（v0.18 新增）──────────────────────────────
+//
+// 三个最常用的组合固定下来，避免每个调用点都写
+// `Anim.at(...).withEase(2)`。名字说明用途而不是参数。
+
+// 淡入：0 → 1，0.2 秒 easeOut。做透明度乘子用。
+fn Anim.fadeIn(dur: Float) -> Anim {
+    let a = Anim.at(0.0, 1.0, dur)
+    return Anim.withEase(a, 2)
+}
+
+// 淡出：1 → 0。
+fn Anim.fadeOut(dur: Float) -> Anim {
+    let a = Anim.at(1.0, 0.0, dur)
+    return Anim.withEase(a, 2)
+}
+
+// 从上滑入：y 从 -20 到 0，easeOut。对话框出现时用。
+fn Anim.slideInY(px: Float, dur: Float) -> Anim {
+    let a = Anim.at(0.0 - px, 0.0, dur)
+    return Anim.withEase(a, 2)
+}
+
+// 弹出：0.85 → 1.0 缩放，easeOut。比纯淡入有「弹出来」的感觉。
+fn Anim.popIn(dur: Float) -> Anim {
+    let a = Anim.at(0.85, 1.0, dur)
+    return Anim.withEase(a, 2)
+}
+
+// 进度环/进度条的平滑推进：从 old 到 new。
+fn Anim.toward(old: Float, target: Float, dur: Float) -> Anim {
+    let a = Anim.at(old, target, dur)
+    return Anim.withEase(a, 2)
+}
+
+// ── 组合辅助 ─────────────────────────────────────────
+
+// 按动画值把透明度换算成 0~100 的整数（Style.opacity 要这个）。
+fn Anim.alphaOf(self: Anim) -> Int {
+    let v = Anim.value(self)
+    var p = toInt(v * 100.0)
+    if (p < 0) { p = 0 }
+    if (p > 100) { p = 100 }
+    return p
+}
+
+// 按动画值插值两个 Int（颜色、坐标、尺寸）。缓动已经算在 value 里。
+fn Anim.lerpInt(self: Anim, a: Int, b: Int) -> Int {
+    let v = Anim.value(self)
+    let span = toFloat(b - a)
+    return a + toInt(span * v)
+}

@@ -1,0 +1,33 @@
+// 50-new-syntax-zh-en.xle — 50-new-syntax-zh.xlc 的英文对应版
+//
+// 这个文件**不参与功能测试**（没有 .expect），它存在的唯一目的是
+// 给 run_tests.sh 提供比对基准：中文版与它的指令序列必须逐条相同。
+//
+// 所以两边的结构、常量、运算顺序必须完全一致 —— 改一边就要改另一边，
+// 否则失败的会是「中英字节码不一致」，而那个报错看起来像中文化出了
+// 问题，实际是两份源码本来就不同。
+
+fn classify(n: Int) -> String {
+    return match n {
+        0           => "零",
+        1..=9       => "一位数",
+        v @ 10..=99 => "两位数:{v}",
+        _           => "大数",
+    }
+}
+
+fn main() -> Int {
+    let a = [1, 2, 3]
+    let empty_arr = []
+    let s = a[0] > 0 ? "正" : "负"
+    // 空数组不是 null —— 这一行验证「?? 只认 null，不认空容器」
+    let z = empty_arr ?? 5
+    println(s)
+    println(len(z))          // 0（不是 5，说明空数组没被当成 null）
+    println(classify(42))
+
+    // 插值里用中文标识符
+    let name = "世界"
+    println("你好，{name}")
+    return 0
+}

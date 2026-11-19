@@ -1,0 +1,263 @@
+// ui/core/text.xle — 文字度量与摆放
+//
+// ── 为什么单独一个文件 ────────────────────────────
+//
+// 「在矩形里居中写字」这件事，在 40 个控件里出现了 40 次。每次
+// 重写都要重新推导 (w - tw) / 2 和 (h - th) / 2，而这两个式子
+// 是最容易写反的地方之一：写成 (w / 2 - tw / 2) 在偶数上结果一样，
+// 在奇数上就差一像素，而且只在奇数宽度时才看得出来。
+//
+// 所以这里把「度量」和「摆放」两件事封起来，控件只声明意图：
+//
+//   uiTextInRect(r, "确定", th.text)      // 这块里居中
+//   uiTextLeft(r, "名称", 8, th.text)     // 左边留 8px
+//
+// ── 度量用内建，不估算 ────────────────────────────
+//
+// 窗口层提供 winTextWidth / winTextHeight，是真实字体度量。
+// 早先版本按「ASCII 7px、CJK 12px」估，居中会偏 2~3px，
+// 等宽字体里 "WWW" 和 "iii" 算成一样宽 —— 按钮上看不出来，
+// 表格列宽就会错位。既然内建存在，就别估。
+//
+// ── 为什么不在这里做数字格式化 ────────────────────
+//
+// 格式化是 std.conv 的职责（fixed / percent / bytes 都在那儿），
+// UI 层再写一份就成了两份要同步维护的实现。这个文件只管
+// 「把已经成型的字符串放到正确的位置」，不做业务上的数字处理。
+
+from "rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+// 默认行高。winTextHeight 给的是当前字体的实际行高，但布局
+// 计算（列表行高、表格行高）需要一个常数才好算格子。这个常量
+// 只用于布局，精确放置一律调 uiTextHeight()。
+const UI_FONT_H = 16
+
+// ── 度量 ────────────────────────────────────────
+
+// 文字像素宽度。转发内建，存在的意义是让 UI 层不需要记住
+// 「哪个度量该用 win* 前缀、哪个用 ui* 前缀」。
+fn uiTextWidth(s: String) -> Int {
+    return winTextWidth(s)
+}
+
+// 文字像素高度（行高）。
+fn uiTextHeight() -> Int {
+    return winTextHeight()
+}
+
+// 一行文字在给定宽度里需要占几行（向上取整，至少 1）。
+//
+// 用于「高度自适应」的标签和提示框：先按字数估行数，再乘行高
+// 得到需要的高度。用整串度量而不是逐字累加，理由同 uiEllipsize。
+fn uiLineCount(s: String, maxW: Int) -> Int {
+    if (maxW <= 0) { return 1 }
+    let total = winTextWidth(s)
+    if (total <= maxW) { return 1 }
+    // 向上取整除法，避免 1.05 行被判成 1 行。
+    return (total + maxW - 1) / maxW
+}
+
+// ── 摆放：以 Rect 为参数（新代码优先用这组）──────
+
+// 水平 + 垂直都居中。
+fn uiTextInRect(r: Rect, s: String, color: Int) {
+    let tw = winTextWidth(s)
+    let th = winTextHeight()
+    winText(r.x + (r.w - tw) / 2, r.y + (r.h - th) / 2, s, color)
+}
+
+// 左对齐 + 垂直居中，左侧留 pad。
+fn uiTextLeft(r: Rect, s: String, pad: Int, color: Int) {
+    winText(r.x + pad, r.y + (r.h - winTextHeight()) / 2, s, color)
+}
+
+// 右对齐 + 垂直居中，右侧留 pad。
+fn uiTextRight(r: Rect, s: String, pad: Int, color: Int) {
+    let tw = winTextWidth(s)
+    winText(r.x + r.w - pad - tw, r.y + (r.h - winTextHeight()) / 2, s, color)
+}
+
+// 左对齐 + 顶端对齐。多行文本块的起点用它，不用垂直居中 ——
+// 多行块居中会让它在内容变化时整体跳动。
+fn uiTextTopLeft(r: Rect, s: String, pad: Int, color: Int) {
+    winText(r.x + pad, r.y, s, color)
+}
+
+// ── 摆放：以坐标为中心 ────────────────────────────
+
+// 以 (cx, cy) 为中心画。自绘的刻度、圆点标注用。
+fn uiTextCentered(cx: Int, cy: Int, s: String, color: Int) {
+    let tw = winTextWidth(s)
+    let th = winTextHeight()
+    winText(cx - tw / 2, cy - th / 2, s, color)
+}
+
+// 兼容老 ui.xle 的签名：cx 是水平中心，y 是文字顶边。
+fn uiTextCenter(cx: Int, y: Int, s: String, color: Int) {
+    winText(cx - winTextWidth(s) / 2, y - winTextHeight() / 2, s, color)
+}
+
+// 四 Int 版本的左对齐。老代码里 Cursor 逐行推进时只有坐标。
+fn uiTextLeftAt(x: Int, y: Int, w: Int, h: Int, s: String, pad: Int, color: Int) {
+    winText(x + pad, y + (h - winTextHeight()) / 2, s, color)
+}
+
+// ── 截断 ────────────────────────────────────────
+//
+// 文字放不下时怎么办是必须显式决定的问题，三个选项各有用处，
+// 所以给三个函数而不是一个带 flag 的。
+//
+// 默认取 uiEllipsize ——「看得见有更多内容」比「看不见被切了」
+// 对用户更诚实。
+
+// 单行省略。maxW 是可用像素宽度。
+//
+// 实现是「从右往左丢字符直到放得下」，而不是逐字符累加 ——
+// 因为 winTextWidth 是整串度量，不是可加的：字距（kerning）
+// 让 "AV" 比 "A" + "V" 窄一点，累加法在长串上会累积误差。
+// 从右丢对短标签足够，且不需要二分。
+fn uiEllipsize(s: String, maxW: Int) -> String {
+    if (winTextWidth(s) <= maxW) { return s }
+    let ell = "..."
+    let ellW = winTextWidth(ell)
+    if (maxW <= ellW) { return ell }
+
+    var i = len(s)
+    while i > 0 {
+        let sub = strSub(s, 0, i)
+        if (winTextWidth(sub) + ellW <= maxW) {
+            return sub + ell
+        }
+        i = i - 1
+    }
+    return ell
+}
+
+// 硬切（不加省略号）。用在列宽固定、溢出本身就是提示的表头。
+fn uiTruncate(s: String, maxW: Int) -> String {
+    if (winTextWidth(s) <= maxW) { return s }
+    var i = len(s)
+    while i > 0 {
+        if (winTextWidth(strSub(s, 0, i)) <= maxW) {
+            return strSub(s, 0, i)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 从**尾部**保留的省略：把开头丢掉，换成 "..."。
+//
+// ── 和 uiEllipsize 的分工 ─────────────────────
+//
+//   uiEllipsize    —— 保留开头（"很长的文件名很长的...."）
+//   uiEllipsizeEnd —— 保留结尾（".../workspace/src/main.xle"）
+//
+// 为什么必须有第二个：显示路径时，用户关心的永远是**末尾**那几级
+// 目录和文件名。丢掉尾部的省略号等于把最有信息量的部分删了。
+//
+// 实现是从左往右丢字符，每丢一个就测宽度 —— 不比正着做慢，因为
+// 目标宽度通常很接近原文宽度（丢几个字符就够）。
+fn uiEllipsizeEnd(s: String, maxW: Int) -> String {
+    if (winTextWidth(s) <= maxW) { return s }
+    let ell = "..."
+    let ellW = winTextWidth(ell)
+    if (maxW <= ellW) { return ell }
+
+    // 从索引 i 开始的后缀 + "..." 是否放得下。
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let tail = strSub(s, i, n)
+        if (winTextWidth(tail) + ellW <= maxW) {
+            return ell + tail
+        }
+        i = i + 1
+    }
+    return ell
+}
+
+// 从右往左找子串，找不到返回 -1。
+//
+// 语言只有 strFind（首个）和 strFindFrom（从某处往后），没有反向查找。
+// 折行需要「最近的那个空格」，所以这里补一个。实现是循环调用
+// strFindFrom 记住上一次命中位置，直到找不到为止 —— 纯 ASCII 文本
+// 上这比翻转字符串再查快得多，也不会因为多字节字符边界而出错。
+fn uiLastFind(s: String, sub: String) -> Int {
+    var pos = 0
+    var last = -1
+    while true {
+        let k = strFindFrom(s, sub, pos)
+        if (k < 0) { return last }
+        last = k
+        pos = k + 1
+        if (pos >= len(s)) { return last }
+    }
+    return last
+}
+
+// 按像素宽度贪心折行，返回行数组。
+//
+// ── 算法 ────────────────────────────────────────
+//
+// 逐字符累积到当前行；一旦加上这个字符就超宽，分两种情况：
+//
+//   · 行内有空格 → 在**最后一个**空格处断开，空格之后的残余
+//     （也就是正在拼的那个词）留作下一行的开头，当前字符不消费。
+//   · 行内没空格 → 说明是个比整行还长的词，只能硬切。
+//
+// 「不消费当前字符」是关键：它是（可能的）新行首字符，如果消费
+// 掉就会丢字。早先写成 i = i + 0 后又在外层 i = i + 1，实际等于
+// 消费了它，于是 "wrapping" 被切成 "w"/"rappin"/"g" —— 这种
+// bug 不会崩，只会让文字看起来「莫名多了个空格」，很难在测试里
+// 抓到。
+fn uiWrapLines(s: String, maxW: Int) -> Array {
+    let out = []
+    if (len(s) == 0) { return out }
+    if (maxW <= 0) { arrPush(out, s); return out }
+
+    var line = ""
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = strSub(s, i, i + 1)
+
+        // 显式换行符优先于宽度判断：用户写了 \n 就是要断。
+        if (ch == "\n") {
+            arrPush(out, line)
+            line = ""
+            i = i + 1
+            continue
+        }
+
+        if (winTextWidth(line + ch) > maxW && len(line) > 0) {
+            let sp = uiLastFind(line, " ")
+            if (sp > 0) {
+                arrPush(out, strSub(line, 0, sp))
+                line = strSub(line, sp + 1, len(line))
+                continue        // 注意：不推进 i，让 ch 进下一行
+            }
+            arrPush(out, line)
+            line = ""
+            continue            // 同上
+        }
+
+        line = line + ch
+        i = i + 1
+    }
+    if (len(line) > 0) { arrPush(out, line) }
+    return out
+}
+
+// 多行块绘制。返回实际占用的高度，方便调用方接着往下排。
+fn uiTextBlock(r: Rect, lines: Array, lineH: Int, pad: Int, color: Int) -> Int {
+    var y = r.y + pad
+    var i = 0
+    while i < len(lines) {
+        winText(r.x + pad, y, toString(lines[i]), color)
+        y = y + lineH
+        i = i + 1
+    }
+    return y - r.y
+}

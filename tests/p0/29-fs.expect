@@ -1,0 +1,54 @@
+---- 基本读写 ----
+true
+true
+5
+hello
+true
+hi
+2
+---- 追加 ----
+true
+true
+line1
+line2
+line3
+---- 空文件 vs 打不开 ----
+0
+0
+[默认值]
+[]
+---- 非字符串内容 ----
+42
+3.5
+true
+---- 中文 ----
+张三：你好，世界
+8
+24
+---- 多行 ----
+6
+6
+---- 原子替换 ----
+true
+new content
+true
+created
+---- 目录 ----
+true
+true
+false
+true
+true
+true
+true
+false
+0
+---- 删除 ----
+true
+false
+-1
+false
+gone
+---- 清理 ----
+false
+fs ok

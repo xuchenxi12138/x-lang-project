@@ -1,0 +1,326 @@
+// ui/layout/stack.xle — 纵向/横向排布容器
+//
+// ── 和 layout.xle 的分工 ─────────────────────────
+//
+// layout.xle 提供**游标**（手工推进：`f = layoutAdvance(f, 24, 8)`），
+// 适合「我自己控制每一行的位置」。
+//
+// stack.xle 提供**容器**（声明式：`vbox.add(widget, 24)` 然后
+// `vbox.layout()`），适合「我有一组控件，帮我顺序排好」。
+//
+// 两者不是重复，是两种使用节奏：游标用于快速手排，Stack 用于
+// 「控件集合会变化（动态增添）的场景」—— 那时手工维护游标很累，
+// 而 Stack 里加一个就好。
+//
+// ── Stack 为什么持有子控件引用 ─────────────────
+//
+// 因为它要调子控件的 moveTo 来设定位置。这意味着 Stack 必须在
+// 子控件「存在期间」存在 —— 值是这一个约束，不是缺点：
+// 控件几乎总在 Stack 之前创建。
+//
+// ── 为什么不叫 VBox/HBox 两个类 ──────────────────
+//
+// 因为差异只有「主轴方向」，而除方向之外的一切（间距、padding、
+// 交叉轴拉伸、按比例分配）都完全一样。两个类会复制这套逻辑两次，
+// 然后漂移。用一个 vertical 字段切换是更小的代价。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "layout.xle" import layoutFrame, layoutRaw, layoutColumn, layoutRow, layoutNext, layoutAdvance, layoutNextCol, layoutAdvanceCol, layoutSplit, layoutSplitV, layoutAt, layoutPlace, layoutCenter, layoutHCenter, layoutInset, layoutPadLeft, layoutPadRight, layoutPadTop, layoutPadBottom, layoutPadH, layoutPadV, layoutRemainder, layoutSpacer, Cursor, ALIGN_START, ALIGN_CENTER, ALIGN_END, ALIGN_STRETCH
+from "spacer.xle" import Spacer
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+
+// 子控件的记录。
+//
+// ── 为什么用并行数组而不是结构体数组 ────────────
+//
+// 同 tree.xle 的理由：结构体数组的元素下标访问之后取不到字段
+// （静态不可追踪）。三个并行数组（kids / heights / weights）
+// 用下标对齐，逻辑上等价，但每项都能直接用。
+class Stack extends Widget {
+    // 子控件（Widget 引用）。
+    kids: Array,
+
+    // 每项的主轴尺寸。0 表示「按剩余空间均分」。
+    sizes: Array,
+
+    // 每项的权重（sizes 为 0 时用）。
+    weights: Array,
+
+    // 主轴方向。true = 纵向（自上而下）。
+    vertical: Bool,
+
+    // 子控件之间的间距。
+    gap: Int,
+
+    // 内边距。
+    pad: Int,
+
+    // 交叉轴对齐（ALIGN_START / CENTER / END / STRETCH）。
+    cross: Int,
+
+    // 是否每次 layout 都重算。垂直堆叠通常需要（窗口大小会变）。
+    //
+    // ── 为什么要这个开关 ────────────────────────
+    //
+    // 有些场景下控件的位置是外部指定的（比如绝对定位的面板），
+    // 而 Stack 只用来给它们算一次初始位置。这时关掉重算能省
+    // 一点开销，但更重要的是表达「这些位置不再受容器控制」。
+    autoLayout: Bool,
+
+    constructor(r: Rect) {
+        self.r          = r
+        self.vis        = true
+        self.enabled    = true
+        self.focused    = false
+        self.hovered    = false
+        self.kids       = []
+        self.sizes      = []
+        self.weights    = []
+        self.vertical   = true
+        self.gap        = 8
+        self.pad        = 0
+        self.cross      = ALIGN_STRETCH
+        self.autoLayout = true
+        self.style      = Style.plain()
+    }
+
+    static fn column(r: Rect) -> Stack {
+        return new Stack(r)
+    }
+
+    static fn row(r: Rect) -> Stack {
+        let s = new Stack(r)
+        s.vertical = false
+        return s
+    }
+
+    // ── 添加 ────────────────────────────────────
+
+    // 添加一个固定尺寸的子控件。
+    fn add(w: Widget, size: Int) -> Stack {
+        arrPush(self.kids, w)
+        arrPush(self.sizes, size)
+        arrPush(self.weights, 1)
+        return self
+    }
+
+    // 添加一个按权重分配剩余空间的子控件。
+    //
+    // ── weight 与固定尺寸的区别 ──────────────────
+    //
+    // 固定尺寸（add）先占位，剩余空间再按权重分给 flex 项。
+    // 这是 CSS flexbox 的模型，也是所有布局系统里最实用的模型：
+    // 「这一行固定高，剩下的给那个列表」一句话就能表达。
+    fn flex(w: Widget, weight: Int) -> Stack {
+        arrPush(self.kids, w)
+        arrPush(self.sizes, 0)
+        arrPush(self.weights, weight)
+        return self
+    }
+
+    // 添加纯空白。用于「把后面的东西推到底部」。
+    //
+    // ── 为什么放一个真的 Spacer 对象而不是 null ─────────
+    //
+    // 曾经用 null 占位，但那样 kids 数组里就有 null 元素，而
+    // 编译期对「数组元素」的类型推断会被 null 污染：后面
+    // `let w: Widget = self.kids[i]` 虽然注解了，但同一数组里
+    // 混着 null 会让整条路径的类型推断退化成「未知」，从而在
+    // 无关的地方（Widget.resize 里的 self.r）报「宿主是 Null」。
+    //
+    // 换成一个真正的零内容控件：数组元素类型统一，推断干净，
+    // 而且 draw 什么都不画 —— 行为与 null 完全一样。
+    fn spacer(size: Int) -> Stack {
+        arrPush(self.kids, new Spacer())
+        arrPush(self.sizes, size)
+        arrPush(self.weights, 1)
+        return self
+    }
+
+    // 弹性空白。
+    fn flexSpacer() -> Stack {
+        arrPush(self.kids, new Spacer())
+        arrPush(self.sizes, 0)
+        arrPush(self.weights, 1)
+        return self
+    }
+
+    fn count() -> Int {
+        return len(self.kids)
+    }
+
+    fn setGap(g: Int) -> Stack {
+        self.gap = g
+        return self
+    }
+
+    fn setPad(p: Int) -> Stack {
+        self.pad = p
+        return self
+    }
+
+    fn setCross(a: Int) -> Stack {
+        self.cross = a
+        return self
+    }
+
+    // ── 布局 ────────────────────────────────────
+    //
+    // 两趟：
+    //   1. 统计固定尺寸总和，算出剩余空间
+    //   2. 按顺序分配位置
+    //
+    // ── 为什么必须两趟 ────────────────────────
+    //
+    // 因为 flex 项的尺寸依赖「固定项占了多少」，而固定项在后面
+    // 也可能出现。一趟走完的方案要么要求「flex 必须放最后」，
+    // 要么边算边改剩余空间（那样 flex 项的实际尺寸依赖它在数组
+    // 里的位置，是个隐藏的陷阱）。
+    //
+    // 两趟是 O(2n)，一次分配，无隐藏依赖。
+    fn layout() {
+        if (!self.autoLayout) { return }
+        let n = len(self.kids)
+        if (n == 0) { return }
+
+        let inner = Rect.inset(self.r, self.pad)
+        let totalGap = self.gap * (n - 1)
+
+        // ── 第一趟：统计 ──
+        var totalMain = inner.h
+        var totalCross = inner.w
+        if (!self.vertical) {
+            totalMain = inner.w
+            totalCross = inner.h
+        }
+
+        var fixedSum = 0
+        var weightSum = 0
+        var i = 0
+        while i < n {
+            let sz = toInt(self.sizes[i])
+            if (sz > 0) {
+                fixedSum = fixedSum + sz
+            } else {
+                let wt = toInt(self.weights[i])
+                if (wt < 1) { weightSum = weightSum + 1 }
+                else { weightSum = weightSum + wt }
+            }
+            i = i + 1
+        }
+
+        var remain = totalMain - fixedSum - totalGap
+        if (remain < 0) { remain = 0 }
+
+        // ── 第二趟：分配 ──
+        var cursor = inner.y
+        if (!self.vertical) { cursor = inner.x }
+
+        i = 0
+        var flexUsed = 0
+        var flexSeen = 0
+        while i < n {
+            // 主轴上这一项占多长。
+            var main = toInt(self.sizes[i])
+            if (main <= 0) {
+                var wt = toInt(self.weights[i])
+                if (wt < 1) { wt = 1 }
+                if (weightSum <= 0) {
+                    main = 0
+                } else {
+                    main = remain * wt / weightSum
+                }
+                // 最后一项吃掉余数，避免累计取整造成的 1px 缝隙。
+                flexSeen = flexSeen + 1
+                if (i == n - 1) {
+                    main = remain - flexUsed
+                }
+                flexUsed = flexUsed + main
+            }
+
+            // 交叉轴上的位置与尺寸。
+            let crossPos = inner.x
+            let crossSize = totalCross
+            if (self.vertical) {
+                if (!(self.cross == ALIGN_STRETCH)) {
+                    crossSize = totalCross
+                }
+            } else {
+                if (!(self.cross == ALIGN_STRETCH)) {
+                    crossSize = totalCross
+                }
+            }
+
+            // 定位子控件。
+            //
+            // ── 为什么用 typeOf 判空而不是 `w != null` ─────────
+            //
+            // 数组元素取出来的类型是「未知」，而未知类型做 `!= null`
+            // 比较是合法的，但之后调 w.r = ... 或 w.draw() 都追不到
+            // 宿主类型。用 typeOf 拿到运行时类型名字符串，判它是不是
+            // "null" —— 这样既得到空判定，又把 w 的类型收敛到「一定
+            // 是个对象」的语义上（后面用 Widget.xxx(w) 静态调）。
+            // ── 为什么用类型注解把元素「钉」成 Widget ──────────
+            //
+            // `let w = self.kids[i]` 的类型是未知，后续
+            // `Widget.resize(w, ...)` 的第一个参数（就是 self）
+            // 会被当成 null —— 报「.w 的宿主是 Null」。
+            //
+            // 加上 `: Widget` 注解后，编译器知道 w 是一个 Widget
+            // 引用，静态调用的参数检查就能通过。这也是为什么
+            // null（弹性空白）必须用 typeOf 先筛掉：注解成 Widget
+            // 之后它就不是 null 了，赋 null 进来会崩。
+            let w: Widget = self.kids[i]
+            if (self.vertical) {
+                Widget.resize(w, crossSize, main)
+                Widget.moveTo(w, inner.x, cursor)
+            } else {
+                Widget.resize(w, main, crossSize)
+                Widget.moveTo(w, cursor, inner.y)
+            }
+
+            cursor = cursor + main + self.gap
+            i = i + 1
+        }
+    }
+
+    // ── 绘制 ────────────────────────────────────
+    //
+    // 依次调子控件的 draw。
+    //
+    // ── 为什么 Stack 自己不画背景 ──────────────────
+    //
+    // 因为 Stack 是纯布局容器，不该有视觉。要背景就用 Panel 或
+    // Card 包一层 —— 那比给 Stack 加一个 background 字段更清楚
+    // （否则「这个 Stack 的底色是什么」会成为一个需要查的问题）。
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        self.layout()
+
+        var i = 0
+        while i < len(self.kids) {
+            let w: Widget = self.kids[i]
+            Widget.draw(w, th)
+            i = i + 1
+        }
+    }
+
+    // ── 度量 ────────────────────────────────────
+    //
+    // 「按内容算高度」是垂直堆叠最常见的需求（表单有多高，
+    // 容器就该多高）。这里给出一个估算。
+    fn contentMain() -> Int {
+        var sum = 0
+        var i = 0
+        while i < len(self.kids) {
+            let sz = toInt(self.sizes[i])
+            if (sz > 0) { sum = sum + sz }
+            i = i + 1
+        }
+        let n = len(self.kids)
+        if (n > 1) { sum = sum + self.gap * (n - 1) }
+        return sum + self.pad * 2
+    }
+}

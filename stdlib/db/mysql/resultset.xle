@@ -1,0 +1,349 @@
+// db/mysql/resultset.xle — 结果集报文解析
+//
+// ── 一次 SELECT 的完整报文序列 ──────────────────────
+//
+//   1. 列数包（1 字节长度前缀整数）
+//   2. 列定义包 × N        ← 每列一个
+//   3. EOF 包             （仅当未声明 CLIENT_DEPRECATE_EOF）
+//   4. 数据行包 × M
+//   5. EOF 包             或 一个 OK 包（DEPRECATE_EOF 下）
+//
+// ── DEPRECATE_EOF 为什么不能用 ────────────────────
+//
+// 声明它会用 OK 包替代 EOF，看起来更现代。但 OK 包和数据行一样以
+// 0x00 开头（数据行的第一个字段长度是 0），只能靠「已经读了 N 个
+// 字段」来推断边界。而没声明时 EOF 是 0xFE，判定明确。
+//
+// P0 的客户端不声明 DEPRECATE_EOF，用 EOF 结束判定 —— 更简单也
+// 更不容易错。
+//
+// ── 列定义包 41 的布局 ────────────────────────────
+//
+//   [lenenc] catalog（总是 "def"）
+//   [lenenc] schema
+//   [lenenc] table（别名）
+//   [lenenc] org_table
+//   [lenenc] name（列名/别名）★
+//   [lenenc] org_name
+//   [lenenc] 长度（总是 0x0C）
+//   [2]     字符集
+//   [4]     列长度
+//   [1]     字段类型 ★
+//   [2]     标志位 ★（0x0001 NOT_NULL 等）
+//   [1]     小数位数
+//   [2]     填充
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "../core/result.xle" import ResultSet
+from "packet.xle" import myReadPacket, myWritePacket, myReadLenEnc, myWriteLenEnc, myWriteLenEncStr, myWriteLenEncBytes, myReadLenEncBytes, myReadLenEncStr, myReadNulStr, myReadNulBytes, myIsErrPacket, myIsOkPacket, myIsEofPacket, myParseErrPacket, myParseOkPacket, myArrBool, myArrBytes, MY_MAX_PAYLOAD
+
+// ── 字段类型枚举（只列常用的）─────────────────────
+//
+// MySQL 的类型编号从 0 开始，中间留了很多空洞（0x09 是 INTERNAL，
+// 0xF6-0xF9 是 NEWDATE/VARSTRING 等历史遗留）。这里只保留会出现在
+// 真实结果集里的那些。
+const MY_TYPE_DECIMAL     = 0x00
+const MY_TYPE_TINY        = 0x01
+const MY_TYPE_SHORT       = 0x02
+const MY_TYPE_LONG        = 0x03
+const MY_TYPE_FLOAT       = 0x04
+const MY_TYPE_DOUBLE      = 0x05
+const MY_TYPE_NULL        = 0x06
+const MY_TYPE_TIMESTAMP   = 0x07
+const MY_TYPE_LONGLONG    = 0x08
+const MY_TYPE_INT24       = 0x09
+const MY_TYPE_DATE        = 0x0A
+const MY_TYPE_TIME        = 0x0B
+const MY_TYPE_DATETIME    = 0x0C
+const MY_TYPE_YEAR        = 0x0D
+const MY_TYPE_NEWDATE     = 0x0E
+const MY_TYPE_VARCHAR     = 0x0F
+const MY_TYPE_BIT         = 0x10
+const MY_TYPE_JSON        = 0xF5
+const MY_TYPE_NEWDECIMAL  = 0xF6
+const MY_TYPE_ENUM        = 0xF7
+const MY_TYPE_SET         = 0xF8
+const MY_TYPE_TINY_BLOB   = 0xF9
+const MY_TYPE_MEDIUM_BLOB = 0xFA
+const MY_TYPE_LONG_BLOB   = 0xFB
+const MY_TYPE_BLOB        = 0xFC
+const MY_TYPE_VAR_STRING  = 0xFD
+const MY_TYPE_STRING      = 0xFE
+const MY_TYPE_GEOMETRY    = 0xFF
+
+// 标志位
+const MY_FLAG_NOT_NULL = 0x0001
+const MY_FLAG_UNSIGNED = 0x0020
+const MY_FLAG_BINARY   = 0x0080
+
+// 一列的定义。
+class ColumnDef {
+    name: String,
+    orgName: String,
+    table: String,
+    schema: String,
+    charset: Int,
+    length: Int,
+    fieldType: Int,
+    flags: Int,
+    decimals: Int,
+
+    constructor() {
+        self.name     = ""
+        self.orgName  = ""
+        self.table    = ""
+        self.schema   = ""
+        self.charset  = 0
+        self.length   = 0
+        self.fieldType = 0
+        self.flags    = 0
+        self.decimals = 0
+    }
+
+    fn isNotNull() -> Bool { return (self.flags & MY_FLAG_NOT_NULL) != 0 }
+    fn isUnsigned() -> Bool { return (self.flags & MY_FLAG_UNSIGNED) != 0 }
+    fn isBinary() -> Bool { return (self.flags & MY_FLAG_BINARY) != 0 }
+
+    // 这个类型在文本协议下是否天然是数字。
+    fn isNumeric() -> Bool {
+        let t = self.fieldType
+        return t == MY_TYPE_TINY || t == MY_TYPE_SHORT || t == MY_TYPE_LONG
+            || t == MY_TYPE_LONGLONG || t == MY_TYPE_INT24
+            || t == MY_TYPE_FLOAT || t == MY_TYPE_DOUBLE
+            || t == MY_TYPE_DECIMAL || t == MY_TYPE_NEWDECIMAL
+            || t == MY_TYPE_YEAR || t == MY_TYPE_BIT
+    }
+
+    // 类型名（用于 describe / 调试）。
+    fn typeName() -> String {
+        let t = self.fieldType
+        if (t == MY_TYPE_DECIMAL)     { return "DECIMAL" }
+        if (t == MY_TYPE_TINY)        { return "TINYINT" }
+        if (t == MY_TYPE_SHORT)       { return "SMALLINT" }
+        if (t == MY_TYPE_LONG)        { return "INT" }
+        if (t == MY_TYPE_FLOAT)       { return "FLOAT" }
+        if (t == MY_TYPE_DOUBLE)      { return "DOUBLE" }
+        if (t == MY_TYPE_NULL)        { return "NULL" }
+        if (t == MY_TYPE_TIMESTAMP)   { return "TIMESTAMP" }
+        if (t == MY_TYPE_LONGLONG)    { return "BIGINT" }
+        if (t == MY_TYPE_INT24)       { return "MEDIUMINT" }
+        if (t == MY_TYPE_DATE)        { return "DATE" }
+        if (t == MY_TYPE_TIME)        { return "TIME" }
+        if (t == MY_TYPE_DATETIME)    { return "DATETIME" }
+        if (t == MY_TYPE_YEAR)        { return "YEAR" }
+        if (t == MY_TYPE_VARCHAR)     { return "VARCHAR" }
+        if (t == MY_TYPE_BIT)         { return "BIT" }
+        if (t == MY_TYPE_JSON)        { return "JSON" }
+        if (t == MY_TYPE_NEWDECIMAL)  { return "DECIMAL" }
+        if (t == MY_TYPE_ENUM)        { return "ENUM" }
+        if (t == MY_TYPE_SET)         { return "SET" }
+        if (t == MY_TYPE_TINY_BLOB)   { return "TINYBLOB" }
+        if (t == MY_TYPE_MEDIUM_BLOB) { return "MEDIUMBLOB" }
+        if (t == MY_TYPE_LONG_BLOB)   { return "LONGBLOB" }
+        if (t == MY_TYPE_BLOB)        { return "BLOB" }
+        if (t == MY_TYPE_VAR_STRING)  { return "VARSTRING" }
+        if (t == MY_TYPE_STRING)      { return "STRING" }
+        if (t == MY_TYPE_GEOMETRY)    { return "GEOMETRY" }
+        return "TYPE_0x" + toHex(t)
+    }
+
+    fn describe() -> String {
+        var s = self.name + " " + self.typeName()
+        if (self.isUnsigned()) { s = s + " UNSIGNED" }
+        if (self.isNotNull())  { s = s + " NOT NULL" }
+        return s
+    }
+}
+
+// 解析一个列定义包。
+fn myParseColumn(p: Array) -> ColumnDef {
+    let c = new ColumnDef()
+    var pos = 0
+
+    // catalog（"def"）—— 跳过
+    let cat = myReadLenEncBytes(p, pos)
+    pos = toInt(cat[1])
+
+    let schema = myReadLenEncStr(p, pos)
+    c.schema = toString(schema[0])
+    pos = toInt(schema[1])
+
+    let table = myReadLenEncStr(p, pos)
+    c.table = toString(table[0])
+    pos = toInt(table[1])
+
+    let orgTable = myReadLenEncStr(p, pos)
+    pos = toInt(orgTable[1])
+
+    let name = myReadLenEncStr(p, pos)
+    c.name = toString(name[0])
+    pos = toInt(name[1])
+
+    let orgName = myReadLenEncStr(p, pos)
+    c.orgName = toString(orgName[0])
+    pos = toInt(orgName[1])
+
+    // 固定长度字段（总是 0x0C）
+    let fixedLen = myReadLenEnc(p, pos)
+    pos = toInt(fixedLen[1])
+
+    if (pos + 10 <= len(p)) {
+        c.charset  = bbU16LE(p, pos)
+        c.length   = bbU32LE(p, pos + 2) & 0xFFFFFFFF
+        c.fieldType = bbAt(p, pos + 6) & 0xFF
+        c.flags    = bbU16LE(p, pos + 7) & 0xFFFF
+        c.decimals = bbAt(p, pos + 9) & 0xFF
+    }
+    return c
+}
+
+// 解析一行的所有字段值（文本协议）。
+//
+// 返回 [值数组, NULL 标记数组]。
+//
+// ── 为什么 NULL 要单独一个数组 ────────────────────
+//
+// 因为文本协议下 NULL 用长度 0xFB 表示，而空字符串的长度是 0x00。
+// 两者在结果里都是「空」，但语义完全不同（`IS NULL` 和 `= ''`）。
+// 拼成一个字符串就永久丢失了区分，而应用层经常需要这个区分。
+fn myParseTextRow(p: Array, ncols: Int) -> Array {
+    let vals = []
+    let nulls = []
+    var pos = 0
+    var i = 0
+    while i < ncols {
+        if (pos >= len(p)) {
+            // 包被截断：补齐而不是报错，让上层能看到部分结果
+            arrPush(vals, "")
+            arrPush(nulls, true)
+            i = i + 1
+        } else {
+            let r = myReadLenEnc(p, pos)
+            let n = toInt(r[0])
+            pos = toInt(r[1])
+            if (n == 0 - 2) {
+                arrPush(vals, "")
+                arrPush(nulls, true)
+            } else if (n < 0) {
+                arrPush(vals, "")
+                arrPush(nulls, true)
+            } else {
+                if (pos + n > len(p)) { n = len(p) - pos }
+                arrPush(vals, bbToText(bbSlice(p, pos, pos + n)))
+                arrPush(nulls, false)
+                pos = pos + n
+            }
+            i = i + 1
+        }
+    }
+    return [vals, nulls]
+}
+
+// 读一个完整结果集（含列数包、列定义、EOF、数据行、EOF）。
+//
+// 返回 [ok, ResultSet, 下一个序号, 错误]。
+//
+// ── 为什么要把「下一个序号」传出去 ──────────────────
+//
+// 因为一个查询结束后，如果还有后续报文（比如多结果集），序号必须
+// 连续。把它作为返回值能让 driver 在循环里正确推进，而不是每次
+// 从 0 重算 —— 重算会让第二次查询的序号错位，服务端直接断开。
+fn myReadResultSet(c: Conn, firstSeq: Int) -> Array {
+    // ── 第 1 步：列数包 ─────────────────────────
+    let p1 = myReadPacket(c)
+    if (!myArrBool(p1, 0)) {
+        return [false, ResultSet.fail(toString(p1[3])), 0, toString(p1[3])]
+    }
+    let seq = toInt(p1[1])
+    let payload = p1[2]
+
+    if (myIsErrPacket(payload)) {
+        let msg = myParseErrPacket(payload)
+        return [false, ResultSet.fail(msg), seq, msg]
+    }
+
+    // OK 包：这是一个没有结果集的语句（INSERT/UPDATE/DDL），但被当
+    // 查询发了。返回空结果集 + affected 信息。
+    if (myIsOkPacket(payload)) {
+        let okv = myParseOkPacket(payload)
+        let rs = ResultSet.empty()
+        rs.affected = toInt(okv[0])
+        rs.lastId   = toInt(okv[1])
+        return [true, rs, seq, ""]
+    }
+
+    let cntR = myReadLenEnc(payload, 0)
+    let ncols = toInt(cntR[0])
+    if (ncols <= 0) {
+        let rs = ResultSet.empty()
+        return [true, rs, seq, ""]
+    }
+
+    // ── 第 2 步：列定义 × N ──────────────────────
+    let cols = []
+    let names = []
+    let curSeq = seq
+    var i = 0
+    while i < ncols {
+        let pc = myReadPacket(c)
+        if (!myArrBool(pc, 0)) {
+            let m = "读取第 " + toString(i) + " 个列定义失败：" + toString(pc[3])
+            return [false, ResultSet.fail(m), curSeq, m]
+        }
+        curSeq = toInt(pc[1])
+        let cd = myParseColumn(pc[2])
+        arrPush(cols, cd)
+        arrPush(names, cd.name)
+        i = i + 1
+    }
+
+    // ── 第 3 步：列定义后的 EOF ──────────────────
+    let pe = myReadPacket(c)
+    if (myArrBool(pe, 0)) {
+        curSeq = toInt(pe[1])
+        // 若不是 EOF（比如服务端用了 DEPRECATE_EOF 给了 OK），也已经
+        // 消费掉了，无需特殊处理。
+    }
+
+    // ── 第 4 步：数据行 ──────────────────────────
+    let rows = []
+    let rowNulls = []
+    var guard = 0
+    while true {
+        let pr = myReadPacket(c)
+        if (!myArrBool(pr, 0)) { break }
+        curSeq = toInt(pr[1])
+        let rp = pr[2]
+        if (myIsEofPacket(rp)) { break }
+        if (myIsErrPacket(rp)) {
+            let m = myParseErrPacket(rp)
+            return [false, ResultSet.fail(m), curSeq, m]
+        }
+        let parsed = myParseTextRow(rp, ncols)
+        arrPush(rows, parsed[0])
+        arrPush(rowNulls, parsed[1])
+        guard = guard + 1
+        // 防止协议错位导致无限读。一百万行是单次查询的合理上限。
+        if (guard > 1000000) { break }
+    }
+
+    let rs = ResultSet.make(names, rows)
+    rs.nulls = rowNulls
+    // 把列类型信息也带上，供 describe / 类型推断用。
+    //
+    // ── 为什么拼成一个字符串而不是数组 ─────────────────
+    //
+    // ResultSet.raw 的类型是 String（各驱动共用的契约）。拼成
+    // "id INT NOT NULL UNSIGNED; name VARCHAR" 这种形式，调试时
+    // 直接打印就能看，不需要再遍历。
+    var meta = ""
+    var k = 0
+    while k < len(cols) {
+        let cd: ColumnDef = cols[k]
+        if (k > 0) { meta = meta + "; " }
+        meta = meta + cd.describe()
+        k = k + 1
+    }
+    rs.raw = meta
+    return [true, rs, curSeq, ""]
+}

@@ -1,0 +1,81 @@
+// 06-logic.x — 逻辑、短路、if 表达式
+//
+// 验证点：
+//   1. == != < <= > >= 的关系
+//   2. && 与 or 的短路语义（右侧不该被求值时不求值）
+//   3. not / ! 运算符
+//   4. if 作为表达式（01 §12：不引入三元运算符）
+//   5. 真值规则（0 / 0.0 / "" / null 为假）
+
+println("=== 比较 ===")
+println(3 < 5)          // true
+println(3 <= 3)         // true
+println(3 > 5)          // false
+println(3 >= 5)         // false
+println(3 == 3)         // true
+println(3 != 3)         // false
+println(2.5 < 3.0)      // true
+println(3 == 3.0)       // true（Int 与 Float 按数值比较）
+
+println("=== 逻辑运算 ===")
+println(true && true)   // true
+println(true && false)  // false
+println(false || true)  // true
+println(false || false) // false
+println(!true)          // false
+println(not false)      // true
+
+println("=== 短路求值 ===")
+// sideEffect 会打印，用来观察它有没有被执行
+fn sideEffect(tag: String) -> Bool {
+    println("  [副作用被触发: " + tag + "]")
+    return true
+}
+
+println("--- && 左侧为假，右侧不该求值")
+let r1 = false && sideEffect("and-right")
+
+println("--- && 左侧为真，右侧要求值")
+let r2 = true && sideEffect("and-right")
+
+println("--- or 左侧为真，右侧不该求值")
+let r3 = true || sideEffect("or-right")
+
+println("--- or 左侧为假，右侧要求值")
+let r4 = false || sideEffect("or-right")
+
+println("=== if 表达式 ===")
+let score = 85
+let grade = if score >= 90 {
+    "A"
+} else if score >= 80 {
+    "B"
+} else {
+    "C"
+}
+println(grade)          // B
+
+// if 表达式作为函数实参
+println(if 1 < 2 { "yes" } else { "no" })
+
+println("=== 真值规则 ===")
+fn truthy(v: Bool) -> Bool {
+    return v
+}
+// 注意：X 的 if 条件接受任意值，按真值规则判断。
+// P0 里 `if 0` 这样的写法会走 JUMP_IF_FALSE 的真值判定。
+if 0 {
+    println("0 是假 —— 不该打印")
+} else {
+    println("0 是假 —— 正确")
+}
+if "" {
+    println("空字符串是假 —— 不该打印")
+} else {
+    println("空字符串是假 —— 正确")
+}
+if null {
+    println("null 是假 —— 不该打印")
+} else {
+    println("null 是假 —— 正确")
+}

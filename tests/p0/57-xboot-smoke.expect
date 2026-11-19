@@ -1,0 +1,11 @@
+扫描到 Bean 数: 2
+注入字段数: 2
+注入调用: hello, xboot
+注册路由数: 2
+Router (2 条，按匹配优先级排列)
+  01. POST /api/echo  ->  greetController::echo
+  02. GET /api/hello/:name  ->  greetController::hello
+路径参数: name=tom
+参数反射: name : String
+R 包装: {"code":0,"message":"success","data":{"prefix":"hello"}}
+SMOKE OK

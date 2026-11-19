@@ -1,0 +1,99 @@
+// ui/control/radiogroup.xle — 单选组（一组圈 + 选中索引）
+//
+// ── 为什么要有组，而不是「Radio 数组 + 外部维护 selected」──
+//
+// 因为那意味着每个使用单选组的地方都要写一遍「点中第 i 个时把
+// 其他所有 Radio 的 on 设成 false」。那段循环写 10 次就会有 1 次
+// 写成怪东西，而「两个圈同时亮着」的 bug 不报错、不崩溃，只是
+// 看起来不对 —— 最容易漏到线上的一类问题。
+//
+// 组内聚之后，调用方只关心「现在选的是几号」。
+
+from "radio.xle" import Radio
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+
+class RadioGroup extends Widget {
+    labels: Array,
+    selected: Int,
+
+    // 每行高度。整个组的高度应该 = labels 长度 * rowH，
+    // 但类不强制 —— 传一个更高的 r 只会让底部留白。
+    rowH: Int,
+
+    constructor(r: Rect, labels: Array, selected: Int) {
+        self.r        = r
+        self.vis      = true
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.labels   = labels
+        self.selected = selected
+        self.rowH     = 24
+        self.style    = Style.plain()
+    }
+
+    static fn of(r: Rect, labels: Array, selected: Int) -> RadioGroup {
+        return new RadioGroup(r, labels, selected)
+    }
+
+    // 第 i 行的矩形。
+    fn rowRect(i: Int) -> Rect {
+        return rectOf(self.r.x, self.r.y + i * self.rowH, self.r.w, self.rowH)
+    }
+
+    // 鼠标落在第几行。落在外面返回 -1。
+    //
+    // 用「行号 = (my - y) / rowH」而不是遍历每一行判 contains ——
+    // 除法是 O(1)，而遍历在长列表里是 O(n)，且逐行判定还要处理
+    // 行间缝隙。
+    fn indexAt(mx: Int, my: Int) -> Int {
+        if (!self.vis || !self.enabled) { return -1 }
+        if (!self.r.contains(mx, my)) { return -1 }
+        if (self.rowH <= 0) { return -1 }
+        let i = (my - self.r.y) / self.rowH
+        if (i < 0) { return -1 }
+        if (i >= len(self.labels)) { return -1 }
+        return i
+    }
+
+    // 处理点击。返回是否发生了变化 —— 调用方据此决定要不要做
+    // 重画之外的动作（比如提交表单）。
+    fn click(mx: Int, my: Int) -> Bool {
+        let i = self.indexAt(mx, my)
+        if (i < 0) { return false }
+        if (i == self.selected) { return false }
+        self.selected = i
+        return true
+    }
+
+    fn current() -> Int {
+        return self.selected
+    }
+
+    fn setSelected(i: Int) -> RadioGroup {
+        self.selected = i
+        return self
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 每一行临时造一个 Radio 来画。为什么不留着：Radio 本质是
+        // 无可变状态的绘制器，留着反而要同步 on 字段，得不偿失。
+        // 它们的构造只是几个字段赋值，比 keep-alive 加同步便宜。
+        let mx = winMouseX()
+        let my = winMouseY()
+        let hoverIdx = self.indexAt(mx, my)
+        var i = 0
+        while i < len(self.labels) {
+            let rr = self.rowRect(i)
+            let one = Radio.of(rr, toString(self.labels[i]), i == self.selected)
+            one.enabled = self.enabled
+            one.hovered = self.hovered && hoverIdx == i
+            one.draw(th)
+            i = i + 1
+        }
+    }
+}

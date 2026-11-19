@@ -1,0 +1,363 @@
+// ui/layout/layout.xle — 布局基础：约束、尺寸、对齐
+//
+// ── 为什么布局要单独一层 ──────────────────────────
+//
+// UI 代码里最常见的重复不是「画按钮」，而是「算出下一个元素该放
+// 在哪」：
+//
+//     var cy = panel.y + panel.pad
+//     label.draw(...)          cy = cy + labelH + gap
+//     field.r = Rect { x: ..., y: cy, ... }
+//     cy = cy + fieldH + gap
+//     button.r = Rect { x: ..., y: cy, ... }
+//
+// 这段模式在每个界面里重复几十次，而每次都会有一处 `+ gap` 写漏
+// 或者两个控件的间距不一致。这就是布局层要解决的问题：把「光标
+// 推进」变成一个原子的、可复用的操作。
+//
+// ── 为什么不用「父子容器 + 自动重排」那套 ────────────
+//
+// Flutter/Compose 那套（控件树 + 约束向下传递 + 尺寸向上回传）
+// 需要两趟遍历和一套完整的测量协议。这个库的目标是「短小可控」，
+// 所以选了更朴素的**游标模型**：
+//
+//     let f = Layout.frame(panel)      // 内容区
+//     let r1: Rect = Layout.next(f, 24)   // 拿走 24 高
+//     let r2: Rect = Layout.next(f, 32)   // 再拿 32 高
+//
+// 游标是值，`next` 返回新游标 + 矩形。没有隐式状态，布局顺序
+// 就是代码顺序，一眼能看出控件会排在哪。
+//
+// 代价是：不能做「窗口变大时自动重新分配」。但那个能力可以用
+// 百分比分配（Layout.split）手工表达，而手工表达的结果是可读的。
+
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+
+// ── 对齐方式 ─────────────────────────────────────
+//
+// 主轴/交叉轴各自三种。数值刻意与 Style.align、TEXT_* 保持一致，
+// 这样同一个值在三处可以互换，不用记三套。
+const ALIGN_START  = 0
+const ALIGN_CENTER = 1
+const ALIGN_END    = 2
+
+// 交叉轴拉伸（占满）。单独一个值，因为它不是「在区间内选一点」
+// 而是「改变尺寸」，语义不同。
+const ALIGN_STRETCH = 3
+
+// ── 游标 ─────────────────────────────────────────
+//
+// 一个「还没被分配的区域」+ 当前进度。用 struct 而不是可变对象，
+// 理由同 Rect：布局是值，传出去就不会被意外修改。
+struct Cursor {
+    // 可用区域（已经扣掉 padding）。
+    area: Rect,
+
+    // 当前进度：纵向游标用的是 y，横向用的是 x。两个都存着，
+    // 这样同一个 Cursor 既能纵向推进也能横向推进。
+    x: Int,
+    y: Int,
+
+    // 主方向的剩余长度。降到 0 就说明区域用完了。
+    remain: Int,
+}
+
+// ── 构造 ─────────────────────────────────────────
+
+// 从一块区域建游标，扣掉 padding。
+fn layoutFrame(area: Rect, pad: Int) -> Cursor {
+    let inner = Rect.inset(area, pad)
+    return Cursor {
+        area: inner,
+        x: inner.x,
+        y: inner.y,
+        remain: inner.h,
+    }
+}
+
+// 无 padding 版本。
+fn layoutRaw(area: Rect) -> Cursor {
+    return Cursor {
+        area: area,
+        x: area.x,
+        y: area.y,
+        remain: area.h,
+    }
+}
+
+// 纵向游标（自上而下推进）。
+//
+// 与 layoutFrame 相同，存在的意义是让「我要一个纵向游标」这个
+// 意图在调用点显式化 —— 读代码的人不用去查 layoutFrame 推进
+// 哪个方向。
+fn layoutColumn(area: Rect, pad: Int) -> Cursor {
+    return layoutFrame(area, pad)
+}
+
+// 横向游标（自左向右推进）。
+fn layoutRow(area: Rect, pad: Int) -> Cursor {
+    let inner = Rect.inset(area, pad)
+    return Cursor {
+        area: inner,
+        x: inner.x,
+        y: inner.y,
+        remain: inner.w,
+    }
+}
+
+// ── 推进：纵向 ────────────────────────────────────
+
+// 拿走 h 高度的一块，宽度占满。
+//
+// 返回的矩形由调用方拿去给控件设 r。高度会被夹紧到剩余空间 ——
+// 这样「内容超出容器」时最后一个控件变矮，而不是画到容器外。
+//
+// ── 为什么夹紧而不是溢出 ──────────────────────
+//
+// 溢出的结果是画到边框外面，视觉上是明显的 bug。夹紧的结果是
+// 最后一行矮一点，虽然也不完美但至少还在框里。而对于「滑到
+// 底的列表」这种场景，夹紧是正确行为。
+fn layoutNext(c: Cursor, h: Int) -> Rect {
+    var hh = h
+    if (hh > c.remain) { hh = c.remain }
+    if (hh < 0) { hh = 0 }
+    return rectOf(c.area.x, c.y, c.area.w, hh)
+}
+
+// 推进游标。必须在 layoutNext 之后调，两者配对使用：
+//
+//     let r: Rect = layoutNext(f, 24)
+//     f = layoutAdvance(f, 24, 8)       // 前进 24 + 间距 8
+//
+// 分成两个函数而不是「一个函数返回 矩形+新游标」：因为语言
+// 没有元组，返回数组会让调用点写 `let pair = ...; pair[0]`，
+// 而那个下标 0/1 比两次调用的可读性差得多。
+fn layoutAdvance(c: Cursor, h: Int, gap: Int) -> Cursor {
+    let step = h + gap
+    var ny = c.y + step
+    var rem = c.remain - step
+    if (rem < 0) { rem = 0 }
+    return Cursor { area: c.area, x: c.x, y: ny, remain: rem }
+}
+
+// ── 推进：横向 ────────────────────────────────────
+
+fn layoutNextCol(c: Cursor, w: Int) -> Rect {
+    var ww = w
+    if (ww > c.remain) { ww = c.remain }
+    if (ww < 0) { ww = 0 }
+    return rectOf(c.x, c.area.y, ww, c.area.h)
+}
+
+fn layoutAdvanceCol(c: Cursor, w: Int, gap: Int) -> Cursor {
+    let step = w + gap
+    var nx = c.x + step
+    var rem = c.remain - step
+    if (rem < 0) { rem = 0 }
+    return Cursor { area: c.area, x: nx, y: c.y, remain: rem }
+}
+
+// ── 按比例分配 ────────────────────────────────────
+//
+// 把剩余空间按权重切成 n 份。权重是整数，切出来的宽度之和保证
+// 等于总宽（余数给最后一份）。
+//
+// ── 为什么要保证「和恰好等于总宽」 ───────────────
+//
+// 否则会出现 1 像素的缝：三份各 33% 加起来 99%，右边留一条 1px
+// 的背景色缝，看起来像分隔线断了。这种 bug 在深色主题下很显眼。
+fn layoutSplit(area: Rect, weights: Array, gap: Int) -> Array {
+    let n = len(weights)
+    let out = []
+    if (n == 0) { return out }
+
+    // 先扣掉所有间隙。
+    let totalGap = gap * (n - 1)
+    var avail = area.w - totalGap
+    if (avail < 0) { avail = 0 }
+
+    // 权重和。
+    var sum = 0
+    var i = 0
+    while i < n {
+        let w = toInt(weights[i])
+        if (w > 0) { sum = sum + w }
+        i = i + 1
+    }
+    if (sum <= 0) { sum = n }
+
+    // 逐个切。最后一个拿走剩下的全部，保证精确合计。
+    var cx = area.x
+    i = 0
+    while i < n {
+        var cw = 0
+        if (i == n - 1) {
+            cw = area.x + area.w - cx
+        } else {
+            var wt = toInt(weights[i])
+            if (wt < 0) { wt = 0 }
+            cw = avail * wt / sum
+        }
+        arrPush(out, rectOf(cx, area.y, cw, area.h))
+        cx = cx + cw + gap
+        i = i + 1
+    }
+    return out
+}
+
+// 纵向按比例切。与 layoutSplit 同构，只是切的是高度。
+fn layoutSplitV(area: Rect, weights: Array, gap: Int) -> Array {
+    let n = len(weights)
+    let out = []
+    if (n == 0) { return out }
+
+    let totalGap = gap * (n - 1)
+    var avail = area.h - totalGap
+    if (avail < 0) { avail = 0 }
+
+    var sum = 0
+    var i = 0
+    while i < n {
+        let w = toInt(weights[i])
+        if (w > 0) { sum = sum + w }
+        i = i + 1
+    }
+    if (sum <= 0) { sum = n }
+
+    var cy = area.y
+    i = 0
+    while i < n {
+        var ch = 0
+        if (i == n - 1) {
+            ch = area.y + area.h - cy
+        } else {
+            var wt = toInt(weights[i])
+            if (wt < 0) { wt = 0 }
+            ch = avail * wt / sum
+        }
+        arrPush(out, rectOf(area.x, cy, area.w, ch))
+        cy = cy + ch + gap
+        i = i + 1
+    }
+    return out
+}
+
+// ── 从数组中取矩形 ───────────────────────────────
+//
+// ── 为什么需要这个看起来多余的一行函数 ────────────
+//
+// 语言不允许对数组元素直接做成员访问：`parts[0].w` 会报
+// 「无法确定 `.w` 的宿主类型」，因为数组元素的类型是静态不可
+// 追踪的。而写成 `let p: Rect = parts[0]` 又要多一行。
+//
+// 一个声明了返回类型的函数就解决了：`layoutAt(parts, 0).w`
+// 能编译，因为函数签名给了确定类型。这不是语法让步，而是
+// 「用类型注解把信息补回去」的正确位置 —— 补一次在库里，
+// 而不是在每个调用点补。
+fn layoutAt(arr: Array, i: Int) -> Rect {
+    if (i < 0 || i >= len(arr)) {
+        return rectOf(0, 0, 0, 0)
+    }
+    let r: Rect = arr[i]
+    return r
+}
+
+// ── 对齐 ─────────────────────────────────────────
+
+// 在 area 里放一个 w×h 的块，按水平/垂直对齐方式定位。
+//
+// 这是「居中」这类操作的唯一实现点。手写 (area.w - w) / 2 的地方
+// 多了，早晚会有一处写成 (area.w / 2 - w / 2)，而那在奇数宽度下
+// 差 1px。
+fn layoutPlace(area: Rect, w: Int, h: Int, hAlign: Int, vAlign: Int) -> Rect {
+    var x = area.x
+    if (hAlign == ALIGN_CENTER) {
+        x = area.x + (area.w - w) / 2
+    } else if (hAlign == ALIGN_END) {
+        x = area.x + area.w - w
+    }
+
+    var y = area.y
+    if (vAlign == ALIGN_CENTER) {
+        y = area.y + (area.h - h) / 2
+    } else if (vAlign == ALIGN_END) {
+        y = area.y + area.h - h
+    }
+
+    // 拉伸：占满对应的轴。
+    var ww = w
+    var hh = h
+    if (hAlign == ALIGN_STRETCH) {
+        ww = area.w
+        x = area.x
+    }
+    if (vAlign == ALIGN_STRETCH) {
+        hh = area.h
+        y = area.y
+    }
+
+    return rectOf(x, y, ww, hh)
+}
+
+// 居中。最常用的组合，给个短名字。
+fn layoutCenter(area: Rect, w: Int, h: Int) -> Rect {
+    return layoutPlace(area, w, h, ALIGN_CENTER, ALIGN_CENTER)
+}
+
+// 水平居中、高度占满（表单行的常见需求）。
+fn layoutHCenter(area: Rect, w: Int) -> Rect {
+    return layoutPlace(area, w, area.h, ALIGN_CENTER, ALIGN_STRETCH)
+}
+
+// ── 间距辅助 ─────────────────────────────────────
+
+// 在 area 内缩进。负的 pad 会向外扩张（画焦点环用）。
+fn layoutInset(area: Rect, pad: Int) -> Rect {
+    return Rect.inset(area, pad)
+}
+
+// 只缩进某一个方向。参数为 0 表示该边不动。
+//
+// 四个方向的函数而不是一个带四个参数的函数：调用点通常只改一边
+// （「左右留 16，上下不动」），四参数版本要写 layoutPad(r, 16, 0, 16, 0)，
+// 而顺序（上下左右？左右上下？）是个反复要查的问题。
+fn layoutPadLeft(area: Rect, d: Int) -> Rect {
+    return rectOf(area.x + d, area.y, area.w - d, area.h)
+}
+
+fn layoutPadRight(area: Rect, d: Int) -> Rect {
+    return rectOf(area.x, area.y, area.w - d, area.h)
+}
+
+fn layoutPadTop(area: Rect, d: Int) -> Rect {
+    return rectOf(area.x, area.y + d, area.w, area.h - d)
+}
+
+fn layoutPadBottom(area: Rect, d: Int) -> Rect {
+    return rectOf(area.x, area.y, area.w, area.h - d)
+}
+
+fn layoutPadH(area: Rect, d: Int) -> Rect {
+    return rectOf(area.x + d, area.y, area.w - d * 2, area.h)
+}
+
+fn layoutPadV(area: Rect, d: Int) -> Rect {
+    return rectOf(area.x, area.y + d, area.w, area.h - d * 2)
+}
+
+// ── 剩余空间 ─────────────────────────────────────
+
+// 游标走完之后剩下的矩形。用于「把按钮推到右下角」这类需求。
+fn layoutRemainder(c: Cursor) -> Rect {
+    return rectOf(c.area.x, c.y, c.area.w, c.remain)
+}
+
+// 把游标推到最底部（吃掉剩余空间）。
+fn layoutSpacer(c: Cursor) -> Cursor {
+    return Cursor {
+        area: c.area,
+        x: c.x,
+        y: c.area.y + c.area.h,
+        remain: 0,
+    }
+}

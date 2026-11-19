@@ -1,0 +1,9 @@
+// 01-hello.x — 最小可运行程序
+//
+// 验证点：
+//   1. 顶层语句能合成 main
+//   2. print / println 内置函数
+//   3. 字符串常量池
+
+println("Hello, X!")
+println("你好，世界！")

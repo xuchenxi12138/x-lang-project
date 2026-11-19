@@ -1,0 +1,221 @@
+// db/mongo/wire.xle — MongoDB 线路协议
+//
+// ── MongoDB 的消息结构 ────────────────────────────
+//
+// 所有消息都是：
+//
+//   [4]  总长度（小端，含自身 16 字节头）
+//   [4]  requestID
+//   [4]  responseTo（回复哪个 requestID，0 表示主动通知）
+//   [4]  操作码
+//   ...  负载
+//
+// ── 两个操作码 ──────────────────────────────────
+//
+//   2013 (OP_MSG)   MongoDB 3.6+ 的主流格式，一个消息可以带多个段
+//   2004 (OP_QUERY) 老格式，仅用于握手（isMaster）
+//
+// ── 为什么握手还得用 OP_QUERY ───────────────────
+//
+// 因为 MongoDB 规定「连接后的第一条命令必须是 OP_QUERY 的 isMaster」
+// —— 这是唯一不需要知道服务端版本就能发的消息。之后的通信才用
+// OP_MSG。这个规定在 5.1 之后放宽了，但兼容旧版必须遵守。
+//
+// ── OP_MSG 的段 ────────────────────────────────
+//
+//   [4]  flagBits
+//   [1]  section kind（0 = 文档体，1 = 文档序列）
+//   [..] 内容
+//
+// kind 0 的段就是一个 BSON 文档。绝大多数命令只需要一个 kind 0 段。
+
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "bson.xle" import bsonStr, bsonInt, bsonLong, bsonDouble, bsonBool, bsonNull, bsonDoc, bsonArr, bsonOid, bsonBin, bsonWriteDoc, bsonWriteElem, bbPutDoubleLE, hexToBytes12, hexVal, bsonReadDoc, bsonReadValue, bsonReadDoubleLE, bsonReadCStr, bsonGet, bsonGetText, bsonGetInt, bsonToJson, bsonValueText, bsonDocText, BSON_DOUBLE, BSON_STRING, BSON_DOCUMENT, BSON_ARRAY, BSON_BINARY, BSON_UNDEFINED, BSON_OBJECTID, BSON_BOOL, BSON_DATETIME, BSON_NULL, BSON_REGEX, BSON_DBPOINTER, BSON_JSCODE, BSON_SYMBOL, BSON_JSCODEWS, BSON_INT32, BSON_TIMESTAMP, BSON_INT64, BSON_DECIMAL128, BSON_MINKEY, BSON_MAXKEY
+
+// 操作码
+const MONGO_OP_REPLY = 1
+const MONGO_OP_QUERY = 2004
+const MONGO_OP_MSG   = 2013
+
+// 每个请求的序号。
+//
+// ── 为什么不用全局可变计数器 ─────────────────────
+//
+// 因为被 import 的文件里不允许有可执行的顶层语句（语言规定：顶层
+// 语句会被合进 main，执行顺序无法推理）。所以不能写
+// `var nextReqId = 1`。
+//
+// 替代方案：requestID 只需要「在途请求之间互不相同」，而驱动是
+// 串行发送的（发一个等一个），所以直接用「当前时间的毫秒低 24 位」
+// 就够了 —— 它天然递增且不重复。
+//
+// ── 为什么不干脆固定为 1 ──────────────────────
+//
+// 因为 MongoDB 会把 requestID 回显在 responseTo 里，而某些代理
+// （如 mongos）会用它做链路跟踪。固定值在实际部署里可能引发
+// 混淆。用时间戳保留可区分性，同时完全避开全局状态。
+fn mongoReqId() -> Int {
+    return nowMillis() & 0xFFFFFF
+}
+
+// ── 读消息 ────────────────────────────────────────
+
+// 读一个完整的 MongoDB 消息，返回 [ok, 操作码, responseTo, 负载, 错误]。
+fn mongoReadMsg(c: Conn) -> Array {
+    let h = c.readN(16)
+    if (!mongoBool(h, 0)) {
+        return [false, 0, 0, [], "读取消息头失败"]
+    }
+    let head = h[1]
+    let total     = bbU32LE(head, 0)
+    let reqId     = bbU32LE(head, 4)
+    let responseTo = bbU32LE(head, 8)
+    let opCode    = bbU32LE(head, 12)
+
+    if (total < 16) {
+        return [false, opCode, responseTo, [], "消息长度非法：" + toString(total)]
+    }
+    let bodyLen = total - 16
+    if (bodyLen == 0) {
+        return [true, opCode, responseTo, [], ""]
+    }
+    let b = c.readN(bodyLen)
+    if (!mongoBool(b, 0)) {
+        return [false, opCode, responseTo, [], "读取消息体失败（要 " + toString(bodyLen) + "）"]
+    }
+    return [true, opCode, responseTo, b[1], ""]
+}
+
+// ── 构造消息 ──────────────────────────────────────
+
+// 构造 OP_MSG（单个 kind 0 段）。
+fn mongoBuildMsg(body: Array) -> Array {
+    let out = []
+    // 总长 = 16 头 + 4 flags + 1 kind + body
+    bbPutU32LE(out, 16 + 4 + 1 + len(body))
+    bbPutU32LE(out, mongoReqId())
+    bbPutU32LE(out, 0)              // responseTo
+    bbPutU32LE(out, MONGO_OP_MSG)
+    bbPutU32LE(out, 0)              // flagBits
+    bbPut(out, 0)                   // section kind 0
+    bbPutBytes(out, body)
+    return out
+}
+
+// 构造 OP_QUERY（用于 isMaster 握手）。
+//
+// 布局：
+//   [4] flags
+//   [NUL] 完整集合名（"admin.$cmd"）
+//   [4] 跳过数
+//   [4] 返回数（-1 = 不限）
+//   [..] 查询文档
+fn mongoBuildQuery(namespace: String, query: Array) -> Array {
+    let body = []
+    bbPutU32LE(body, 0)                 // flags
+    bbPutUtf8(body, namespace)
+    bbPut(body, 0)
+    bbPutU32LE(body, 0)                 // numberToSkip
+    bbPutU32LE(body, 0xFFFFFFFF)        // numberToReturn = -1
+    bbPutBytes(body, query)
+
+    let out = []
+    bbPutU32LE(out, 16 + len(body))
+    bbPutU32LE(out, mongoReqId())
+    bbPutU32LE(out, 0)
+    bbPutU32LE(out, MONGO_OP_QUERY)
+    bbPutBytes(out, body)
+    return out
+}
+
+// ── 解析回复 ──────────────────────────────────────
+
+// 从 OP_MSG 回复里取出文档字段（交替数组）。
+//
+// ── 为什么要有这个 ────────────────────────────
+//
+// OP_MSG 的回复体是 [flags(4)][kind(1)][BSON 文档]。调用方直接拿到
+// 的是整个负载，需要剥掉前 5 字节才能解 BSON。这个函数做一次这个
+// 剥离，并顺带处理 kind 1（文档序列）的情况。
+fn mongoParseMsgBody(payload: Array) -> Array {
+    if (len(payload) < 5) { return [] }
+    let kind = bbAt(payload, 4)
+    if (kind == 0) {
+        // 单文档
+        let r = bsonReadDoc(payload, 5)
+        return r[0]
+    }
+    if (kind == 1) {
+        // 文档序列：[4] 长度 + [NUL] 标识 + 若干文档
+        //
+        // 这种格式在 find 的大结果集里出现（避免超 16MB 限制）。
+        // 这里把它合并成一个字段数组 —— 上层看到的是「所有文档的
+        // 字段都被摊平到同一个数组」，需要更多结构时改用 raw。
+        let seqSize = bbU32LE(payload, 5)
+        let idEnd = bbIndexOf(payload, 0, 9)
+        if (idEnd < 0) { return [] }
+        var pos = idEnd + 1
+        let end = 5 + seqSize
+        let fields = []
+        while pos < end && pos < len(payload) {
+            let r = bsonReadDoc(payload, pos)
+            let f = r[0]
+            var i = 0
+            while i + 1 < len(f) {
+                arrPush(fields, f[i])
+                arrPush(fields, f[i + 1])
+                i = i + 2
+            }
+            pos = toInt(r[1])
+        }
+        return fields
+    }
+    return []
+}
+
+// 从 OP_REPLY（老格式，isMaster 的回复）里取出文档字段。
+//
+// 布局：[4] responseFlags + [8] cursorId + [4] startingFrom + [4] numberReturned + 文档
+fn mongoParseReplyBody(payload: Array) -> Array {
+    if (len(payload) < 20) { return [] }
+    let r = bsonReadDoc(payload, 20)
+    return r[0]
+}
+
+// 从回复里判断是否有错误。
+//
+// ── 为什么 MongoDB 用 ok 字段而不是状态码 ────────────
+//
+// 因为 MongoDB 的设计里「命令执行失败」是业务结果而非协议错误 ——
+// 服务器照样回一个正常消息，只是文档里 ok: 0 并带 errmsg。
+// 所以必须解出文档才能知道成败。
+fn mongoReplyOk(fields: Array) -> Bool {
+    if (len(fields) == 0) { return false }
+    let v = bsonGet(fields, "ok")
+    if (len(v) < 2) { return false }
+    let tag = toInt(v[0])
+    if (tag == BSON_INT32 || tag == BSON_INT64) { return toInt(v[1]) != 0 }
+    if (tag == BSON_DOUBLE) {
+        let d = v[1]
+        if (typeOf(d) == "Float") { return d > 0.5 }
+        return toInt(d) != 0
+    }
+    if (tag == BSON_BOOL) { return v[1] == true }
+    return false
+}
+
+fn mongoReplyError(fields: Array) -> String {
+    let msg = bsonGetText(fields, "errmsg")
+    if (len(msg) > 0) { return msg }
+    let code = bsonGetInt(fields, "code")
+    if (code != 0) { return "错误码 " + toString(code) }
+    return "未知错误"
+}
+
+// 安全读 Bool。
+fn mongoBool(r: Array, idx: Int) -> Bool {
+    if (idx < 0 || idx >= len(r)) { return false }
+    if (r[idx] == true) { return true }
+    return false
+}

@@ -1,0 +1,48 @@
+// ui/layout/spacer.xle — 空位
+//
+// 一个「什么都不画、不响应输入」的控件。存在的唯一理由是让
+// Stack 的 kids 数组类型统一（全是有内容的 Widget 引用）。
+//
+// ── 为什么要一个类，而不是往数组里塞 null ─────────────
+//
+// 实测过：`arrPush(kids, null)` 会让整个数组的元素类型退化成
+// Null，而编译器随即在**完全无关的地方**报「.w 的宿主是 Null」
+//（具体是 Widget.resize 里读 self.r.w）。那个报错的位置离真正的
+// 原因隔了两百行，很难查。
+//
+// 换成具体类之后数组保持同质，那个幽灵错误就消失了。而且
+// 「一个占位控件」本来也确实应该是个控件。
+//
+// ── 为什么不能直接 new Widget() ────────────────────
+//
+// Widget 有抽象方法 draw，不可实例化。这正是抽象存在的意义：
+// 一个不知道怎么画自己的东西本来就不该被创建出来。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+
+class Spacer extends Widget {
+    constructor() {
+        self.r       = rectOf(0, 0, 0, 0)
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.style   = Style.plain()
+    }
+
+    static fn of() -> Spacer {
+        return new Spacer()
+    }
+
+    fn draw(th: Theme) {
+        // 有意空实现：空位的价值就是「占地方但不显示」。
+    }
+
+    // 空位永远不拦截点击 —— 否则它盖住的区域点不穿。
+    fn hit(mx: Int, my: Int) -> Bool {
+        return false
+    }
+}

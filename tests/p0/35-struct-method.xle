@@ -1,0 +1,73 @@
+// 35-struct-method.xle — 方法：实例方法、静态方法、链式访问
+//
+// 方法不是新语法，是**名字改写**：
+//     obj.method(a, b)  ≡  Type.method(obj, a, b)
+//
+// 所以 `fn Rect.area(self: Rect)` 就是一个名字里带点的普通函数。
+// 没有 MethodDecl、没有虚表、没有隐含的 self 绑定规则 —— 这三样
+// 加起来才叫「对象系统」，而我们现在只需要前一半。
+//
+// 这个设计带来一个必须写清的结果：**方法不能按名字裸调**。
+// `area(r)` 找不到 `Rect.area`，因为方法名是 `Rect.area`。
+
+struct Rect { x: Int, y: Int, w: Int, h: Int }
+
+fn Rect.area(self: Rect) -> Int { return self.w * self.h }
+
+fn Rect.right(self: Rect) -> Int { return self.x + self.w }
+
+fn Rect.center(self: Rect) -> Rect {
+    return Rect { x: self.x + self.w / 2, y: self.y + self.h / 2, w: 0, h: 0 }
+}
+
+fn Rect.inset(self: Rect, d: Int) -> Rect {
+    return Rect { x: self.x + d, y: self.y + d,
+                  w: self.w - d * 2, h: self.h - d * 2 }
+}
+
+fn Rect.show(self: Rect, tag: String) {
+    println(tag + ": " + toString(self))
+}
+
+// 静态方法：宿主是类型名，不是值。没有 self，参数个数不 +1。
+fn Rect.unit() -> Rect {
+    return Rect { x: 0, y: 0, w: 1, h: 1 }
+}
+
+fn Rect.ofSize(w: Int, h: Int) -> Rect {
+    return Rect { x: 0, y: 0, w: w, h: h }
+}
+
+fn main() -> Int {
+    let r = Rect { x: 10, y: 20, w: 100, h: 50 }
+
+    // ---- 实例方法 ----
+    println(r.area())
+    println(r.right())
+
+    // ---- 静态方法 ----
+    println(Rect.unit())
+    println(Rect.ofSize(30, 40))
+    println(Rect.ofSize(30, 40).area())
+
+    // ---- 返回结构体的方法 ----
+    println(r.center())
+    println(r.inset(5))
+    println(r.inset(5).area())
+
+    // ---- 链式：方法结果直接取字段 / 继续调方法 ----
+    // 这条是关键 —— 它证明类型跟踪能穿过调用边界。如果编译器只
+    // 记得「返回结构体」而不知道是哪个，这里就会报「无法确定宿主类型」。
+    println(r.center().x)
+    println(r.center().y)
+    println(r.inset(5).inset(5).area())
+
+    // ---- 返回 Null 的方法 ----
+    r.show("原矩形")
+
+    // ---- 方法参数与普通参数一致 ----
+    println(r.inset(0).area())
+
+    println("method ok")
+    return 0
+}

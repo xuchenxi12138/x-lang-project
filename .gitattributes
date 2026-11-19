@@ -1,0 +1,65 @@
+# ============================================================
+# 行尾策略
+# ============================================================
+#
+# ── 为什么必须有这个文件 ────────────────────────────────────
+#
+# 本项目的测试夹具（tests/**/*.expect）是**逐字节**比对程序输出的。
+# 而 `println` 在 Windows 上输出 CRLF、在 Linux 上输出 LF。
+#
+# 不加约束时，仓库里的 .expect 存成什么行尾取决于**提交者的 git
+# 配置**（core.autocrlf），检出成什么行尾取决于**克隆者的 git 配置**。
+# 于是「测试红不红」变成了一件由环境决定的事，而源码一个字都没错。
+#
+# 实测踩到过：20-profile.expect 在工作区是 CRLF（靠 autocrlf=true
+# 转换），但 Git 里存的是 LF。换一台 autocrlf=false 的机器，或者
+# clone 到 Linux，那条测试立刻失败。
+#
+# 两层防护：
+#   1. 这里用 `-text` 让 Git **完全不做行尾转换**，存什么就是什么。
+#   2. tools/run_tests.sh 在比对前用 `tr -d '\r'` 归一化，即使
+#      将来有人改了配置，测试也不会因为行尾而误red。
+#
+# 两层都要：只有第 1 层，编辑器可能把 LF 改成 CRLF；只有第 2 层，
+# 那 .expect 文件在 diff 里会显示成「整文件重写」。
+
+# 本文件自己也固定成 LF —— 否则它会跟着 core.autocrlf 变，
+# 而它正是定义「谁该是什么行尾」的那个文件，自己先随波逐流很荒谬。
+.gitattributes text eol=lf
+
+# 这些是逐字节比对的夹具，行尾必须原样保留
+x-lang/tests/**/*.expect -text
+x-lang/tests/**/*.fail   -text
+x-lang/tests/pkg/**/*.expect -text
+
+# ── 源码与脚本 ──────────────────────────────────────────────
+#
+# 统一成 LF 入库。理由：
+#   - sh 脚本带 CRLF 会在 Linux/macOS 上报 `bad interpreter`
+#     （`\r` 被当成解释器路径的一部分）。这个坑很经典。
+#   - C 源码带 CRLF 本身没问题，但与 LF 混在一个仓库里会让
+#     diff 噪音变大，且部分工具（clang-format、部分 LSP）会
+#     把行尾当成格式差异反复报。
+#
+# 注意 *.patch / *.diff 永远要 text=auto 之外单独处理成 LF，
+# 本项目没有这类文件，就不写多余的规则。
+*.c      text eol=lf
+*.h      text eol=lf
+*.sh     text eol=lf
+*.md     text eol=lf
+*.toml   text eol=lf
+*.xle    text eol=lf
+*.xlc    text eol=lf
+*.py     text eol=lf
+
+# ── 二进制 ──────────────────────────────────────────────────
+#
+# 明确标注而不是靠自动探测：Git 的启发式判断在极小文件上会出错
+# （一个 3 字节的图片会被当成文本）。标了以后 diff 里直接显示
+# "Binary files differ"，不会被当成一堆乱码行。
+*.exe    binary
+*.png    binary
+*.jpg    binary
+*.gif    binary
+*.ico    binary
+*.xbc    binary

@@ -1,0 +1,850 @@
+// ============================================================
+// std.text.doc —— 按行的文档模型
+// ============================================================
+//
+// ── 为什么是「行数组」而不是一整块字符串 ────────────────────
+//
+// 编辑器 99% 的操作都是按行的：上移下移、行号、整行复制/删除、
+// 排序、行注释、按行着色。如果文档是一个大字符串，每个这类操作
+// 都要先算出「当前行在全文中的偏移」，再切片再拼回去 —— 一次
+// 上移光标会退化成 O(全文长度)。
+//
+// 存成 Array<String> 后，行内编辑只改一行（O(行长)），跨行操作
+// 是数组操作（O(行数)），行号就是下标。代价是「全文文本」要拼
+// 一次（保存时做一次，可接受）。
+//
+// ── 码点而不是字节 ──────────────────────────────────────
+//
+// strAt/strSub/len 全部按码点（T1 探针实测：len("中文") == 2），
+// 所以光标列直接就是码点下标。若哪天 len 改成字节，只需改 txtLen。
+//
+// ── 撤销为什么用整份快照 ────────────────────────────────
+//
+// 记录「操作」需要为每种操作写正向和反向两套逻辑（插入的反向是
+// 删除，删除要记住被删内容，多行替换要记住行数与内容……），任何
+// 一种写错就是「撤销一次数据损坏」。
+//
+// 快照只做一件事：复制行数组。字符串不可变，所以这是浅拷贝，
+// 成本是 O(行数) 的指针复制，不复制字符内容。200 步上限下，
+// 一个 1 万行的文件也只多占 200 × 1 万 × 8 字节 ≈ 16MB 指针，
+// 换来的是「撤销永远正确」。
+
+from std.array import arrSorted
+from std.str import strTrimEnd, strTrimStart
+
+const DOC_UNDO_MAX = 200
+
+// ── 通用小工具 ────────────────────────────────────────
+
+// 码点长度。当前语言 len() 就是码点数（T1 实测），保留函数名是
+// 为了把「这里依赖什么语义」固定在调用点；若语义变化只改这一处。
+fn txtLen(s: String) -> Int {
+    return len(s)
+}
+
+fn txtIsSpaceChar(c: String) -> Bool {
+    return c == " " || c == "\t" || c == "\n" || c == "\r"
+}
+
+// 前导空白的**码点**个数（不是显示列）。Home 键的第一站用它。
+fn txtIndentCol(line: String) -> Int {
+    var i = 0
+    while (i < len(line)) {
+        let c = strAt(line, i)
+        if (c == " " || c == "\t") { i = i + 1 } else { return i }
+    }
+    return i
+}
+
+// 行尾符文本。0=CRLF 1=LF 2=CR。
+fn txtEolText(eol: Int) -> String {
+    if (eol == 0) { return "\r\n" }
+    if (eol == 2) { return "\r" }
+    return "\n"
+}
+
+// 换行符名称，状态栏显示用。
+fn txtEolName(eol: Int) -> String {
+    if (eol == 0) { return "Windows (CRLF)" }
+    if (eol == 2) { return "Macintosh (CR)" }
+    return "Unix (LF)"
+}
+
+// 码点是否词字符（供全词匹配与统计使用）。
+fn txtIsWordCode(cp: Int) -> Bool {
+    if (cp >= 48 && cp <= 57) { return true }     // 0-9
+    if (cp >= 65 && cp <= 90) { return true }     // A-Z
+    if (cp >= 97 && cp <= 122) { return true }    // a-z
+    if (cp == 95) { return true }                 // _
+    if (cp >= 128) { return true }                // 非 ASCII（中文等）
+    return false
+}
+
+// ============================================================
+// Doc
+// ============================================================
+
+class Doc {
+    lines: Array       // 每行文本（不含行尾），至少 1 个元素
+    ln: Int            // 光标行，0 基
+    col: Int           // 光标列，码点，0 基
+    anchorLn: Int      // 选区锚点；与光标相同 = 无选区
+    anchorCol: Int
+    top: Int           // 视口首行
+    left: Int          // 水平滚动像素
+    undo: Array        // 快照 [linesCopy, ln, col, anchorLn, anchorCol]
+    redo: Array
+    dirty: Bool
+    path: String
+    name: String       // 未保存时的显示名（"新建 1"）
+    eol: Int           // 0=CRLF 1=LF 2=CR
+    lang: Int          // LANG_*，由视图/应用设置
+    prefCol: Int       // 纵向移动保留的目标列，-1 = 无
+
+    constructor() {
+        self.lines     = [""]
+        self.ln        = 0
+        self.col       = 0
+        self.anchorLn  = 0
+        self.anchorCol = 0
+        self.top       = 0
+        self.left      = 0
+        self.undo      = []
+        self.redo      = []
+        self.dirty     = false
+        self.path      = ""
+        self.name      = "新建"
+        self.eol       = 0
+        self.lang      = 0
+        self.prefCol   = 0 - 1
+    }
+
+    // ── 基本查询 ────────────────────────────────────
+
+    fn lineCount() -> Int {
+        return len(self.lines)
+    }
+
+    fn lineAt(i: Int) -> String {
+        if (i < 0 || i >= len(self.lines)) { return "" }
+        return toString(self.lines[i])
+    }
+
+    fn curLine() -> String {
+        return self.lineAt(self.ln)
+    }
+
+    fn title() -> String {
+        if (len(self.path) == 0) { return self.name }
+        var i = len(self.path) - 1
+        while (i >= 0) {
+            let c = strAt(self.path, i)
+            if (c == "/" || c == "\\") { return strSub(self.path, i + 1, len(self.path)) }
+            i = i - 1
+        }
+        return self.path
+    }
+
+    // ── 光标与选区 ──────────────────────────────────
+
+    fn ensureCursor() {
+        if (len(self.lines) == 0) { arrPush(self.lines, "") }
+        if (self.ln < 0) { self.ln = 0 }
+        if (self.ln >= len(self.lines)) { self.ln = len(self.lines) - 1 }
+        let l = self.lineAt(self.ln)
+        if (self.col < 0) { self.col = 0 }
+        if (self.col > len(l)) { self.col = len(l) }
+        if (self.anchorLn < 0) { self.anchorLn = 0 }
+        if (self.anchorLn >= len(self.lines)) { self.anchorLn = len(self.lines) - 1 }
+        let a = self.lineAt(self.anchorLn)
+        if (self.anchorCol < 0) { self.anchorCol = 0 }
+        if (self.anchorCol > len(a)) { self.anchorCol = len(a) }
+    }
+
+    fn hasSel() -> Bool {
+        return self.anchorLn != self.ln || self.anchorCol != self.col
+    }
+
+    fn clearSel() {
+        self.anchorLn = self.ln
+        self.anchorCol = self.col
+    }
+
+    // 选区起点（文中小者），返回 [ln, col]
+    fn selStart() -> Array {
+        if (self.anchorLn < self.ln) { return [self.anchorLn, self.anchorCol] }
+        if (self.anchorLn > self.ln) { return [self.ln, self.col] }
+        if (self.anchorCol < self.col) { return [self.anchorLn, self.anchorCol] }
+        return [self.ln, self.col]
+    }
+
+    fn selEnd() -> Array {
+        if (self.anchorLn > self.ln) { return [self.anchorLn, self.anchorCol] }
+        if (self.anchorLn < self.ln) { return [self.ln, self.col] }
+        if (self.anchorCol > self.col) { return [self.anchorLn, self.anchorCol] }
+        return [self.ln, self.col]
+    }
+
+    fn selText() -> String {
+        if (!self.hasSel()) { return "" }
+        let a = self.selStart()
+        let b = self.selEnd()
+        let l0 = toInt(a[0])
+        let c0 = toInt(a[1])
+        let l1 = toInt(b[0])
+        let c1 = toInt(b[1])
+        if (l0 == l1) { return strSub(self.lineAt(l0), c0, c1) }
+        var out = strSub(self.lineAt(l0), c0, len(self.lineAt(l0)))
+        var l = l0 + 1
+        while (l < l1) {
+            out = out + "\n" + self.lineAt(l)
+            l = l + 1
+        }
+        out = out + "\n" + strSub(self.lineAt(l1), 0, c1)
+        return out
+    }
+
+    fn selCharCount() -> Int {
+        let s = self.selText()
+        var n = 0
+        var i = 0
+        while (i < len(s)) {
+            if (strAt(s, i) != "\n") { n = n + 1 }
+            i = i + 1
+        }
+        return n
+    }
+
+    // 选区覆盖的行范围 [l0, l1]（无选区 = 当前行）
+    fn selLineRange() -> Array {
+        if (!self.hasSel()) { return [self.ln, self.ln] }
+        let a = self.selStart()
+        let b = self.selEnd()
+        var l0 = toInt(a[0])
+        var l1 = toInt(b[0])
+        // 选区终点在行首时，最后一行实际上没被覆盖
+        if (toInt(b[1]) == 0 && l1 > l0) { l1 = l1 - 1 }
+        return [l0, l1]
+    }
+
+    fn setCursor(nln: Int, ncol: Int, extend: Int) {
+        self.ln = nln
+        self.col = ncol
+        self.ensureCursor()
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn selectRange(l0: Int, c0: Int, l1: Int, c1: Int) {
+        self.anchorLn = l0
+        self.anchorCol = c0
+        self.ln = l1
+        self.col = c1
+        self.ensureCursor()
+    }
+
+    // ── 撤销 / 重做 ────────────────────────────────
+
+    fn snapshot() -> Array {
+        return [arrCopy(self.lines), self.ln, self.col, self.anchorLn, self.anchorCol]
+    }
+
+    fn applySnapshot(s: Array) {
+        self.lines     = arrCopy(s[0])
+        self.ln        = toInt(s[1])
+        self.col       = toInt(s[2])
+        self.anchorLn  = toInt(s[3])
+        self.anchorCol = toInt(s[4])
+        self.prefCol   = 0 - 1
+        self.ensureCursor()
+    }
+
+    // 编辑前调用：推一份快照、清空重做栈、标记脏。
+    fn beforeEdit() {
+        arrPush(self.undo, self.snapshot())
+        if (len(self.undo) > DOC_UNDO_MAX) { arrRemove(self.undo, 0) }
+        while (len(self.redo) > 0) { arrPop(self.redo) }
+        self.dirty = true
+    }
+
+    fn canUndo() -> Bool { return len(self.undo) > 0 }
+    fn canRedo() -> Bool { return len(self.redo) > 0 }
+
+    fn undo() {
+        if (len(self.undo) == 0) { return }
+        arrPush(self.redo, self.snapshot())
+        let s = arrPop(self.undo)
+        self.applySnapshot(s)
+        self.dirty = true
+    }
+
+    fn redo() {
+        if (len(self.redo) == 0) { return }
+        arrPush(self.undo, self.snapshot())
+        let s = arrPop(self.redo)
+        self.applySnapshot(s)
+        self.dirty = true
+    }
+
+    // ── 删除选区（不单独记撤销）──────────────────────
+
+    fn deleteSelSilent() -> Bool {
+        if (!self.hasSel()) { return false }
+        let a = self.selStart()
+        let b = self.selEnd()
+        let sl = toInt(a[0])
+        let sc = toInt(a[1])
+        let el = toInt(b[0])
+        let ec = toInt(b[1])
+        if (sl == el) {
+            let line = self.lineAt(sl)
+            self.lines[sl] = strSub(line, 0, sc) + strSub(line, ec, len(line))
+        } else {
+            let head = strSub(self.lineAt(sl), 0, sc)
+            let tail = strSub(self.lineAt(el), ec, len(self.lineAt(el)))
+            self.lines[sl] = head + tail
+            var k = el
+            while (k > sl) {
+                arrRemove(self.lines, k)
+                k = k - 1
+            }
+        }
+        self.ln = sl
+        self.col = sc
+        self.anchorLn = sl
+        self.anchorCol = sc
+        return true
+    }
+
+    // ── 插入 ───────────────────────────────────────
+
+    fn insertText(s: String) {
+        if (len(s) == 0) { return }
+        let norm = strReplace(strReplace(s, "\r\n", "\n"), "\r", "\n")
+        self.beforeEdit()
+        self.deleteSelSilent()
+        self.ensureCursor()
+        let parts = strSplit(norm, "\n")
+        let n = len(parts)
+        let cur = self.lineAt(self.ln)
+        let head = strSub(cur, 0, self.col)
+        let tail = strSub(cur, self.col, len(cur))
+        if (n == 1) {
+            self.lines[self.ln] = head + toString(parts[0]) + tail
+            self.col = self.col + len(toString(parts[0]))
+        } else {
+            self.lines[self.ln] = head + toString(parts[0])
+            var k = 1
+            while (k < n) {
+                arrInsert(self.lines, self.ln + k, parts[k])
+                k = k + 1
+            }
+            let last = self.ln + n - 1
+            self.lines[last] = toString(self.lines[last]) + tail
+            self.ln = last
+            self.col = len(toString(parts[n - 1]))
+        }
+        self.anchorLn = self.ln
+        self.anchorCol = self.col
+        self.prefCol = 0 - 1
+    }
+
+    fn newline() {
+        self.insertText("\n")
+    }
+
+    // ── 删除 ───────────────────────────────────────
+
+    fn backspace() -> Bool {
+        if (self.hasSel()) {
+            self.beforeEdit()
+            self.deleteSelSilent()
+            return true
+        }
+        self.ensureCursor()
+        if (self.col > 0) {
+            self.beforeEdit()
+            let line = self.lineAt(self.ln)
+            self.lines[self.ln] = strSub(line, 0, self.col - 1) + strSub(line, self.col, len(line))
+            self.col = self.col - 1
+            self.clearSel()
+            self.prefCol = 0 - 1
+            return true
+        }
+        if (self.ln > 0) {
+            self.beforeEdit()
+            let prev = self.lineAt(self.ln - 1)
+            let cur = self.lineAt(self.ln)
+            self.lines[self.ln - 1] = prev + cur
+            arrRemove(self.lines, self.ln)
+            self.ln = self.ln - 1
+            self.col = len(prev)
+            self.clearSel()
+            self.prefCol = 0 - 1
+            return true
+        }
+        return false
+    }
+
+    fn deleteForward() -> Bool {
+        if (self.hasSel()) {
+            self.beforeEdit()
+            self.deleteSelSilent()
+            return true
+        }
+        self.ensureCursor()
+        let line = self.lineAt(self.ln)
+        if (self.col < len(line)) {
+            self.beforeEdit()
+            self.lines[self.ln] = strSub(line, 0, self.col) + strSub(line, self.col + 1, len(line))
+            self.clearSel()
+            return true
+        }
+        if (self.ln < len(self.lines) - 1) {
+            self.beforeEdit()
+            self.lines[self.ln] = line + self.lineAt(self.ln + 1)
+            arrRemove(self.lines, self.ln + 1)
+            self.clearSel()
+            return true
+        }
+        return false
+    }
+
+    // ── 缩进 ───────────────────────────────────────
+
+    fn tabIndent() {
+        if (self.hasSel()) {
+            let r = self.selLineRange()
+            let l0 = toInt(r[0])
+            let l1 = toInt(r[1])
+            self.beforeEdit()
+            var l = l0
+            while (l <= l1) {
+                self.lines[l] = "    " + self.lineAt(l)
+                l = l + 1
+            }
+            self.anchorCol = self.anchorCol + 4
+            self.col = self.col + 4
+        } else {
+            self.insertText("    ")
+        }
+    }
+
+    fn tabUnindent() {
+        let r = self.selLineRange()
+        let l0 = toInt(r[0])
+        let l1 = toInt(r[1])
+        self.beforeEdit()
+        var l = l0
+        while (l <= l1) {
+            let line = self.lineAt(l)
+            if (strStarts(line, "    ")) {
+                self.lines[l] = strSub(line, 4, len(line))
+            } else if (strStarts(line, "\t")) {
+                self.lines[l] = strSub(line, 1, len(line))
+            } else if (strStarts(line, " ")) {
+                self.lines[l] = strSub(line, 1, len(line))
+            }
+            l = l + 1
+        }
+        if (self.col >= 4) { self.col = self.col - 4 } else { self.col = 0 }
+        self.ensureCursor()
+    }
+
+    // ── 行操作 ─────────────────────────────────────
+
+    fn duplicateLine() {
+        self.beforeEdit()
+        arrInsert(self.lines, self.ln + 1, self.lineAt(self.ln))
+        self.clearSel()
+    }
+
+    fn deleteLine() {
+        self.beforeEdit()
+        if (len(self.lines) == 1) {
+            self.lines[0] = ""
+            self.ln = 0
+            self.col = 0
+        } else {
+            arrRemove(self.lines, self.ln)
+            if (self.ln >= len(self.lines)) { self.ln = len(self.lines) - 1 }
+            let l = self.lineAt(self.ln)
+            if (self.col > len(l)) { self.col = len(l) }
+        }
+        self.clearSel()
+    }
+
+    fn moveLineUp() {
+        if (self.ln <= 0) { return }
+        self.beforeEdit()
+        let tmp = self.lineAt(self.ln - 1)
+        self.lines[self.ln - 1] = self.lineAt(self.ln)
+        self.lines[self.ln] = tmp
+        self.ln = self.ln - 1
+        self.clearSel()
+    }
+
+    fn moveLineDown() {
+        if (self.ln >= len(self.lines) - 1) { return }
+        self.beforeEdit()
+        let tmp = self.lineAt(self.ln + 1)
+        self.lines[self.ln + 1] = self.lineAt(self.ln)
+        self.lines[self.ln] = tmp
+        self.ln = self.ln + 1
+        self.clearSel()
+    }
+
+    // 行注释切换。prefix/suffix 由调用方按语言给出（HTML 需要后缀）。
+    // 判定规则：范围内每个非空行的去空白开头都已有 prefix，则取消，
+    // 否则统一加。多行时保持原有缩进：prefix 插在首个非空白字符前。
+    fn toggleComment(prefix: String, suffix: String) {
+        let r = self.selLineRange()
+        let l0 = toInt(r[0])
+        let l1 = toInt(r[1])
+        var allHave = true
+        var anyLine = false
+        var l = l0
+        while (l <= l1) {
+            let trimmed = strTrimStart(self.lineAt(l))
+            if (len(trimmed) > 0) {
+                anyLine = true
+                if (!strStarts(trimmed, prefix)) { allHave = false }
+            }
+            l = l + 1
+        }
+        if (!anyLine) { return }
+
+        self.beforeEdit()
+        l = l0
+        while (l <= l1) {
+            var line = self.lineAt(l)
+            let ind = txtIndentCol(line)
+            let trimmed = strSub(line, ind, len(line))
+            if (len(strTrimStart(trimmed)) == 0) {
+                // 空行不动
+            } else if (allHave) {
+                var body = trimmed
+                if (strStarts(body, prefix)) { body = strSub(body, len(prefix), len(body)) }
+                if (len(suffix) > 0 && strEnds(body, suffix)) {
+                    body = strSub(body, 0, len(body) - len(suffix))
+                }
+                self.lines[l] = strSub(line, 0, ind) + body
+            } else {
+                var body = trimmed
+                var tail = ""
+                if (len(suffix) > 0) {
+                    // HTML：把行尾空白留在注释之外
+                    body = strTrimEnd(trimmed)
+                    tail = strSub(trimmed, len(body), len(trimmed))
+                }
+                self.lines[l] = strSub(line, 0, ind) + prefix + body + suffix + tail
+            }
+            l = l + 1
+        }
+        self.clearSel()
+    }
+
+    fn sortLines() {
+        let r = self.selLineRange()
+        let l0 = toInt(r[0])
+        let l1 = toInt(r[1])
+        self.beforeEdit()
+        let part = arrSlice(self.lines, l0, l1 + 1)
+        let sorted = arrSorted(part)
+        var k = 0
+        while (k < len(sorted)) {
+            self.lines[l0 + k] = toString(sorted[k])
+            k = k + 1
+        }
+        self.clearSel()
+    }
+
+    fn trimTrailing() {
+        let r = self.selLineRange()
+        let l0 = toInt(r[0])
+        let l1 = toInt(r[1])
+        self.beforeEdit()
+        var l = l0
+        while (l <= l1) {
+            self.lines[l] = strTrimEnd(self.lineAt(l))
+            l = l + 1
+        }
+        self.ensureCursor()
+    }
+
+    fn toUpperSel() {
+        self.convertCase(1)
+    }
+
+    fn toLowerSel() {
+        self.convertCase(0)
+    }
+
+    fn convertCase(upper: Int) {
+        if (self.hasSel()) {
+            let a = self.selStart()
+            let b = self.selEnd()
+            let l0 = toInt(a[0])
+            let c0 = toInt(a[1])
+            let l1 = toInt(b[0])
+            let c1 = toInt(b[1])
+            self.beforeEdit()
+            if (l0 == l1) {
+                let line = self.lineAt(l0)
+                let mid = strSub(line, c0, c1)
+                var conv = strLower(mid)
+                if (upper == 1) { conv = strUpper(mid) }
+                self.lines[l0] = strSub(line, 0, c0) + conv + strSub(line, c1, len(line))
+            } else {
+                var l = l0
+                while (l <= l1) {
+                    let line = self.lineAt(l)
+                    var conv = strLower(line)
+                    if (upper == 1) { conv = strUpper(line) }
+                    if (l == l0) {
+                        conv = strSub(line, 0, c0) + convTail(line, c0, upper)
+                    } else if (l == l1) {
+                        conv = convHead(line, c1, upper) + strSub(line, c1, len(line))
+                    }
+                    self.lines[l] = conv
+                    l = l + 1
+                }
+            }
+        } else {
+            self.beforeEdit()
+            let line = self.lineAt(self.ln)
+            var conv = strLower(line)
+            if (upper == 1) { conv = strUpper(line) }
+            self.lines[self.ln] = conv
+        }
+        self.clearSel()
+    }
+
+    fn convertEol(e: Int) {
+        if (self.eol == e) { return }
+        self.beforeEdit()
+        self.eol = e
+    }
+
+    // ── 导航 ───────────────────────────────────────
+
+    fn moveLeft(extend: Int) {
+        self.prefCol = 0 - 1
+        self.ensureCursor()
+        if (extend == 0 && self.hasSel()) {
+            let a = self.selStart()
+            self.ln = toInt(a[0])
+            self.col = toInt(a[1])
+            self.clearSel()
+            return
+        }
+        if (self.col > 0) {
+            self.col = self.col - 1
+        } else if (self.ln > 0) {
+            self.ln = self.ln - 1
+            self.col = len(self.lineAt(self.ln))
+        }
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn moveRight(extend: Int) {
+        self.prefCol = 0 - 1
+        self.ensureCursor()
+        if (extend == 0 && self.hasSel()) {
+            let b = self.selEnd()
+            self.ln = toInt(b[0])
+            self.col = toInt(b[1])
+            self.clearSel()
+            return
+        }
+        let line = self.lineAt(self.ln)
+        if (self.col < len(line)) {
+            self.col = self.col + 1
+        } else if (self.ln < len(self.lines) - 1) {
+            self.ln = self.ln + 1
+            self.col = 0
+        }
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn moveUp(extend: Int) {
+        self.ensureCursor()
+        if (self.prefCol < 0) { self.prefCol = self.col }
+        if (self.ln > 0) {
+            self.ln = self.ln - 1
+            let l = self.lineAt(self.ln)
+            self.col = self.prefCol
+            if (self.col > len(l)) { self.col = len(l) }
+        } else {
+            self.col = 0
+        }
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn moveDown(extend: Int) {
+        self.ensureCursor()
+        if (self.prefCol < 0) { self.prefCol = self.col }
+        if (self.ln < len(self.lines) - 1) {
+            self.ln = self.ln + 1
+            let l = self.lineAt(self.ln)
+            self.col = self.prefCol
+            if (self.col > len(l)) { self.col = len(l) }
+        } else {
+            self.col = len(self.lineAt(self.ln))
+        }
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn moveHome(extend: Int) {
+        self.prefCol = 0 - 1
+        let line = self.lineAt(self.ln)
+        let ind = txtIndentCol(line)
+        if (self.col == ind) { self.col = 0 } else { self.col = ind }
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn moveEnd(extend: Int) {
+        self.prefCol = 0 - 1
+        self.col = len(self.lineAt(self.ln))
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn moveDocStart(extend: Int) {
+        self.prefCol = 0 - 1
+        self.ln = 0
+        self.col = 0
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn moveDocEnd(extend: Int) {
+        self.prefCol = 0 - 1
+        self.ln = len(self.lines) - 1
+        self.col = len(self.lineAt(self.ln))
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn pageUp(pageLines: Int, extend: Int) {
+        self.ensureCursor()
+        if (self.prefCol < 0) { self.prefCol = self.col }
+        self.ln = self.ln - pageLines
+        if (self.ln < 0) { self.ln = 0 }
+        let l = self.lineAt(self.ln)
+        self.col = self.prefCol
+        if (self.col > len(l)) { self.col = len(l) }
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn pageDown(pageLines: Int, extend: Int) {
+        self.ensureCursor()
+        if (self.prefCol < 0) { self.prefCol = self.col }
+        self.ln = self.ln + pageLines
+        if (self.ln >= len(self.lines)) { self.ln = len(self.lines) - 1 }
+        let l = self.lineAt(self.ln)
+        self.col = self.prefCol
+        if (self.col > len(l)) { self.col = len(l) }
+        if (extend == 0) { self.clearSel() }
+    }
+
+    fn selectAll() {
+        self.anchorLn = 0
+        self.anchorCol = 0
+        self.ln = len(self.lines) - 1
+        self.col = len(self.lineAt(self.ln))
+    }
+
+    fn gotoLine(n: Int) {
+        var l = n - 1
+        if (l < 0) { l = 0 }
+        if (l >= len(self.lines)) { l = len(self.lines) - 1 }
+        self.ln = l
+        self.col = 0
+        self.clearSel()
+        self.prefCol = 0 - 1
+    }
+
+    // ── 统计 ───────────────────────────────────────
+
+    fn charCount() -> Int {
+        if (self.hasSel()) { return self.selCharCount() }
+        var n = 0
+        var i = 0
+        while (i < len(self.lines)) {
+            n = n + len(self.lineAt(i))
+            i = i + 1
+        }
+        return n
+    }
+
+    fn wordCount() -> Int {
+        var n = 0
+        var inWord = false
+        var l = 0
+        while (l < len(self.lines)) {
+            let line = self.lineAt(l)
+            var i = 0
+            while (i < len(line)) {
+                let cp = strCode(strAt(line, i))
+                if (txtIsWordCode(cp)) {
+                    if (!inWord) { n = n + 1 }
+                    inWord = true
+                } else {
+                    inWord = false
+                }
+                i = i + 1
+            }
+            inWord = false
+            l = l + 1
+        }
+        return n
+    }
+
+    // ── 全文 ───────────────────────────────────────
+
+    fn text() -> String {
+        if (len(self.lines) == 1 && len(self.lineAt(0)) == 0) { return "" }
+        let e = txtEolText(self.eol)
+        return strJoin(self.lines, e) + e
+    }
+
+    fn setText(s: String) {
+        let norm = strReplace(strReplace(s, "\r\n", "\n"), "\r", "\n")
+        let parts = strSplit(norm, "\n")
+        self.lines = []
+        var i = 0
+        while (i < len(parts)) {
+            arrPush(self.lines, toString(parts[i]))
+            i = i + 1
+        }
+        // 文件以换行结尾时，split 会多出一个空行，它是「行尾」而不是
+        // 一行内容。去掉它，但保证至少保留一行。
+        if (len(self.lines) > 1 && len(self.lineAt(len(self.lines) - 1)) == 0) {
+            arrRemove(self.lines, len(self.lines) - 1)
+        }
+        if (len(self.lines) == 0) { arrPush(self.lines, "") }
+        self.ln = 0
+        self.col = 0
+        self.anchorLn = 0
+        self.anchorCol = 0
+        self.undo = []
+        self.redo = []
+        self.dirty = false
+        self.prefCol = 0 - 1
+    }
+}
+
+// ── 局部大小写辅助（供 convertCase 使用）──────────────
+//
+// 这两个函数存在的理由：跨行大小写转换时，首尾两行只转「选区
+// 覆盖的那一段」，中间行整行转。写成函数避免在 while 里堆三层
+// if，也避免把 upper 标志传来传去时写错。
+
+fn convHead(line: String, endCol: Int, upper: Int) -> String {
+    let part = strSub(line, 0, endCol)
+    if (upper == 1) { return strUpper(part) }
+    return strLower(part)
+}
+
+fn convTail(line: String, startCol: Int, upper: Int) -> String {
+    let part = strSub(line, startCol, len(line))
+    if (upper == 1) { return strUpper(part) }
+    return strLower(part)
+}

@@ -1,0 +1,55 @@
+// 04-fn.x — 函数与递归
+//
+// 验证点：
+//   1. 函数声明、参数、返回值
+//   2. 前向引用（add 在 main 之后调用也没问题）
+//   3. 递归（factorial）
+//   4. 互递归（isEven / isOdd）
+//   5. 返回类型推断影响调用方的指令选择（fact 返回 Int → 乘法走 MUL_I64）
+
+fn add(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+fn factorial(n: Int) -> Int {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+fn fib(n: Int) -> Int {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+// 互递归：两个函数互相引用，靠的是签名表两遍扫描
+fn isEven(n: Int) -> Bool {
+    if n == 0 {
+        return true
+    }
+    return isOdd(n - 1)
+}
+
+fn isOdd(n: Int) -> Bool {
+    if n == 0 {
+        return false
+    }
+    return isEven(n - 1)
+}
+
+fn square(x: Float) -> Float {
+    return x * x
+}
+
+fn main() -> Int {
+    println(add(3, 4))          // 7
+    println(factorial(10))      // 3628800
+    println(fib(20))            // 6765
+    println(isEven(10))         // true
+    println(isOdd(10))          // false
+    println(square(1.5))        // 2.25
+    return 0
+}

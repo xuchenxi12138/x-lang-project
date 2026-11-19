@@ -1,0 +1,418 @@
+// ui/display/tree.xle — 树形视图
+//
+// ── 树的核心是「扁平化」 ──────────────────────────
+//
+// 树在逻辑上是嵌套结构，但在绘制和命中判定上必须是**一行行**
+// 的扁平列表 —— 因为滚动、选中、虚拟化全都按「行」工作。
+//
+// 所以 Tree 的关键设计是：内部持有一份「可见行的扁平数组」，
+// 每个元素记录（层级、是否展开、对应的节点下标）。
+// 展开/收起时重建这份数组。
+//
+// ── 边的表示（本实现的核心取舍）──────────────────
+//
+// 用两个并行数组而不是嵌套结构：
+//
+//   names   = ["src", "main", "app.xle", "lib", "ui.xle"]
+//   depths  = [0, 1, 2, 1, 1]
+//   hasKids = [true, true, false, true, false]
+//
+// ── 为什么不用嵌套数组 ─────────────────────────
+//
+// 嵌套（`[["src", [["main", [...]]]]]`）在语言里没法静态追踪
+// 类型，每次取下标都要 toInt()/toString() 强转，而且遍历要写
+// 递归 —— 而递归在每帧都跑的情况下很容易踩栈。
+//
+// 扁平三数组的代价是「结构信息散在三处」，但换来的是 O(1) 的
+// 行访问和线性遍历。对一个每帧都跑的 UI 组件来说，这个取舍
+// 是对的。
+//
+// ── 展开状态存在哪 ───────────────────────────
+//
+// 存在一个 Bool 数组 expanded 里，与 names 同下标。这样「第 i 行
+// 展开了吗」是 O(1) 查询，不需要遍历祖先链。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 行高。
+const TREE_ROW_H = 26
+
+// 每级缩进的像素宽度。
+const TREE_INDENT = 16
+
+// 展开箭头的宽度。
+const TREE_ARROW_W = 14
+
+class Tree extends Widget {
+    // 节点名（扁平，按显示顺序）。
+    names: Array,
+
+    // 每个节点的层级。0 是根。
+    depths: Array,
+
+    // 是否有子节点（决定画不画展开箭头）。
+    hasKids: Array,
+
+    // 是否展开。只有 hasKids 为真的节点才有意义。
+    expanded: Array,
+
+    // 当前选中行。-1 表示无。
+    selected: Int,
+
+    // 滚动偏移（像素）。
+    offset: Int,
+
+    // 每级缩进。
+    indent: Int,
+
+    constructor(r: Rect) {
+        self.r        = r
+        self.vis      = true
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.names    = []
+        self.depths   = []
+        self.hasKids  = []
+        self.expanded = []
+        self.selected = 0 - 1
+        self.offset   = 0
+        self.indent   = TREE_INDENT
+        self.style    = Style.plain()
+    }
+
+    static fn of(r: Rect) -> Tree {
+        return new Tree(r)
+    }
+
+    // ── 设置数据 ─────────────────────────────────
+    //
+    // 一次性传入三个并行数组。默认全部收起（除了根级）。
+    //
+    // ── 为什么默认收起而不是全展开 ────────────────
+    //
+    // 全展开会把上千个节点一次铺出来，用户找不到东西。默认收起
+    // 是文件树、大纲视图的一致行为。
+    fn setNodes(ns: Array, ds: Array, kids: Array) -> Tree {
+        self.names = ns
+        self.depths = ds
+        self.hasKids = kids
+
+        let ex = []
+        var i = 0
+        while i < len(ns) {
+            arrPush(ex, false)
+            i = i + 1
+        }
+        self.expanded = ex
+        self.selected = 0 - 1
+        self.offset = 0
+        return self
+    }
+
+    fn rowCount() -> Int {
+        return len(self.names)
+    }
+
+    // ── 折叠的可见性 ──────────────────────────────
+    //
+    // 一行是否可见 = 它的所有祖先都处于展开状态。
+    //
+    // ── 为什么每次现算而不是维护「可见行数组」 ──────────
+    //
+    // 现算是 O(行数) 的（对每行往回找祖先），而维护可见数组
+    // 也要求 O(行数) 的重建。前者代码少一半，且不会有「数组
+    // 过期」的 bug。对几百个节点的树，这点开销可以忽略。
+    fn isVisible(i: Int) -> Bool {
+        if (i < 0 || i >= len(self.names)) { return false }
+        let d = toInt(self.depths[i])
+        if (d == 0) { return true }
+
+        // 往回找最近的、层级恰好的祖先。
+        //
+        // 从 i-1 往前扫，第一个 depth < d 的节点就是上一层祖先；
+        // 再继续往前找它的祖先，直到 depth 0。任何一层收起，
+        // 本行就不可见。
+        var target = d - 1
+        var k = i - 1
+        while k >= 0 {
+            let kd = toInt(self.depths[k])
+            if (kd == target) {
+                if (!self.expanded[k]) { return false }
+                if (target == 0) { return true }
+                target = target - 1
+                // 从找到的祖先继续往前。
+                k = k - 1
+                continue
+            }
+            k = k - 1
+        }
+        // 找不到完整祖先链（数据不一致）：保守地认为可见。
+        return true
+    }
+
+    // 可见行数。
+    fn visibleCount() -> Int {
+        var n = 0
+        var i = 0
+        while i < len(self.names) {
+            if (self.isVisible(i)) { n = n + 1 }
+            i = i + 1
+        }
+        return n
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    fn viewport() -> Rect {
+        return Rect.inset(self.r, 1)
+    }
+
+    // 第 i 个**节点**（不是可见序号）的屏幕矩形。
+    //
+    // ── 为什么用节点下标而不是可见序号 ─────────────
+    //
+    // 因为选中、展开、命中都是按节点下标识别的。用可见序号的
+    // 话，每次折叠都要重映射，而「重映射表」是最容易出 bug
+    // 的地方（尤其是折叠中间的节点时）。
+    //
+    // 代价是计算 y 要数「i 之前有多少可见行」—— O(n) 每次。
+    // 对几百个节点可以接受；上千个节点时应该改成预计算。
+    fn rowRect(i: Int) -> Rect {
+        var y = self.viewport().y;
+        var k = 0
+        while k < i {
+            if (self.isVisible(k)) {
+                y = y + TREE_ROW_H
+            }
+            k = k + 1
+        }
+        return rectOf(self.viewport().x, y - self.offset,
+                      self.viewport().w, TREE_ROW_H)
+    }
+
+    // 鼠标命中的节点下标。
+    fn rowAt(mx: Int, my: Int) -> Int {
+        let vp = self.viewport()
+        if (!vp.contains(mx, my)) { return 0 - 1 }
+        let rel = my - vp.y + self.offset
+        if (rel < 0) { return 0 - 1 }
+
+        // 数到第几个可见行。
+        var want = rel / TREE_ROW_H
+        var n = 0
+        var i = 0
+        while i < len(self.names) {
+            if (self.isVisible(i)) {
+                if (n == want) { return i }
+                n = n + 1
+            }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // 展开箭头的矩形（第 i 个节点）。
+    fn arrowRect(i: Int) -> Rect {
+        let rr = self.rowRect(i)
+        let d = toInt(self.depths[i])
+        let x = rr.x + d * self.indent + 4
+        return rectOf(x, rr.y, TREE_ARROW_W, rr.h)
+    }
+
+    // ── 交互 ────────────────────────────────────
+
+    // 折叠/展开。返回是否变化。
+    fn toggle(i: Int) -> Bool {
+        if (i < 0 || i >= len(self.names)) { return false }
+        if (!self.hasKids[i]) { return false }
+        self.expanded[i] = !self.expanded[i]
+        return true
+    }
+
+    fn expand(i: Int) -> Tree {
+        if (i >= 0 && i < len(self.names) && self.hasKids[i]) {
+            self.expanded[i] = true
+        }
+        return self
+    }
+
+    fn collapse(i: Int) -> Tree {
+        if (i >= 0 && i < len(self.names)) {
+            self.expanded[i] = false
+        }
+        return self
+    }
+
+    fn expandAll() -> Tree {
+        var i = 0
+        while i < len(self.names) {
+            self.expanded[i] = true
+            i = i + 1
+        }
+        return self
+    }
+
+    fn collapseAll() -> Tree {
+        var i = 0
+        while i < len(self.names) {
+            self.expanded[i] = false
+            i = i + 1
+        }
+        return self
+    }
+
+    // 点击。返回被点中的节点下标，-1 表示无。
+    //
+    // ── 点箭头和点名字的区别 ────────────────────
+    //
+    // 点箭头 = 展开/收起（不改变选中）
+    // 点名字 = 选中（并可能触发打开）
+    //
+    // 这个区分很重要：想让用户「展开看一眼但不想离开当前位置」，
+    // 就必须能只点箭头。混在一起做会让树用起来很难受。
+    fn click(mx: Int, my: Int) -> Int {
+        if (!self.vis || !self.enabled) { return 0 - 1 }
+        let i = self.rowAt(mx, my)
+        if (i < 0) { return 0 - 1 }
+
+        let ar: Rect = self.arrowRect(i)
+        if (ar.contains(mx, my) && self.hasKids[i]) {
+            self.toggle(i)
+            return 0 - 1
+        }
+
+        if (i != self.selected) {
+            self.selected = i
+            return i
+        }
+        return i
+    }
+
+    // 键盘。左右折叠/展开，上下移动。
+    fn keyDown(key: String) -> Int {
+        if (key == "ArrowRight") {
+            let i = self.selected
+            if (i >= 0 && self.hasKids[i] && !self.expanded[i]) {
+                self.expand(i)
+            }
+            return 0 - 1
+        }
+        if (key == "ArrowLeft") {
+            let i = self.selected
+            if (i >= 0 && self.hasKids[i] && self.expanded[i]) {
+                self.collapse(i)
+            }
+            return 0 - 1
+        }
+        return 0 - 1
+    }
+
+    // 滚动。
+    fn scroll(delta: Int) -> Tree {
+        self.offset = self.offset - delta * TREE_ROW_H
+        let total = self.visibleCount() * TREE_ROW_H
+        let vh = self.viewport().h
+        let mx2 = total - vh
+        if (mx2 < 0) { mx2 = 0 }
+        if (self.offset > mx2) { self.offset = mx2 }
+        if (self.offset < 0) { self.offset = 0 }
+        return self
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.surface)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, th.border)
+
+        if (len(self.names) == 0) {
+            uiTextInRect(self.viewport(), "暂无节点", th.textDim)
+            return
+        }
+
+        let vp = self.viewport()
+        winClip(vp.x, vp.y, vp.w, vp.h)
+
+        let mxx = winMouseX()
+        let myy = winMouseY()
+        let hovRow = self.rowAt(mxx, myy)
+
+        var i = 0
+        while i < len(self.names) {
+            if (!self.isVisible(i)) {
+                i = i + 1
+                continue
+            }
+            let rr: Rect = self.rowRect(i)
+            // 快速跳过看不见的行（滚动到上面的）。
+            if (rr.y + rr.h < vp.y) { i = i + 1; continue }
+            if (rr.y > vp.y + vp.h) { break }
+
+            // 行背景。
+            if (i == self.selected) {
+                winFillRect(rr.x, rr.y, rr.w, rr.h, th.surfaceActive)
+            } else if (i == hovRow) {
+                winFillRect(rr.x, rr.y, rr.w, rr.h, th.surfaceHover)
+            }
+
+            let d = toInt(self.depths[i])
+            let kids = self.hasKids[i]
+            let ex = self.expanded[i]
+
+            // 缩进参考线：每级画一条竖线，帮助看清层级。
+            //
+            // 只画到「当前层的左边界」为止，不画满整行 —— 画满会
+            // 让树看起来很吵。
+            var lv = 0
+            while lv < d {
+                let lx = rr.x + lv * self.indent + 8
+                winFillRect(lx, rr.y, 1, rr.h, th.border)
+                lv = lv + 1
+            }
+
+            // 展开箭头（有子节点时）。
+            let ar: Rect = self.arrowRect(i)
+            if (kids) {
+                let cx = ar.x + ar.w / 2
+                let cy = ar.y + ar.h / 2
+                let s = 4
+                var pts = []
+                if (ex) {
+                    // 展开：朝下。
+                    pts = [cx - s, cy - 2, cx + s, cy - 2, cx, cy + s - 2]
+                } else {
+                    // 收起：朝右。
+                    pts = [cx - 2, cy - s, cx - 2, cy + s, cx + s - 2, cy]
+                }
+                winPath(pts, th.textDim)
+            }
+
+            // 名字。
+            let tx = ar.x + ar.w + 4
+            let avail = rr.x + rr.w - tx - 10
+            var name = toString(self.names[i])
+            if (avail > 0 && winTextWidth(name) > avail) {
+                name = uiEllipsize(name, avail)
+            }
+
+            var tc = th.text
+            if (i == self.selected) { tc = th.accent }
+            if (!self.enabled) { tc = th.disabled }
+
+            let ty = rr.y + (rr.h - winTextHeight()) / 2
+            winText(tx, ty, name, tc)
+
+            i = i + 1
+        }
+
+        winUnclip()
+    }
+}

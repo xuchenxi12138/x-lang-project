@@ -1,0 +1,72 @@
+// mapper/user_mapper.xle — 用户表数据访问
+//
+// ── 这个类展示了「MyBatis-Plus 的 BaseMapper 在无泛型语言里的
+//    对应物」的完整用法 ─────────────────────────────────────
+//
+// BaseMapper 提供行级 API（rowById 返回 [[列名, 值], ...]），因为
+// 语言没有泛型、没有类型转换语法，BaseMapper 没法返回「User 类型」。
+// 类型化的门面由本类用**协变覆写**补上：
+//
+//   基类行为             本类的类型化门面
+//   ─────────────       ─────────────────
+//   rowById(id) 行数组   byId(id) -> User（fillEntity 填充）
+//   rowList(qw) 行数组   rowsToUsers(rows) -> Array（元素是 User）
+//
+// service 拿到的引用是编译器验证过的 User —— 比 Java 泛型擦除后
+// 的效果还干净（这里是真实的字段访问类型检查，不是编译器哄你）。
+//
+// CRUD 的 SQL 生成与执行都在 BaseMapper（insert/updateById/
+// deleteById/count），本类只写「类型收窄」和业务查询组合。
+
+import "../../../../lib/xboot/data.xle"
+import "../entity/user.xle"
+
+@Mapper(entity = "User")
+class UserMapper extends BaseMapper {
+
+    // 按主键取单个实体。查无此行返回 null。
+    fn byId(id: Int) -> User {
+        let row = self.rowById(id)
+        if (len(row) == 0) { return null }
+        let u = new User()
+        fillEntity(u, self.meta, row)
+        return u
+    }
+
+    // 行数组 → 实体数组（列表查询的共用后处理）。
+    fn rowsToUsers(rows: Array) -> Array {
+        let out = []
+        var i = 0
+        while i < len(rows) {
+            let row: Array = rows[i]
+            let u = new User()
+            fillEntity(u, self.meta, row)
+            arrPush(out, u)
+            i = i + 1
+        }
+        return out
+    }
+
+    // 全量列表（按 id 升序 —— 分页列表的稳定次序）。
+    fn listAll() -> Array {
+        let qw = new QueryWrapper()
+        qw.orderByAsc("id")
+        return self.rowsToUsers(self.rowList(qw))
+    }
+
+    // 按状态筛选。
+    fn listByStatus(status: Int) -> Array {
+        let qw = new QueryWrapper()
+        qw.eq("status", status)
+        qw.orderByAsc("id")
+        return self.rowsToUsers(self.rowList(qw))
+    }
+
+    // 用户名模糊搜索。
+    fn searchByName(keyword: String) -> Array {
+        let qw = new QueryWrapper()
+        qw.like("username", keyword)
+        qw.orderByAsc("id")
+        return self.rowsToUsers(self.rowList(qw))
+    }
+}

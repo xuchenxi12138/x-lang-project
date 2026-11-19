@@ -1,0 +1,325 @@
+// db/oracle/driver.xle — Oracle 驱动
+//
+// ══════════════════════════════════════════════════════
+//  ⚠ 本驱动的状态：**协议层完成，会话层为诚实占位**
+// ══════════════════════════════════════════════════════
+//
+// ── 已经实现并在离线测试中验证的 ────────────────────────
+//
+//   · TNS 报文帧（8 字节头、长度含头、包类型）
+//   · CONNECT 负载构造（描述符 TLV 编码、7 个 u16 固定头、58 字节偏移）
+//   · ACCEPT 解析（版本 / SDU / TDU 协商结果）
+//   · REFUSE 解析（34 个原因码全部翻成中文 + 可操作建议）
+//   · DATA 包的 flags / func 分离与解析
+//   · 17 种 Oracle 类型名
+//   · NUMBER 的十进制编码解码
+//
+// ── 没有实现，以及为什么 ──────────────────────────
+//
+// **O5LOGON 认证**。这是真正的阻塞点，不是省事：
+//
+//   1. 它要 AES-128-CBC 加解密。本层已有 SHA-1/256、MD5、HMAC、
+//      PBKDF2，但**没有 AES**。而在纯 X 语言里实现 AES 需要
+//      S-box、密钥扩展、MixColumns —— 约 400 行，且必须与 Oracle
+//      的密钥派生（PBKDF2-SHA512，注意是 **512** 不是 256，
+//      而我们已经实现的 PBKDF2 是 256 版）严格对齐。
+//
+//   2. O5LOGON 的握手是**五轮**，每轮的负载结构都没有公开文档，
+//      全靠逆向。任何一字节偏差的表现是「登录挂起」或
+//      「ORA-01017 用户名/口令无效」—— 后者会让人去查密码，
+//      而真正的原因是加密算错了。
+//
+//   3. 没有可信的测试环境就无法验证。本机没有 Oracle 服务
+//      （1521 端口未监听，无 sqlplus，无 cx_Oracle），
+//      写出来的认证代码**一行都无法验证**。
+//
+// ── 为什么选择「明确失败」而不是「假装能连」 ────────────
+//
+// 一个会发 CONNECT、收 ACCEPT、然后在 OLOGON 阶段随机失败的驱动，
+// 比一个直接说「不支持」的驱动危险得多：前者会让用户花几小时
+// 怀疑网络、防火墙、监听器、密码，而问题根本在客户端。
+//
+// 所以 connect() 的行为是：
+//   · TCP 能连上 → 发 CONNECT → 收 ACCEPT → **明确报「认证未实现」**
+//   · TCP 连不上 → 报网络错误
+//   · 收到 REFUSE → 报原因码的中文解释
+//
+// 这样「网络通不通 / 监听器认不认服务名 / 认证支不支持」三种失败
+// 能被清楚区分开。前两种对排查真实环境仍然有用。
+//
+// ── 后续要补什么 ──────────────────────────────────
+//
+//   1. codec/aes.xle（AES-128-CBC）
+//   2. codec/pbkdf2.xle 加 SHA-512 变体（Oracle 用 SHA-512）
+//   3. oracle/auth.xle（O5LOGON 五轮握手）
+//   4. oracle/descriptor.xle（查询结果的描述符解析）
+//   5. driver 里把 query / execute 接上 OOPEN/OEXEC/OFETCH
+
+from "../core/datasource.xle" import sqlBind, execAll, DataSource
+from "../core/result.xle" import ResultSet
+from "../core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "tns.xle" import tnsConnectFlags, tnsTypeName, tnsBuild, tnsRead, tnsParseRefuse, tnsRefuseReason, TnsPacket, TNS_HDR, TNS_PKT_CONNECT, TNS_PKT_ACCEPT, TNS_PKT_ACK, TNS_PKT_REFUSE, TNS_PKT_REDIRECT, TNS_PKT_DATA, TNS_PKT_MARKER, TNS_PKT_ATTEST, TNS_PKT_CONTROL, TNS_PKT_RESEND, TNS_VERSION_11_2, TNS_VERSION_12_1
+from "connect.xle" import tnsBuildConnect, tnsEncodeDescriptor, tnsEncodeGroup, tnsMatchParen, tnsParseAccept, toHexStr, TnsAccept, TNS_CONNECT_DATA_OFFSET, TNS_SDU, TNS_TDU
+from "data.xle" import oraFuncName, tnsHex, oraTypeName, oraBuildData, oraParseData, oraDecodeNumber, OraDataPacket, ORA_TYPE_VARCHAR, ORA_TYPE_NUMBER, ORA_TYPE_LONG, ORA_TYPE_VARCHAR2, ORA_TYPE_ROWID, ORA_TYPE_DATE, ORA_TYPE_RAW, ORA_TYPE_LONG_RAW, ORA_TYPE_CHAR, ORA_TYPE_BINARY_F, ORA_TYPE_BINARY_D, ORA_TYPE_CLOB, ORA_TYPE_BLOB, ORA_TYPE_TIMESTAMP, ORA_TYPE_TIMESTAMPTZ, ORA_TYPE_INTERVAL_YM, ORA_TYPE_INTERVAL_DS, ORA_FUNC_OSQL, ORA_FUNC_OEXFCX, ORA_FUNC_OFETCH, ORA_FUNC_OCLOSE, ORA_FUNC_OLOGOFF, ORA_FUNC_OOPEN, ORA_FUNC_OPARSE, ORA_FUNC_OEXEC, ORA_FUNC_OLOGON, ORA_FUNC_OPING, ORA_FUNC_OEND, ORA_FLAG_NORMAL, ORA_FLAG_MORE, ORA_FLAG_EOF
+
+class OracleDataSource extends DataSource {
+    // 账号（P0 只用于诊断输出，不参与认证）。
+    user: String,
+    password: String,
+
+    // 服务名（SERVICE_NAME，不是 SID）。
+    serviceName: String,
+
+    // TCP 连接。
+    conn: Conn,
+
+    // ACCEPT 协商结果。
+    accept: TnsAccept,
+
+    constructor(ep: Endpoint, user: String, password: String, serviceName: String) {
+        self.ep          = ep
+        self.user        = user
+        self.password    = password
+        self.serviceName = serviceName
+        self.dialect     = dialectOf(DB_ORACLE)
+        self.connected   = false
+        self.lastError   = ""
+        self.conn        = new Conn(0 - 1, ep.host, ep.port)
+        let a = new TnsAccept()
+        self.accept      = a
+    }
+
+    static fn ofUrl(url: String, user: String, password: String) -> OracleDataSource {
+        let u = oraParseUrl(url)
+        return new OracleDataSource(endpointOf(toString(u[1]), toInt(u[2])),
+                                    user, password, toString(u[3]))
+    }
+
+    // ── connect ─────────────────────────────────
+
+    fn connect() -> Bool {
+        self.lastError = ""
+
+        // ① TCP
+        let c = Conn.dial(self.ep)
+        if (!c.isOpen()) {
+            self.lastError = "连不上 " + endpointString(self.ep) +
+                             "。检查：监听器是否启动（lsnrctl status）、" +
+                             "主机名/端口是否正确、防火墙是否放通"
+            return false
+        }
+        self.conn = c
+
+        // ② CONNECT
+        let cp = tnsBuildConnect(self.serviceName)
+        if (len(cp) == 0) {
+            self.lastError = "构造 CONNECT 包失败（服务名 `" + self.serviceName +
+                             "` 可能过长，或描述符编码失败）"
+            c.close()
+            return false
+        }
+        let pkt = tnsBuild(TNS_PKT_CONNECT, cp)
+        if (c.sendBytes(pkt) != len(pkt)) {
+            self.lastError = "发送 CONNECT 包失败（连接被对端关闭）"
+            c.close()
+            return false
+        }
+
+        // ③ 读响应：可能是 ACCEPT / REFUSE / REDIRECT
+        let rr = tnsRead(c)
+        if (rr[0] != true) {
+            self.lastError = "读 CONNECT 响应失败：" + toString(rr[2])
+            c.close()
+            return false
+        }
+        let resp: TnsPacket = rr[1]
+
+        if (resp.pktType == TNS_PKT_REFUSE) {
+            // REFUSE：把这当成「服务端有响应但拒绝了」。
+            //
+            // ── 为什么这里不算「连上了」 ────────────────────
+            //
+            // 因为 REFUSE 表示服务名/版本/资源有问题，会话根本没建立。
+            // 但 reasons 里的信息对排查真实环境**很有用**，所以
+            // 完整写进 lastError，而不是只说「连接失败」。
+            self.lastError = tnsParseRefuse(resp.payload)
+            c.close()
+            return false
+        }
+
+        if (resp.pktType == TNS_PKT_REDIRECT) {
+            self.lastError = "服务端要求重定向到另一个监听器（REDIRECT）。" +
+                             "本驱动不支持自动跟随重定向，请直接把连接指向目标地址。"
+            c.close()
+            return false
+        }
+
+        if (resp.pktType != TNS_PKT_ACCEPT) {
+            self.lastError = "期望 ACCEPT，实际收到 " + resp.describe() +
+                             "。这通常意味着服务端版本与本客户端不兼容（试 TNS_VERSION_11_2）。"
+            c.close()
+            return false
+        }
+
+        // ④ ACCEPT 解析
+        let a = tnsParseAccept(resp.payload)
+        self.accept = a
+        if (!a.ok) {
+            self.lastError = "ACCEPT 解析失败：" + a.error
+            c.close()
+            return false
+        }
+
+        // ⑤ 到这里 TNS 层已经通了。接下来的 O5LOGON 认证未实现 ——
+        //    明确报出来，并保留上一句诊断信息（SDU/版本），因为那些
+        //    对判断「环境本身有没有问题」是有价值的。
+        self.lastError = "TNS 层已连通（" + a.describe() + "），但 O5LOGON 认证未实现，" +
+                         "无法建立数据库会话。\n" +
+                         "  原因：O5LOGON 需要 AES-128-CBC + PBKDF2-SHA512 五轮握手，" +
+                         "本层尚未实现（见 oracle/driver.xle 文件头的详细说明）。\n" +
+                         "  TCP 与监听器都是通的 —— 如果你看到这条消息，" +
+                         "说明网络/端口/服务名至少有一项是对的。"
+        c.close()
+        return false
+    }
+
+    fn close() {
+        if (self.conn.isOpen()) {
+            // 尝试体面地发 OEND（结束会话）。失败也无所谓 ——
+            // 会话本来就没建立起来。
+            let p = oraBuildData(ORA_FUNC_OEND, [])
+            let pkt = tnsBuild(TNS_PKT_DATA, p)
+            self.conn.sendBytes(pkt)
+            self.conn.close()
+        }
+        self.connected = false
+    }
+
+    fn ping() -> Bool {
+        // 会话没建立，ping 必然是 false。
+        //
+        // ── 为什么不做「TCP 探测」当 ping ──────────────
+        //
+        // 因为 ping 的语义是「这个数据源还能用吗」，而不是「端口开着吗」。
+        // 返回 true 会让上层的连接池认为可以借出这个连接，然后查询时
+        // 才失败 —— 错误被推迟到业务代码里，栈更难读。
+        return self.connected
+    }
+
+    fn query(sql: String) -> ResultSet {
+        return self.notImplemented("query", sql)
+    }
+
+    fn execute(sql: String) -> ResultSet {
+        return self.notImplemented("execute", sql)
+    }
+
+    // 统一的「未实现」结果集。带上足够多的上下文，让调用方知道
+    // 卡在哪一层。
+    fn notImplemented(op: String, sql: String) -> ResultSet {
+        let rs = ResultSet.empty()
+        rs.ok = false
+        var head = strTrim(sql)
+        if (len(head) > 60) { head = strSub(head, 0, 60) + "…" }
+        rs.error = "Oracle " + op + " 不可用：O5LOGON 认证未实现，会话未建立。" +
+                   "\n  SQL: " + head +
+                   "\n  当前状态: TNS " + oraTnsState(self) +
+                   "\n  已实现的部分: TNS 报文帧 / CONNECT 构造 / ACCEPT 解析 / " +
+                   "REFUSE 原因码解释 / DATA 包解析 / 17 种类型名 / NUMBER 解码"
+        return rs
+    }
+
+    // ── 诊断 ────────────────────────────────────
+
+    fn kind() -> Int {
+        return DB_ORACLE
+    }
+
+    fn name() -> String {
+        return "oracle"
+    }
+
+    fn describe() -> String {
+        var s = "Oracle @" + endpointString(self.ep) + " service=" + self.serviceName
+        if (self.accept.ok) {
+            s = s + " [TNS " + self.accept.describe() + "]"
+        }
+        if (!self.connected) { s = s + " [无会话]" }
+        return s
+    }
+
+    // 连接诊断：逐层报告能走到哪一步。
+    //
+    // 这是本驱动最实用的方法 —— 因为「连不上 Oracle」的原因有十几
+    // 种，而这个函数能把它缩小到具体一层。
+    fn diagnose() -> String {
+        var s = "Oracle 连接诊断\n"
+        s = s + "  目标      " + endpointString(self.ep) + "\n"
+        s = s + "  服务名    " + self.serviceName + "\n"
+        s = s + "  账号      " + self.user + "\n"
+        s = s + "  TCP       "
+        let c = Conn.dial(self.ep)
+        if (!c.isOpen()) {
+            s = s + "✗ 连不上（端口未监听 / 防火墙 / 主机名）\n"
+            return s
+        }
+        s = s + "✓ 已连接\n"
+        c.close()
+
+        s = s + "  TNS       "
+        if (self.accept.ok) {
+            s = s + "✓ " + self.accept.describe() + "\n"
+        } else if (len(self.lastError) > 0) {
+            s = s + "✗ " + self.lastError + "\n"
+        } else {
+            s = s + "? 未尝试（先调 connect()）\n"
+        }
+        s = s + "  认证      ✗ O5LOGON 未实现（AES-128-CBC + PBKDF2-SHA512）\n"
+        s = s + "  结论      "
+        if (self.connected) {
+            s = s + "可用"
+        } else {
+            s = s + "不可用 —— 但上面的 TCP / TNS 两层结果对排查环境仍然有效"
+        }
+        return s
+    }
+}
+
+fn oraTnsState(ds: OracleDataSource) -> String {
+    if (ds.accept.ok) { return "TNS 已协商（" + ds.accept.describe() + "），会话未建立" }
+    return "TNS 未协商"
+}
+
+// oracle://user:pwd@host:1521/SERVICE_NAME
+fn oraParseUrl(url: String) -> Array {
+    var s = url
+    let p = strFind(s, "://")
+    if (p >= 0) { s = strSub(s, p + 3, len(s)) }
+
+    var host = ""
+    var port = PORT_ORACLE
+    var svc = ""
+
+    // 认证部分
+    let at = strFind(s, "@")
+    if (at >= 0) { s = strSub(s, at + 1, len(s)) }
+
+    // 路径部分
+    let sl = strFind(s, "/")
+    if (sl >= 0) {
+        svc = strSub(s, sl + 1, len(s))
+        s = strSub(s, 0, sl)
+    }
+
+    let c = strFind(s, ":")
+    if (c >= 0) {
+        host = strSub(s, 0, c)
+        port = toIntOr(strSub(s, c + 1, len(s)), PORT_ORACLE)
+    } else {
+        host = s
+    }
+    return ["oracle", host, port, svc]
+}

@@ -1,0 +1,380 @@
+// service/config.xle — 配置
+//
+// ── 配置的核心问题不是「怎么读」，是「读不到时怎么办」────
+//
+// 一个能上线的服务的配置层必须能回答四个问题：
+//
+// 【1】这个 key 有没有被配置？（不是「它的值是不是空串」）
+//
+//   因为「配了空串」和「没配」在业务上完全不同：前者可能是
+//   「明确禁用」（`log.level = ""`），后者应该是「用默认值」。
+//   用空串当默认值就把两者混成一种了。
+//
+// 【2】值来自哪里？（环境变量？文件？默认值？）
+//
+//   排查「生产环境和本地行为不一致」时，第一件要确认的就是这个。
+//   如果配置层不记录来源，就只能靠猜。
+//
+// 【3】类型不对怎么办？
+//
+//   `port = "abc"` 是配置错误。静默回退到默认值会让服务起在错误的
+//   端口上，而日志上看不出任何异常。必须能明确报错。
+//
+// 【4】环境变量怎么覆盖文件？
+//
+//   12-factor 的要求是「环境变量优先级最高」。而 env 名不能带点，
+//   所以 `db.host` 要映射到 `DB_HOST` —— 这个映射规则必须固定且
+//   可预期（大写 + 点变下划线）。
+//
+// ── 格式选择：properties 而不是 JSON/YAML ──────────
+//
+// 因为 properties 的解析器只有 30 行，而 JSON/YAML 解析器要几百行
+// 且有自己的边界情况。配置文件是**人写的**，人写的东西越简单越不
+// 容易出错 —— `key=value` 一行一个，没有缩进敏感、没有逗号遗漏。
+
+from "../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from "../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+// 一个配置项：值 + 来源。
+class ConfigEntry {
+    key: String
+    value: String
+
+    // 来源："default" / "file" / "env" / "code"
+    //
+    // ── 为什么要记录来源 ────────────────────────
+    //
+    // 见文件头【2】。这个字段在排查「为什么生产的行为和本地不同」
+    // 时是第一个要看的。
+    source: String
+
+    constructor(key: String, value: String, source: String) {
+        self.key    = key
+        self.value  = value
+        self.source = source
+    }
+}
+
+class Config {
+    // 平行数组：键、值、来源。
+    keys: Array
+    vals: Array
+    sources: Array
+
+    // 解析/加载过程中的错误。非空表示配置有问题。
+    errors: Array
+
+    constructor() {
+        self.keys    = []
+        self.vals    = []
+        self.sources = []
+        self.errors  = []
+    }
+
+    // ── 内部 ──────────────────────────────────
+
+    fn indexOf(key: String) -> Int {
+        var i = 0
+        while i < len(self.keys) {
+            let k: String = self.keys[i]
+            if (k == key) { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // ── 写 ────────────────────────────────────
+
+    // 设置一个值。同一个 key 重复设置时，**优先级高的覆盖低的**。
+    //
+    // ── 优先级规则 ───────────────────────────
+    //
+    //   code    > env  > file  > default
+    //
+    // 用一个数字表达优先级，比「按调用顺序覆盖」可靠 —— 因为
+    // 「先 loadFile 还是先 loadEnv」这件事很容易在某次重构里被调换，
+    // 而调换之后环境变量就悄悄失效了。用显式优先级，顺序无关。
+    fn put(key: String, value: String, source: String) {
+        let at = self.indexOf(key)
+        if (at >= 0) {
+            let oldSource: String = self.sources[at]
+            if (cfgPriority(source) < cfgPriority(oldSource)) {
+                // 新值的优先级更低，不覆盖。
+                return
+            }
+            self.vals[at]    = value
+            self.sources[at] = source
+            return
+        }
+        arrPush(self.keys, key)
+        arrPush(self.vals, value)
+        arrPush(self.sources, source)
+    }
+
+    // ── 读 ────────────────────────────────────
+
+    // 是否存在这个 key。
+    fn has(key: String) -> Bool {
+        return self.indexOf(key) >= 0
+    }
+
+    // 取字符串。找不到时返回 def 并记录一条「用了默认值」的痕迹。
+    //
+    // ── 为什么不记录 warnings ────────────────────
+    //
+    // 因为「用默认值」是正常情况，不是异常。为每个可选配置都记一条
+    // 日志会把日志淹没。真要审计，用 dump() 看所有 key 的来源。
+    fn getOr(key: String, def: String) -> String {
+        let at = self.indexOf(key)
+        if (at < 0) { return def }
+        let v: String = self.vals[at]
+        return v
+    }
+
+    fn get(key: String, def: String) -> String {
+        return self.getOr(key, def)
+    }
+
+    // 取整数。值不是合法整数时**记错误并返回 def**。
+    //
+    // ── 为什么不是静默回退 ───────────────────────
+    //
+    // 见文件头【3】。`port = "8080 "`（末尾有空格）会被 toIntOr 解析
+    // 失败回退到默认 8080 —— 正好一样，看不出问题。而
+    // `port = "80O0"`（字母 O）回退到 8080 就起在了错误的端口上。
+    // 记一条错误让它在启动时就暴露。
+    fn getInt(key: String, def: Int) -> Int {
+        if (!self.has(key)) { return def }
+        let raw = self.get(key, "")
+        let trimmed = strTrim(raw)
+        if (!strIsInt(trimmed)) {
+            arrPush(self.errors, "配置 `" + key + "` 应为整数，实际是 `" +
+                    raw + "`（已回退到 " + toString(def) + "）")
+            return def
+        }
+        return toIntOr(trimmed, def)
+    }
+
+    fn getBool(key: String, def: Bool) -> Bool {
+        if (!self.has(key)) { return def }
+        let raw = strLower(strTrim(self.get(key, "")))
+        if (raw == "true" || raw == "1" || raw == "yes" || raw == "on") {
+            return true
+        }
+        if (raw == "false" || raw == "0" || raw == "no" || raw == "off") {
+            return false
+        }
+        arrPush(self.errors, "配置 `" + key + "` 应为布尔值（true/false/1/0/yes/no/on/off），" +
+                "实际是 `" + raw + "`（已回退到 " + boolToString(def) + "）")
+        return def
+    }
+
+    // 取逗号分隔的列表（自动 trim 空项）。
+    fn getList(key: String) -> Array {
+        let raw = self.get(key, "")
+        let out = []
+        if (len(raw) == 0) { return out }
+        let parts = strSplit(raw, ",")
+        var i = 0
+        while i < len(parts) {
+            let p: String = parts[i]
+            let t = strTrim(p)
+            if (len(t) > 0) { arrPush(out, t) }
+            i = i + 1
+        }
+        return out
+    }
+
+    // 值来自哪里（诊断用）。
+    fn sourceOf(key: String) -> String {
+        let at = self.indexOf(key)
+        if (at < 0) { return "" }
+        let s: String = self.sources[at]
+        return s
+    }
+
+    // ── 加载 ──────────────────────────────────
+
+    // 解析 properties 文本。
+    //
+    // 支持：
+    //   key=value
+    //   key = value        （两边空白会被去掉）
+    //   key: value         （冒号也接受，因为 Java 的 properties 允许）
+    //   # 注释              （整行）
+    //   ! 注释              （properties 的传统）
+    //   空行
+    //
+    // 不支持（明确不实现，避免歧义）：
+    //   反斜杠续行            —— 它让「一行 = 一个配置」这个心智模型失效
+    //   内嵌 \n \t 转义       —— 需要一套转义规则，而那会让值里的反斜杠
+    //                            （Windows 路径！）变得必须双写
+    //   \uXXXX unicode 转义   —— 同上
+    //
+    // ── 为什么不支持 Windows 路径里的反斜杠 ──────────
+    //
+    // 正好相反：因为**不**做转义处理，`path=C:\data\x` 就是原样的
+    // 字面量。这是刻意的选择 —— 配置值是数据不是转义序列。
+    fn loadText(text: String) {
+        let lines = strLines(text)
+        var i = 0
+        while i < len(lines) {
+            let raw: String = lines[i]
+            let line = strTrim(raw)
+            if (len(line) > 0) {
+                if (strStarts(line, "#") || strStarts(line, "!")) {
+                    // 注释
+                } else {
+                    // 找第一个 = 或 :
+                    let eqAt = strFind(line, "=")
+                    let coAt = strFind(line, ":")
+                    var sepAt = eqAt
+                    if (sepAt < 0) { sepAt = coAt }
+                    if (sepAt < 0) {
+                        // 没有分隔符：畸形行。记错误而不是静默忽略 ——
+                        // 因为「少打了个 =」会让整行被丢弃，而配置项
+                        // 缺失的症状是「用了默认值」，非常难查。
+                        arrPush(self.errors, "第 " + toString(i + 1) +
+                                " 行缺少 `=` 或 `:`，已跳过：`" + line + "`")
+                    } else {
+                        let key = strTrim(strSub(line, 0, sepAt))
+                        let value = strTrim(strSub(line, sepAt + 1, len(line)))
+                        if (len(key) == 0) {
+                            arrPush(self.errors, "第 " + toString(i + 1) +
+                                    " 行的键为空，已跳过：`" + line + "`")
+                        } else {
+                            self.put(key, value, "file")
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // 从文件加载。文件不存在时记错误（调用方决定是否致命）。
+    fn loadFile(path: String) {
+        if (!fsExists(path)) {
+            arrPush(self.errors, "配置文件不存在：" + path)
+            return
+        }
+        let text = fsRead(path)
+        self.loadText(text)
+    }
+
+    // 用环境变量覆盖。
+    //
+    // ── 映射规则 ────────────────────────────
+    //
+    //   db.host      →  DB_HOST
+    //   log.level    →  LOG_LEVEL
+    //   http.port    →  HTTP_PORT
+    //
+    // 即：大写 + 点变下划线。这个规则必须与运维的部署脚本对齐，
+    // 所以它写在这里而不是让调用方自己拼。
+    //
+    // ── 为什么只覆盖「已存在的 key」 ────────────────
+    //
+    // 因为环境变量里有一大堆系统变量（PATH、TEMP、COMPUTERNAME）。
+    // 全量导入会让 dump() 输出几百行无关内容，且 get("PATH") 会
+    // 意外地返回系统路径 —— 那是一个真实的信息泄露面（配置端点
+    // 被暴露时）。
+    //
+    // 所以 env 只用于「覆盖已知的配置项」。要新增配置项必须先在
+    // 代码或文件里声明。
+    fn applyEnv(prefix: String) {
+        var i = 0
+        while i < len(self.keys) {
+            let key: String = self.keys[i]
+            let envName = cfgEnvName(prefix, key)
+            let v = envGet(envName)
+            if (len(v) > 0) {
+                self.put(key, v, "env")
+            }
+            i = i + 1
+        }
+    }
+
+    // ── 校验 ──────────────────────────────────
+
+    // 必需的 key 是否都已配置。返回缺失的列表。
+    //
+    // ── 为什么必需项要单独声明 ────────────────────
+    //
+    // 因为「缺了必需项」应该在**启动时**炸掉，而不是在第一个请求
+    // 到达时才炸。后者会让服务看起来健康（端口在听）但所有请求
+    // 都 500，而负载均衡还在往里送流量。
+    fn missingRequired(required: Array) -> Array {
+        let out = []
+        var i = 0
+        while i < len(required) {
+            let k: String = required[i]
+            if (!self.has(k)) { arrPush(out, k) }
+            i = i + 1
+        }
+        return out
+    }
+
+    fn hasErrors() -> Bool {
+        return len(self.errors) > 0
+    }
+
+    fn errorText() -> String {
+        if (len(self.errors) == 0) { return "" }
+        var out = "配置有 " + toString(len(self.errors)) + " 个问题："
+        var i = 0
+        while i < len(self.errors) {
+            let e: String = self.errors[i]
+            out = out + "\n  - " + e
+            i = i + 1
+        }
+        return out
+    }
+
+    // 打印所有配置及来源。
+    fn dump() -> String {
+        var out = "Config(" + toString(len(self.keys)) + " 项)"
+        var i = 0
+        while i < len(self.keys) {
+            let k: String = self.keys[i]
+            let v: String = self.vals[i]
+            let s: String = self.sources[i]
+            out = out + "\n  " + strPadRight(k, 24, " ") + " = " + strPadRight(v, 16, " ") +
+                  "  [" + s + "]"
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// 来源优先级。数字大的赢。
+fn cfgPriority(source: String) -> Int {
+    if (source == "code")    { return 40 }
+    if (source == "env")     { return 30 }
+    if (source == "file")    { return 20 }
+    if (source == "default") { return 10 }
+    return 0
+}
+
+// key → 环境变量名。
+fn cfgEnvName(prefix: String, key: String) -> String {
+    var out = strUpper(key)
+    out = strReplace(out, ".", "_")
+    out = strReplace(out, "-", "_")
+    if (len(prefix) > 0) { out = strUpper(prefix) + "_" + out }
+    return out
+}
+
+// 读环境变量。
+//
+// ── 为什么这里直接声明内建而不用库函数 ──────────────
+//
+// 因为本语言没有环境变量内建（P0 没有）。所以这个函数只能返回
+// 空串，并把这个限制如实告诉调用方 —— 而不是假装读到了。
+//
+// 需要真实环境变量时的替代方案：部署脚本先生成一份 properties
+// 文件传给 loadFile。这比在语言里加一个内建更符合「配置即文件」
+// 的运维习惯。
+fn envGet(name: String) -> String {
+    return ""
+}

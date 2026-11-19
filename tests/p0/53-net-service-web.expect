@@ -1,0 +1,269 @@
+---- uri encode ----
+/a%20b/%E4%B8%AD%E6%96%87.txt
+a%3D1%26b%3D%3F/
+true
+a%ZZb%
+%
+---- uri parse ----
+http
+u
+p@ss
+a.com
+8080
+/p/a%20b
+q=1&r=2
+frag
+/p/a%20b?q=1&r=2
+a.com:8080
+[::1]
+8443
+8443
+[][][/a/b]
+[][a/b:c]
+---- uri host header ----
+a.com
+a.com
+a.com:8080
+---- uri resolve ----
+http://a.com/login
+http://a.com/dir/sub/x
+http://a.com/up
+http://a.com/dir/page?p=2
+http://a.com/dir/page?x=1#top
+http://cdn.com/z
+http://other.com/z
+---- uri dot segments ----
+/a/c
+/a
+/a/b
+/a/b/
+---- header ----
+4
+text/plain
+text/plain
+2
+no-cache, max-age=0
+<none>
+true
+[1, 2]
+Content-Type: text/plain
+
+Set-Cookie: a=1
+
+Set-Cookie: b=2
+
+cache-control: no-cache
+
+cache-control: max-age=0
+
+X-Test: 1
+
+X-Test: 2
+
+4
+first second
+true
+[]
+false
+3/4
+2
+---- cookie parse ----
+4
+[session, theme, flag, q]
+[abc=def, dark, , quoted]
+abc=def
+[]
+quoted
+<none>
+---- set cookie ----
+session=abc123; Max-Age=3600; Path=/app; Secure; HttpOnly; SameSite=Lax
+[]
+theme=dark; Path=/
+true
+cookie 名里不能含 ` `（浏览器会丢弃整个 cookie）
+SameSite=None 必须同时设置 Secure，否则浏览器直接拒绝该 cookie
+SameSite 只能是 None / Lax / Strict，实际是 `none`（大小写敏感）
+cookie 名不能为空
+---- cookie delete ----
+session=; Max-Age=-1; Path=/
+false
+---- status ----
+OK
+Not Found
+
+[]
+4
+5
+true
+true
+true
+false
+false
+---- request line ----
+true
+GET
+/a/b?id=1&kw=%E4%B8%AD&flag
+/a/b
+1
+中
+[]
+false
+不支持的 HTTP 版本 `HTTP/2`（本实现只支持 HTTP/1.0 与 HTTP/1.1）
+不支持的 HTTP 版本 `HTTP/0.9`（本实现只支持 HTTP/1.0 与 HTTP/1.1）
+---- request finalize ----
+false
+同时存在 Transfer-Encoding: chunked 和 Content-Length —— 这是请求走私（request smuggling）的典型特征，已拒绝
+false
+HTTP/1.1 请求缺少 Host 头
+true
+1
+2
+-1
+false
+---- response serialize ----
+HTTP/1.1 200 OK
+
+Content-Type: application/json; charset=utf-8
+
+Content-Length: 11
+
+Set-Cookie: a=1; Path=/
+
+Set-Cookie: b=2; Path=/
+
+
+
+{"ok":true}---- response head ----
+HTTP/1.1 200 OK
+
+Content-Type: text/plain; charset=utf-8
+
+Content-Length: 10
+
+
+
+true
+true
+---- response 204 ----
+HTTP/1.1 204 No Content
+
+Content-Type: text/plain; charset=utf-8
+
+
+
+true
+true
+---- response redirect ----
+true
+true
+true
+---- router ----
+7
+home
+userList
+userDetail id=42
+userDetail
+userPost id=42 pid=7
+userUpdate
+false
+fileServe rest=a/b/c.txt
+true
+userDetail
+false
+[GET, POST]
+---- router encoded ----
+true
+true
+true x=v
+---- tcp loopback ----
+true
+true
+true
+false
+true
+true
+true
+true
+你好，TCP
+true
+00 01 7f 80 fe ff 00 41
+true
+true
+20000
+true
+20000
+true
+false
+false
+---- lifecycle ----
+组件名 `db` 已存在，注册被拒绝
+3
+[db, cache, http]
+[http, cache, db]
+INIT
+true
+false
+服务正在启动中
+RUNNING
+true
+false
+[db, cache, http]
+---- health ----
+true
+liveness
+true
+[]
+false
+[db]
+false
+{"status":"ok","checks":[{"name":"db","status":"pass","detail":"","required":true}]}
+---- config ----
+7
+127.0.0.1
+3306
+8080
+true
+true
+[]
+false
+[<none>]
+[a, b, c]
+file
+10.0.0.1
+10.0.0.1
+code
+true
+配置有 2 个问题：
+  - 第 10 行缺少 `=` 或 `:`，已跳过：`no separator`
+  - 配置 `bad.port` 应为整数，实际是 `80O0`（已回退到 8080）
+[secret.key]
+DB_HOST
+APP_DB_HOST
+---- container ----
+true
+3
+[db, repo, svc]
+true
+-1
+true
+false
+0
+[repo, svc]
+false
+Bean `nope` 未注册，无法挂载实例
+[]
+[`db` 依赖 `svc`，但 `svc` 在之后才注册（应提前）]
+[`ghost` 依赖 `db`，但 `ghost` 未注册]
+---- application ----
+true
+true
+code
+4
+false
+缺少必需配置项：[must.have.one, must.have.two]
+true
+false
+FAILED
+false
+指定的配置文件不存在：definitely/not/here.properties
+false

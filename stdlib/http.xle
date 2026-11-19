@@ -1,0 +1,984 @@
+// ============================================================
+// std.http —— HTTP/1.1 服务端与客户端
+// ============================================================
+//
+// 这一层完全建立在 std.net 的 10 个 TCP 原语之上，不新增任何
+// 内建函数。理由与 std.json / std.fs 一致：语言层的原语越少，
+// AOT 与解释器需要保持一致的东西就越少，而「两个执行档行为不同」
+// 是这个项目最贵的 bug 类别。
+//
+// ── 为什么服务端要做成「非阻塞 + 手动 pump」────────────────
+//
+// X 没有线程。所以一个能同时服务多个连接的服务器只能是单线程
+// 事件循环：调用方写
+//
+//     let srv = httpServer(8080)
+//     while (true) {
+//         httpPump(srv, 50)        // 处理一轮，最多阻塞 50ms
+//         // 这里还能干别的
+//     }
+//
+// 而不是「httpListen 然后 httpAccept（内部阻塞到有请求）」。
+// 后者的写法在单线程下等于「同一时刻只能有一个客户端」，而且
+// 一旦浏览器开了 6 个连接（现代浏览器对同一域名就是 6 个），
+// 服务端会卡在第 2 个上，第 1 个的 keep-alive 却还占着不放。
+//
+// ── 为什么请求/响应都用「扁平键值数组」而不是结构化对象 ────
+//
+// X 只有 6 种值类型，没有结构体也没有 Map。std.json 已经确立
+// 了约定：object = [k1, v1, k2, v2, ...]。HTTP 的 headers 天然
+// 就是「名字 → 值」的多重映射，沿用同一约定让用户不必学第二套。
+//
+//   req = [ method, path, query, version, headers, body ]
+//     req[0] "GET"          req[3] "HTTP/1.1"
+//     req[1] "/api/user"    req[4] ["Host","a","Accept","b"]
+//     req[2] "id=1&n=2"     req[5] "body 原文"
+//
+// 用固定下标而不是命名访问，是因为语言没有结构体；把下标定义
+// 成常量（HTTP_METHOD 等）让用户代码可读。
+//
+// ── 关于 body 的大小 ────────────────────────────────────────
+//
+// 一次 netRecv 最多 64 KB。这里按 Content-Length 循环读直到够数，
+// 并有硬上限（HTTP_MAX_BODY）。没有上限的话，一个 `Content-Length:
+// 999999999` 的请求能把进程内存吃光 —— 这不是理论风险，是任何
+// 暴露到公网的服务都会在几小时内遇到的事。
+
+from std.str import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from std.json import jsonParse, jsonParseScalar, jsonInt, jsonSetInt, jsonCur, jsonSkipWs, jsonFail, jsonParseValue, jsonExpect, jsonParseNumber, jsonParseString, jsonParseEscape, jsonHex4, jsonParseArray, jsonParseObject, jsonIsObject, jsonTypeOf, jsonGet, jsonGetOr, jsonHas, jsonKeys, jsonValues, jsonStringify, jsonArrayAny, jsonQuote, jsonHex, jsonNull, jsonNullValue, jsonBool, jsonNumber, jsonIntLit, jsonArrayOfStrings, jsonObject
+
+// ---- 请求数组的下标 ----
+//
+// 定义成常量而不是到处写 0/1/2：改结构时只改这里，而错误地下标
+// 在动态类型下不会报错，只会静默拿到另一个字段（比如把 method
+// 当 path 用），是很难发现的 bug。
+const HTTP_METHOD  = 0
+const HTTP_PATH    = 1
+const HTTP_QUERY   = 2
+const HTTP_VERSION = 3
+const HTTP_HEADERS = 4
+const HTTP_BODY    = 5
+
+// 请求体上限 8 MB。够上传图片和普通表单，又不至于让一个恶意
+// Content-Length 吃掉整个进程。
+const HTTP_MAX_BODY = 8388608
+
+// 请求头上限。4 KB 是 Apache 的默认值，这里给 16 KB 更宽松，
+// 但**必须有上限**：没有上限时对方只要一直发头不发空行，就能
+// 让接收缓冲无限增长。
+const HTTP_MAX_HEADER = 16384
+
+// ============================================================
+// 服务端对象
+// ============================================================
+//
+// 用一个扁平数组承载全部状态，因为语言没有结构体：
+//
+//   [ listener, clients, bufs, routes, port ]
+//        0         1       2      3       4
+//
+//   clients —— 当前连接句柄的数组（Int）
+//   bufs    —— 与 clients 同下标的接收缓冲（String），已收到但
+//              还没构成完整请求的字节。HTTP 请求常常跨多个 TCP
+//              段到达，不做累积就只能解析到半截头。
+//   routes  —— 路由表，扁平形式 [method, path, handler_id, ...]
+//
+// handler 用 Int 表示：X 没有函数类型，所以不能把函数存进数组。
+// 调用方在 httpPump 返回后自己 dispatch（见 httpRoute 的说明）。
+
+const SRV_LISTENER = 0
+const SRV_CLIENTS  = 1
+const SRV_BUFS     = 2
+const SRV_ROUTES   = 3
+const SRV_PORT     = 4
+
+// 建一个服务器。port 传 0 让系统分配（测试用），真实端口用 httpPort 查。
+//
+// bind 地址默认 127.0.0.1 而不是 0.0.0.0 —— 这是安全默认值。
+// 监听所有网卡意味着同局域网任何人都能访问，而开发者本机调试
+// 时并不想要这个。需要对外时显式传 "0.0.0.0"。
+fn httpServer(port: Int) -> Array {
+    return httpServerOn("127.0.0.1", port)
+}
+
+fn httpServerOn(bind: String, port: Int) -> Array {
+    let sock = netListen(bind, port)
+    if (sock < 0) {
+        fail("HTTP 服务端监听 " + bind + ":" + toString(port) + " 失败：" + netError())
+    }
+    // 两个容器分开建：`array(5, 0)` 会把每个槽位的类型推成 Int，
+    // 于是 srv[SRV_CLIENTS] 拿到的是 Int 而不是 Array，后面 `len(r)`
+    // 就在编译期报「len 只接受 String 或 Array」。
+    // 先建成目标类型、再回填标量槽，类型推断才能对得上。
+    let srv = array(5, 0)
+    srv[SRV_LISTENER] = sock
+    srv[SRV_CLIENTS]  = array(0, 0)
+    srv[SRV_BUFS]     = array(0, "")
+    srv[SRV_ROUTES]   = array(0, "")
+    srv[SRV_PORT]     = netPort(sock)
+    return srv
+}
+
+// 实际监听的端口。port 传 0 时用它查系统分配了哪个。
+fn httpPort(srv: Array) -> Int {
+    return toInt(srv[SRV_PORT])
+}
+
+// 注册路由。handler 是一个 Int 编号，由调用方自己解释。
+//
+// ── 为什么路由表存在服务端，而不是让调用方自己 if/else ──────
+//
+// 调用方当然可以自己比对 req[HTTP_PATH]，但那样每轮 pump 都要
+// 把所有路由比一遍，且没法在服务端做「404 该长什么样」这种
+// 统一决策。把表放这里，httpMatch 一次查完，返回编号或 -1。
+fn httpRoute(srv: Array, method: String, path: String, handler: Int) -> Void {
+    let r = srv[SRV_ROUTES]
+    arrPush(r, strUpper(method))
+    arrPush(r, path)
+    arrPush(r, handler)
+    srv[SRV_ROUTES] = r
+}
+
+// 查路由。返回 handler 编号，没有匹配返回 -1。
+//
+// 路径匹配规则：
+//   1. 先找**精确匹配**（"GET" + "/api/user"）
+//   2. 再找**后缀通配**（路径以 "/*" 结尾的项，比如 "/static/*"）
+//   3. 都没有返回 -1
+//
+// 通配放第二步而不是按注册顺序混在一起，是为了「精确优先」这条
+// 确定的规则：注册顺序不该决定命中哪条，否则换个 import 顺序就
+// 换了行为。
+fn httpMatch(srv: Array, method: String, path: String) -> Int {
+    let r = srv[SRV_ROUTES]
+    let m = strUpper(method)
+    var i = 0
+    let n = len(r)
+    // 第一轮：精确
+    while (i + 2 < n) {
+        if (r[i] == m && r[i + 1] == path) { return toInt(r[i + 2]) }
+        i = i + 3
+    }
+    // 第二轮：前缀通配（"xxx/*" 匹配所有以 "xxx/" 开头的路径）
+    i = 0
+    while (i + 2 < n) {
+        let pat = r[i + 1]
+        if (r[i] == m && strEnds(pat, "/*")) {
+            let prefix = strSub(pat, 0, len(pat) - 1)   // 保留结尾的 "/"
+            if (strStarts(path, prefix)) { return toInt(r[i + 2]) }
+        }
+        i = i + 3
+    }
+    return -1
+}
+
+// ============================================================
+// 一轮事件循环
+// ============================================================
+//
+// 返回**已经收完的请求**数组：每个元素是一个 req 数组（见文件头）。
+// 没有请求时返回空数组 —— 不是 null，让调用方无条件写 for 循环。
+//
+// 同时返回的还有「这些请求各自来自哪个连接」，放在 req 的
+// 第 6 位（HTTP_CONN）。调用方处理完后用 httpRespond 回写。
+//
+// ── 为什么把「收请求」和「发响应」分开 ──────────────────────
+//
+// 如果 pump 内部直接调 handler，那么 handler 就必须是一段能在
+// pump 里被调用的代码 —— 而 X 没有函数值，做不到。分开之后，
+// handler 是调用方的一个 if/else 分支，pump 只负责 I/O。
+const HTTP_CONN = 6
+
+fn httpPump(srv: Array, wait_ms: Int) -> Array {
+    // 1. 接受新连接。非阻塞 accept，所以循环到没有为止。
+    let l = srv[SRV_LISTENER]
+    let clients = srv[SRV_CLIENTS]
+    let bufs = srv[SRV_BUFS]
+    var accepted = 0
+    while (accepted < 64) {          // 单轮上限，防止 fork bomb 式的连接洪水
+        let c = netAccept(l)
+        if (c < 0) { break }
+        arrPush(clients, c)
+        arrPush(bufs, "")
+        accepted = accepted + 1
+    }
+
+    // 2. 从已有连接读数据，能凑出完整请求的就取走。
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(clients)) {
+        let conn = toInt(clients[i])
+        let chunk = netRecv(conn)
+        if (len(chunk) > 0) {
+            bufs[i] = bufs[i] + chunk
+            // 缓冲上限：头一直不结束就把连接掐掉。
+            // 不设这个上限的话，`netRecv` 会无限制地往里灌。
+            if (len(bufs[i]) > HTTP_MAX_HEADER + HTTP_MAX_BODY) {
+                netClose(conn)
+                arrRemove(clients, i)
+                arrRemove(bufs, i)
+                continue
+            }
+        } else if (!netPending(conn)) {
+            // 对端已断开：回收这个槽位。
+            //
+            // 顺序必须是从后往前删，或者删一个就把 i 退回一位 ——
+            // 否则删掉 i 之后，原来 i+1 的元素移到 i，而 i 又自增，
+            // 那个元素就被跳过了，句柄泄漏。
+            netClose(conn)
+            arrRemove(clients, i)
+            arrRemove(bufs, i)
+            continue
+        }
+
+        // 3. 试着从缓冲里解析出一个完整请求。
+        let r = httpParse(bufs[i])
+        if (len(r) > 0) {
+            let used = toInt(r[HTTP_CONN])     // 解析器复用了这个槽位传「消耗了多少字节」
+            bufs[i] = strSub(bufs[i], used, len(bufs[i]))
+            let req = array(7, "")
+            req[HTTP_METHOD]  = r[0]
+            req[HTTP_PATH]    = r[1]
+            req[HTTP_QUERY]   = r[2]
+            req[HTTP_VERSION] = r[3]
+            req[HTTP_HEADERS] = r[4]
+            req[HTTP_BODY]    = r[5]
+            req[HTTP_CONN]    = conn
+            arrPush(out, req)
+        }
+        i = i + 1
+    }
+
+    // 4. 没有活动时睡一下，避免空转把 CPU 打满。
+    //
+    // 为什么不在「这一轮什么都没发生」时睡：accepted 与 out 都空
+    // 才睡。有数据却睡会拖慢响应，而空转的代价是 100% 单核占用 ——
+    // 两者都不对，所以要分开判。
+    if (accepted == 0 && len(out) == 0 && wait_ms > 0) {
+        netSleep(wait_ms)
+    }
+
+    srv[SRV_CLIENTS] = clients
+    srv[SRV_BUFS] = bufs
+    return out
+}
+
+// 睡一会儿。
+//
+// ── 为什么用 sleep 而不是 winSleep ──────────────────────────
+//
+// winSleep 属于窗口段，用它会让 bc_uses_gui 把整个程序判成
+// 「用到了窗口能力」。于是一个纯控制台的 HTTP 服务端会收到
+// 「加 --profile=desktop 重编」的警告 —— 照做之后产物变成
+// WINDOWS 子系统，println 全部静默丢失。
+//
+// sleep 是通用内建（在窗口段边界之后），语义相同但不影响
+// 窗口判定。这个区别看着小，但它决定了「标准库里的一个函数
+// 会不会把用户的程序变成 GUI 程序」。
+fn netSleep(ms: Int) -> Void {
+    sleep(ms)
+}
+
+// ============================================================
+// 请求解析
+// ============================================================
+//
+// 返回长度 0（表示「还不完整，等更多数据」）或 6 元素数组：
+//   [method, path, query, version, headers, body]
+// 第 6 位（下标 6）放「消耗的字节数」，供调用方从缓冲里切掉。
+//
+// ── 为什么返回数组第 6 位干这个，而不是多返回一个值 ────────
+//
+// X 没有多返回值。调用方需要两个信息（解析结果、消耗多少），
+// 所以只能打包进同一个数组。用一个专门的槽位比「把 body 和
+// 长度拼在一起」清楚得多。
+fn httpParse(raw: String) -> Array {
+    let empty = array(0, 0)
+    if (len(raw) == 0) { return empty }
+
+    // 找头结束。RFC 允许 \r\n\r\n，也接受裸 \n\n（很多手写客户端
+    // 和测试脚本这么发，拒绝它只会带来无谓的兼容问题）。
+    let hend = strFind(raw, "\r\n\r\n")
+    var hlen = 4
+    if (hend < 0) {
+        hend = strFind(raw, "\n\n")
+        hlen = 2
+        if (hend < 0) { return empty }      // 头还没收完
+    }
+
+    let head = strSub(raw, 0, hend)
+    let rest = strSub(raw, hend + hlen, len(raw))
+
+    // ---- 请求行 ----
+    //
+    // "GET /path?q=1 HTTP/1.1"
+    let lines = httpSplitLines(head)
+    if (len(lines) == 0) { return empty }
+    let first = lines[0]
+    let parts = strSplit(first, " ")
+    if (len(parts) < 2) {
+        // 请求行都拼不出来的东西不是 HTTP。返回一个明确的 400 请求，
+        // 而不是静默丢弃 —— 静默丢弃会让调用方以为「没有请求」。
+        return httpBadRequest("请求行格式不对：" + first)
+    }
+
+    let method = parts[0]
+    let target = parts[1]
+    var version = "HTTP/1.0"
+    if (len(parts) >= 3) { version = parts[2] }
+
+    // ---- 拆 path 与 query ----
+    let qi = strFind(target, "?")
+    var path = target
+    var query = ""
+    if (qi >= 0) {
+        path = strSub(target, 0, qi)
+        query = strSub(target, qi + 1, len(target))
+    }
+
+    // ---- 头 ----
+    let headers = array(0, "")
+    var i = 1
+    while (i < len(lines)) {
+        let ln = lines[i]
+        let ci = strFind(ln, ":")
+        if (ci > 0) {
+            arrPush(headers, strLower(strTrim(strSub(ln, 0, ci))))
+            arrPush(headers, strTrim(strSub(ln, ci + 1, len(ln))))
+        }
+        i = i + 1
+    }
+
+    // ---- body ----
+    //
+    // 三种情况：
+    //   1. Content-Length 给了数 → 读够那么多
+    //   2. Transfer-Encoding: chunked → 逐块解
+    //   3. 都没有 → 没有 body
+    var body = ""
+    var used = hend + hlen
+    let clen = httpHeaderInt(headers, "content-length", -1)
+    if (clen >= 0) {
+        if (clen > HTTP_MAX_BODY) {
+            return httpBadRequest("请求体过大：" + toString(clen) + " 字节，上限 " +
+                                  toString(HTTP_MAX_BODY))
+        }
+        if (len(rest) < clen) { return empty }      // body 还没收完
+        body = strSub(rest, 0, clen)
+        used = used + clen
+    } else if (httpHeader(headers, "transfer-encoding", "") == "chunked") {
+        let cr = httpDechunk(rest)
+        if (len(cr) == 0) { return empty }          // 分块还没收完
+        body = cr[0]
+        used = used + toInt(cr[1])
+    }
+
+    let req = array(7, "")
+    req[0] = method
+    req[1] = path
+    req[2] = query
+    req[3] = version
+    req[4] = headers
+    req[5] = body
+    req[6] = used
+    return req
+}
+
+// 切头部的行。必须同时认 \r\n 与 \n，并且**丢掉空的末尾行** ——
+// strSplit 会在结尾留下一个 ""，那会让 headers 里多出一对空值。
+fn httpSplitLines(s: String) -> Array {
+    let out = array(0, "")
+    let parts = strSplit(s, "\n")
+    var i = 0
+    while (i < len(parts)) {
+        var ln = parts[i]
+        if (strEnds(ln, "\r")) { ln = strSub(ln, 0, len(ln) - 1) }
+        if (len(ln) > 0) { arrPush(out, ln) }
+        i = i + 1
+    }
+    return out
+}
+
+// 取头字段（名字已在解析时统一小写）。找不到返回 def。
+fn httpHeader(headers: Array, name: String, def: String) -> String {
+    var i = 0
+    while (i + 1 < len(headers)) {
+        if (headers[i] == name) { return headers[i + 1] }
+        i = i + 2
+    }
+    return def
+}
+
+fn httpHeaderInt(headers: Array, name: String, def: Int) -> Int {
+    let v = httpHeader(headers, name, "")
+    if (len(v) == 0) { return def }
+    if (!strIsInt(v)) { return def }
+    return toInt(v)
+}
+
+// 解 chunked 编码。返回 [正文, 消耗字节数]，不完整时返回 []。
+//
+// 格式：
+//    1a\r\n<26 字节>\r\n0\r\n\r\n
+// 每块前面是十六进制的块长。最后一块长度为 0。
+fn httpDechunk(s: String) -> Array {
+    var body = ""
+    var pos = 0
+    let n = len(s)
+    while (pos < n) {
+        let eol = strFindFrom(s, "\r\n", pos)
+        if (eol < 0) { return array(0, 0) }         // 块头没收完
+        let sizeStr = strTrim(strSub(s, pos, eol))
+        // 块扩展（"1a;name=value"）：分号之后丢掉
+        let semi = strFind(sizeStr, ";")
+        if (semi >= 0) { sizeStr = strSub(sizeStr, 0, semi) }
+        let size = httpHexToInt(sizeStr)
+        if (size < 0) { return array(0, 0) }         // 块长非法，当作不完整
+        pos = eol + 2
+        if (size == 0) {
+            // 末块。后面可能还有一个 \r\n，有就吞掉。
+            if (strFindFrom(s, "\r\n", pos) >= 0 && pos + 2 <= n) { pos = pos + 2 }
+            return httpPair(body, pos)
+        }
+        if (pos + size + 2 > n) { return array(0, 0) }   // 块内容没收完
+        body = body + strSub(s, pos, pos + size)
+        pos = pos + size + 2                            // 跳过块尾 \r\n
+    }
+    // 走到这里说明还没见到末块
+    return array(0, 0)
+}
+
+fn httpPair(a: String, b: Int) -> Array {
+    let r = array(2, "")
+    r[0] = a
+    r[1] = b
+    return r
+}
+
+fn httpHexToInt(s: String) -> Int {
+    if (len(s) == 0) { return -1 }
+    var v = 0
+    var i = 0
+    while (i < len(s)) {
+        let ch = strAt(s, i)
+        let d = httpHexDigit(ch)
+        if (d < 0) { return -1 }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+fn httpHexDigit(ch: String) -> Int {
+    if (len(ch) != 1) { return -1 }
+    let c = strCode(ch)
+    if (c >= 48 && c <= 57)  { return c - 48 }        // 0-9
+    if (c >= 97 && c <= 102) { return c - 87 }        // a-f
+    if (c >= 65 && c <= 70)  { return c - 55 }        // A-F
+    return -1
+}
+
+// 造一个「解析失败」的哨兵请求。
+//
+// 它的 method 是 "!" —— 一个 HTTP 方法名里不可能出现的字符，
+// 于是调用方的路由表永远匹配不上，会走到 400 分支。这比返回
+// 空数组好：「解析失败」和「还没收完」对调用方是两件事，
+// 前者要立刻回 400，后者要接着等。
+fn httpBadRequest(msg: String) -> Array {
+    let req = array(7, "")
+    req[0] = "!"
+    req[1] = msg
+    req[2] = ""
+    req[3] = "HTTP/1.1"
+    req[4] = array(0, "")
+    req[5] = ""
+    req[6] = 0        // 消耗 0：整个缓冲保持原样，连坏请求一起丢掉由调用方决定
+    return req
+}
+
+// ============================================================
+// 响应
+// ============================================================
+
+// 状态码 → 原因短语。只收录常用的一批。
+//
+// 不认识的码给 "Unknown"：HTTP 允许自定义状态码，而拒绝发送
+// 一个合法但少见的状态码是没必要的限制。
+fn httpStatusText(code: Int) -> String {
+    if (code == 200) { return "OK" }
+    if (code == 201) { return "Created" }
+    if (code == 204) { return "No Content" }
+    if (code == 301) { return "Moved Permanently" }
+    if (code == 302) { return "Found" }
+    if (code == 304) { return "Not Modified" }
+    if (code == 400) { return "Bad Request" }
+    if (code == 401) { return "Unauthorized" }
+    if (code == 403) { return "Forbidden" }
+    if (code == 404) { return "Not Found" }
+    if (code == 405) { return "Method Not Allowed" }
+    if (code == 409) { return "Conflict" }
+    if (code == 413) { return "Payload Too Large" }
+    if (code == 422) { return "Unprocessable Entity" }
+    if (code == 429) { return "Too Many Requests" }
+    if (code == 500) { return "Internal Server Error" }
+    if (code == 501) { return "Not Implemented" }
+    if (code == 503) { return "Service Unavailable" }
+    return "Unknown"
+}
+
+// 发一个响应。headers 是扁平数组 [k1,v1,k2,v2,...]，可为空。
+//
+// ── 为什么 Content-Length 一定要自己算，而不是交给调用方 ────
+//
+// 忘了写 Content-Length 的后果不是「页面显示不全」，而是浏览器
+// 一直等下去 —— 它不知道 body 到哪结束，只能等连接关闭。于是
+// 用户看到的是「转圈 30 秒然后超时」，而服务端日志里一切正常。
+// 这类问题极难从日志发现，所以由库里强制补上。
+//
+// Content-Type 的默认值给 text/plain; charset=utf-8 而不是
+// 省略：省略时浏览器会去猜（MIME sniffing），把一段 JSON 猜成
+// HTML 执行掉是真实存在的安全问题。
+fn httpRespond(conn: Int, code: Int, body: String) -> Int {
+    return httpRespondWith(conn, code, "text/plain; charset=utf-8", "", body)
+}
+
+fn httpRespondWith(conn: Int, code: Int, ctype: String, extra: String, body: String) -> Int {
+    var head = "HTTP/1.1 " + toString(code) + " " + httpStatusText(code) + "\r\n"
+    head = head + "Content-Type: " + ctype + "\r\n"
+    head = head + "Content-Length: " + toString(len(body)) + "\r\n"
+    if (len(extra) > 0) {
+        // extra 按 "Name: value\r\nName2: value2" 传，已经是原样的头，
+        // 直接接上。不做二次解析 —— 用户需要能写任意头（CORS 之类）。
+        head = head + extra + "\r\n"
+    }
+    head = head + "Connection: close\r\n\r\n"
+    let total = netSend(conn, head + body)
+    return total
+}
+
+// 发 JSON。自动序列化并设 Content-Type。
+fn httpRespondJson(conn: Int, code: Int, value: Array) -> Int {
+    return httpRespondWith(conn, code, "application/json; charset=utf-8", "",
+                           jsonStringify(value))
+}
+
+// 发一段 HTML。
+fn httpRespondHtml(conn: Int, code: Int, html: String) -> Int {
+    return httpRespondWith(conn, code, "text/html; charset=utf-8", "", html)
+}
+
+// 发一段纯文本。
+fn httpRespondText(conn: Int, code: Int, text: String) -> Int {
+    return httpRespondWith(conn, code, "text/plain; charset=utf-8", "", text)
+}
+
+// 发 404。写成一个函数是因为它是服务端最常用的响应，而且
+// 「404 该回什么」应该是统一决策，不是每个 handler 自己拼。
+fn httpNotFound(conn: Int) -> Int {
+    return httpRespond(conn, 404, "404 Not Found\n")
+}
+
+// 关掉一个连接。响应发完后必须调 —— 语言层没有 RAII，
+// 不显式关就泄漏句柄，长期运行的服务最终 accept 失败。
+fn httpClose(conn: Int) -> Void {
+    netClose(conn)
+}
+
+// 关掉整个服务器（监听 + 所有连接）。
+fn httpServerClose(srv: Array) -> Void {
+    netClose(srv[SRV_LISTENER])
+    let clients = srv[SRV_CLIENTS]
+    var i = 0
+    while (i < len(clients)) {
+        netClose(toInt(clients[i]))
+        i = i + 1
+    }
+    srv[SRV_CLIENTS] = array(0, 0)
+    srv[SRV_BUFS] = array(0, "")
+}
+
+// ============================================================
+// 查询串与表单
+// ============================================================
+//
+// application/x-www-form-urlencoded 的格式：k1=v1&k2=v2
+// 值里的特殊字符用 %XX 转义，空格写作 +。
+//
+// 解析成扁平键值数组（与 headers 同一个约定），重复键保留 ——
+// `?tag=a&tag=b` 是合法且常见的（多选筛选），把后者覆盖前者
+// 会静默丢掉用户的选择。
+
+fn httpParseQuery(q: String) -> Array {
+    let out = array(0, "")
+    if (len(q) == 0) { return out }
+    let parts = strSplit(q, "&")
+    var i = 0
+    while (i < len(parts)) {
+        let p = parts[i]
+        let eq = strFind(p, "=")
+        var k = p
+        var v = ""
+        if (eq >= 0) {
+            k = strSub(p, 0, eq)
+            v = strSub(p, eq + 1, len(p))
+        }
+        if (len(k) > 0) {
+            arrPush(out, httpUrlDecode(k))
+            arrPush(out, httpUrlDecode(v))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 取查询参数。只在 httpParseQuery 的返回值上用。
+fn httpQueryGet(kv: Array, key: String, def: String) -> String {
+    var i = 0
+    while (i + 1 < len(kv)) {
+        if (kv[i] == key) { return kv[i + 1] }
+        i = i + 2
+    }
+    return def
+}
+
+// 取查询参数的整数值。缺失或非数字都给 def。
+//
+// 为什么要单独一个函数：`toInt("")` 不会报错，它给 0 —— 于是
+// 「没传参数」和「传了 0」变成同一个值。分页参数上这会导致
+// 第一页被跳过，是那种「能跑但结果是错的」bug。
+fn httpQueryInt(kv: Array, key: String, def: Int) -> Int {
+    let v = httpQueryGet(kv, key, "")
+    if (len(v) == 0) { return def }
+    if (!strIsInt(v)) { return def }
+    return toInt(v)
+}
+
+// %XX 解码，并把 + 还原成空格。
+//
+// ── 为什么必须逐字节处理而不是逐码点 ────────────────────────
+//
+// %XX 转义的是**字节**，不是字符。一个中文字在 UTF-8 里是 3 个
+// 字节，编码成 %E4%B8%AD 这种形式。
+//
+// ── 这里曾经有个真实缺陷 ────────────────────────────────────
+//
+// 最初的实现是「逐字节转成字符再拼接」：%E4 → strFromCode(0xE4)
+// 得到 U+00E4 的 UTF-8 编码（两字节 C3 A4），%B8 同理。三段拼
+// 起来是 6 字节，而「中」应该是 3 字节 E4 B8 AD。
+//
+// 症状是「英文参数正常，中文参数变乱码」—— 因为英文的 %XX 都
+// 在 0..127，每个字节恰好等于一个 ASCII 字符的编码，碰巧正确。
+//
+// 根因是语言层原本没有「把字节原样拼成字符串」的能力。现在有了
+// strFromBytes（见 x.h 的说明），这里就能真正无损解码：
+// 先把所有 %XX 攒成 0..255 的字节数组，最后一次转成字符串。
+fn httpUrlDecode(s: String) -> String {
+    let n = len(s)
+    if (n == 0) { return "" }
+    let bytes = array(0, 0)
+    var i = 0
+    while (i < n) {
+        let ch = strAt(s, i)
+        if (ch == "+") {
+            arrPush(bytes, 32)
+            i = i + 1
+        } else if (ch == "%" && i + 2 < n) {
+            let hi = httpHexDigit(strAt(s, i + 1))
+            let lo = httpHexDigit(strAt(s, i + 2))
+            if (hi >= 0 && lo >= 0) {
+                arrPush(bytes, hi * 16 + lo)
+                i = i + 3
+            } else {
+                // 非法的 % 序列：保留原字符，不静默丢弃。
+                // 静默丢弃会让用户看到「参数少了一个字母」这种
+                // 完全无法追查的现象。
+                arrPush(bytes, strCode(ch))
+                i = i + 1
+            }
+        } else {
+            // 非转义部分：按它的 UTF-8 字节逐个累积。
+            //
+            // 不能直接 arrPush(strCode(ch))：strCode 给的是**码点**，
+            // 而「中」的码点是 0x4E2D，远超 255，塞进字节数组会被
+            // strFromBytes 钳成 255。所以要先 strBytes 拆成字节。
+            let cb = strBytes(ch)
+            var k = 0
+            while (k < len(cb)) {
+                arrPush(bytes, toInt(cb[k]))
+                k = k + 1
+            }
+            i = i + 1
+        }
+    }
+    return strFromBytes(bytes)
+}
+
+// URL 编码：把字符串编码成 %XX 形式（用于拼查询串或表单）。
+//
+// ── 为什么保留 unreserved 字符而不全部转义 ──────────────────
+//
+// RFC 3986 的 unreserved 集合（字母、数字、- . _ ~）编码成 %XX
+// 虽然合法，但会让 URL 变得难读、变长，且部分服务端对
+// "%41" 这种「把字母也转义」的写法处理不一致。所以按惯例保留。
+//
+// 空格编成 %20 而不是 +：+ 只是 application/x-www-form-urlencoded
+// 的约定，在 URL 路径段里 + 是字面加号。统一用 %20 两边都对。
+fn httpUrlEncode(s: String) -> String {
+    let bytes = strBytes(s)
+    var out = ""
+    var i = 0
+    while (i < len(bytes)) {
+        let b = toInt(bytes[i])
+        if ((b >= 48 && b <= 57) ||        // 0-9
+            (b >= 65 && b <= 90) ||        // A-Z
+            (b >= 97 && b <= 122) ||       // a-z
+            b == 45 || b == 46 || b == 95 || b == 126) {   // - . _ ~
+            out = out + strFromCode(b)
+        } else {
+            out = out + "%" + httpHex2(b)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn httpHex2(b: Int) -> String {
+    let hi = b / 16
+    let lo = b % 16
+    return httpHexChar(hi) + httpHexChar(lo)
+}
+
+fn httpHexChar(d: Int) -> String {
+    if (d < 10) { return strFromCode(48 + d) }
+    return strFromCode(65 + d - 10)     // 大写 A-F
+}
+
+// 把 %XX 序列解成**字节数组**（每个元素 0..255）。
+//
+// httpUrlDecode 已经能直接给出正确字符串，这个函数只在需要
+// 「按字节检查解码结果」时用（比如校验签名、判断魔数）。
+fn httpUrlDecodeBytes(s: String) -> Array {
+    let out = array(0, 0)
+    let n = len(s)
+    var i = 0
+    while (i < n) {
+        let ch = strAt(s, i)
+        if (ch == "+") {
+            arrPush(out, 32)
+            i = i + 1
+        } else if (ch == "%" && i + 2 < n) {
+            let hi = httpHexDigit(strAt(s, i + 1))
+            let lo = httpHexDigit(strAt(s, i + 2))
+            if (hi >= 0 && lo >= 0) {
+                arrPush(out, hi * 16 + lo)
+                i = i + 3
+            } else {
+                let cb = strBytes(ch)
+                var k = 0
+                while (k < len(cb)) {
+                    arrPush(out, toInt(cb[k]))
+                    k = k + 1
+                }
+                i = i + 1
+            }
+        } else {
+            let cb = strBytes(ch)
+            var k = 0
+            while (k < len(cb)) {
+                arrPush(out, toInt(cb[k]))
+                k = k + 1
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ============================================================
+// 客户端
+// ============================================================
+//
+// ── 为什么客户端要自己拼请求 ────────────────────────────────
+//
+// 有人会问「为什么不直接用系统里的 curl」。因为标准库的定义是
+// 「拷到哪都能用」—— 依赖外部可执行文件就不满足这个前提，
+// 而且 curl 的输出格式在不同版本间会变。
+//
+// 客户端返回数组：
+//   [ status, headers, body ]
+//     0        1        2
+// status 是 Int（连不上时给 -1），headers 是扁平键值数组。
+
+const RESP_STATUS  = 0
+const RESP_HEADERS = 1
+const RESP_BODY    = 2
+
+// 发一个 GET。url 形如 "http://host:port/path?query"。
+fn httpGet(url: String) -> Array {
+    return httpRequest("GET", url, "", "")
+}
+
+// 发一个带 body 的 POST。ctype 例："application/json"。
+fn httpPost(url: String, ctype: String, body: String) -> Array {
+    return httpRequest("POST", url, ctype, body)
+}
+
+fn httpRequest(method: String, url: String, ctype: String, body: String) -> Array {
+    let bad = array(3, "")
+    bad[0] = -1
+    bad[1] = array(0, "")
+    bad[2] = ""
+
+    // 只支持 http://。https 需要 TLS，而 TLS 不是「加个 socket 调用」
+    // 能解决的 —— 它要证书校验、密钥交换、对称加密全套。假装支持
+    // 比不支持危险得多（用户会以为自己受到了保护），所以明确拒绝。
+    if (!strStarts(url, "http://")) {
+        bad[2] = "只支持 http:// 开头的 URL（https 需要 TLS，P0 不支持）"
+        return bad
+    }
+    let rest = strSub(url, 7, len(url))
+
+    // 拆 host:port 与 path
+    var hostport = rest
+    var path = "/"
+    let slash = strFind(rest, "/")
+    if (slash >= 0) {
+        hostport = strSub(rest, 0, slash)
+        path = strSub(rest, slash, len(rest))
+    }
+
+    var host = hostport
+    var port = 80
+    let colon = strFind(hostport, ":")
+    if (colon >= 0) {
+        host = strSub(hostport, 0, colon)
+        let ps = strSub(hostport, colon + 1, len(hostport))
+        if (strIsInt(ps)) { port = toInt(ps) }
+    }
+    if (len(host) == 0) {
+        bad[2] = "URL 里没有主机名：" + url
+        return bad
+    }
+
+    let conn = netConnect(host, port)
+    if (conn < 0) {
+        bad[2] = "连接 " + host + ":" + toString(port) + " 失败：" + netError()
+        return bad
+    }
+
+    // ---- 拼请求 ----
+    //
+    // Host 头是 HTTP/1.1 的强制要求，缺了它很多服务器直接回 400。
+    var req = method + " " + path + " HTTP/1.1\r\n"
+    req = req + "Host: " + host + "\r\n"
+    req = req + "Connection: close\r\n"
+    req = req + "User-Agent: x-stdlib/1.0\r\n"
+    if (len(body) > 0) {
+        req = req + "Content-Type: " + ctype + "\r\n"
+        req = req + "Content-Length: " + toString(len(body)) + "\r\n"
+    }
+    req = req + "\r\n" + body
+    netSend(conn, req)
+
+    // ---- 收响应 ----
+    //
+    // Connection: close 意味着服务端发完就关，所以「读到空串」就是结束。
+    // 这比解析 Content-Length 简单得多，也不用处理 chunked。
+    var raw = ""
+    var rounds = 0
+    while (rounds < 4096) {          // 上限防止服务端一直不断开
+        let chunk = netRecv(conn)
+        if (len(chunk) == 0) {
+            if (!netPending(conn)) { break }
+            // 还没数据但连接活着：等一小下再试
+            netSleep(1)
+        } else {
+            raw = raw + chunk
+        }
+        rounds = rounds + 1
+    }
+    netClose(conn)
+
+    if (len(raw) == 0) {
+        bad[2] = "服务端没有返回任何数据"
+        return bad
+    }
+
+    return httpParseResponse(raw)
+}
+
+// 解析响应。返回 [status, headers, body]。
+fn httpParseResponse(raw: String) -> Array {
+    let hend = strFind(raw, "\r\n\r\n")
+    var hlen = 4
+    if (hend < 0) {
+        hend = strFind(raw, "\n\n")
+        hlen = 2
+    }
+    if (hend < 0) {
+        let r = array(3, "")
+        r[0] = -1
+        r[1] = array(0, "")
+        r[2] = "响应头不完整"
+        return r
+    }
+
+    let head = strSub(raw, 0, hend)
+    let bodyRaw = strSub(raw, hend + hlen, len(raw))
+    let lines = httpSplitLines(head)
+
+    let r = array(3, "")
+    r[0] = -1
+    r[1] = array(0, "")
+    r[2] = ""
+    if (len(lines) == 0) { return r }
+
+    // 状态行："HTTP/1.1 200 OK"
+    let parts = strSplit(lines[0], " ")
+    if (len(parts) < 2 || !strIsInt(parts[1])) {
+        r[2] = "状态行格式不对：" + lines[0]
+        return r
+    }
+    let status = toInt(parts[1])
+
+    let headers = array(0, "")
+    var i = 1
+    while (i < len(lines)) {
+        let ln = lines[i]
+        let ci = strFind(ln, ":")
+        if (ci > 0) {
+            arrPush(headers, strLower(strTrim(strSub(ln, 0, ci))))
+            arrPush(headers, strTrim(strSub(ln, ci + 1, len(ln))))
+        }
+        i = i + 1
+    }
+
+    // body 解码：chunked 优先（它可能没有 Content-Length）
+    var body = bodyRaw
+    if (httpHeader(headers, "transfer-encoding", "") == "chunked") {
+        let cr = httpDechunk(bodyRaw)
+        if (len(cr) > 0) { body = cr[0] }
+    } else {
+        let clen = httpHeaderInt(headers, "content-length", -1)
+        if (clen >= 0 && len(bodyRaw) >= clen) {
+            body = strSub(bodyRaw, 0, clen)
+        }
+    }
+
+    r[0] = status
+    r[1] = headers
+    r[2] = body
+    return r
+}
+
+fn httpRespStatus(r: Array) -> Int {
+    return toInt(r[RESP_STATUS])
+}
+
+fn httpRespHeader(r: Array, name: String, def: String) -> String {
+    return httpHeader(r[RESP_HEADERS], strLower(name), def)
+}
+
+fn httpRespBody(r: Array) -> String {
+    return r[RESP_BODY]
+}

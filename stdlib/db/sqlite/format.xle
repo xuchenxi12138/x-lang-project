@@ -1,0 +1,397 @@
+// db/sqlite/format.xle — SQLite 数据库文件格式
+//
+// ── SQLite 和另外六个库的根本差别 ──────────────────────
+//
+// MySQL / Postgres / Oracle 是**服务端进程**：你连一个端口，发 SQL
+// 报文，服务端解析执行后回结果。SQLite 不是 —— 它是一个**文件格式
+// 规范**，加一个嵌入式库。没有端口，没有报文，没有握手。
+//
+// 所以「驱动」这两个字在 SQLite 上含义完全不同：
+//
+//   其他六个：实现客户端协议          → socket + 报文编解码
+//   SQLite  ：实现文件格式 + 查询执行 → 文件读取 + B-tree 遍历
+//
+// 这也是为什么 SQLite 驱动比 Oracle 还难写一半：协议只要求你「按
+// 字节格式收发」，而文件格式要求你**自己实现一个查询引擎**（B-tree
+// 定位、记录解码、表达式求值、聚合）。P0 的边界见 driver.xle。
+//
+// ── 文件头（前 100 字节） ────────────────────────────
+//
+//   偏移  长度  含义
+//   0     16    魔数 "SQLite format 3\0"
+//   16    2     页大小（大端）。值 1 表示 65536
+//   18    1     写格式版本（1=legacy，2=WAL）
+//   19    1     读格式版本
+//   20    1     每页保留字节数
+//   21    1     最大/最小内嵌负载比例（通常 64）
+//   22    1     最小/最大内嵌负载比例（通常 32）
+//   23    1     叶子负载比例（通常 32）
+//   24    4     文件修改计数器
+//   28    4     数据库大小（**以页为单位**）
+//   32    4     空闲页链表头
+//   36    4     空闲页总数
+//   40    4     模式 cookie
+//   44    4     模式格式号（1..4）
+//   48    4     默认页缓存大小
+//   52    4     最大 B-tree 根页（autovacuum）
+//   56    4     文本编码（1=UTF-8，2=UTF-16le，3=UTF-16be）
+//   60    4     user_version
+//   64    4     增量 vacuum 模式
+//   68    4     应用 id
+//   ...
+//   92    4     版本有效数字
+//   96    4     SQLite 版本号（如 3045001 = 3.45.1）
+//
+// ── 为什么页大小要特判「1」 ──────────────────────────
+//
+// 页大小字段是 2 字节大端，最大只能表示 65535。而 SQLite 允许
+// 65536 的页 —— 编码成 1 来表示。这是规范里的一个历史补丁：
+// 早期实现用 uint16，后来需要支持 64KB 页，就在不破坏兼容的前提下
+// 借用了「1」这个本来非法的值（页大小必须是 2 的幂且在 512..65536）。
+//
+// 忘了这个特判的症状：页大小读成 1，然后所有页偏移全错，
+// 页头解析出完全无意义的数字。
+//
+// ── 大端还是小端 ──────────────────────────────────
+//
+// **文件头全部大端，页内的 cell 指针和 varint 有些是小端混排**。
+// 这是 SQLite 文件格式最容易搞错的一处：
+//
+//   文件头所有多字节整数      → 大端
+//   页头（页类型之后的字段）  → 大端
+//   cell 内的 varint          → SQLite 自定义变长编码（见 varint.xle）
+//   cell 内的 payload 长度    → varint 或大端，看情况
+//   record header 里的长度    → varint
+//
+// 所以我把它拆成三个文件：format（本文件，文件头+页头）、
+// varint（变长整数）、record（记录解码）。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// 文件头魔数，16 字节（含结尾的 0）。
+const SQLITE_MAGIC = "SQLite format 3"
+
+// 页类型（页头第 1 字节）。
+//
+// 只有四种 —— 相比其他数据库的几十种页类型，SQLite 简单得让人
+// 不习惯，但这也正是它的设计哲学：一张表就是一个 B-tree，
+// 一个索引就是一个 B-tree，没有堆表/聚簇索引/undo 段/回滚段。
+const SQLITE_PAGE_INTERIOR_INDEX = 2
+const SQLITE_PAGE_INTERIOR_TABLE = 5
+const SQLITE_PAGE_LEAF_INDEX     = 10
+const SQLITE_PAGE_LEAF_TABLE     = 13
+
+// 文件头大小。页 1 的前 100 字节被它占掉 —— 见 sqlitePageBytes 的
+// 说明，这是本项目实际卡住过的地方。
+const SQLITE_FILE_HEADER_SIZE = 100
+
+// 文本编码。
+const SQLITE_ENC_UTF8    = 1
+const SQLITE_ENC_UTF16LE = 2
+const SQLITE_ENC_UTF16BE = 3
+
+// 页头大小：叶子页与内部页都是 8 字节（页类型 1 + 首空闲块 2 +
+// cell 数 2 + cell 内容起始 2 + 碎片字节 1），再加 4 字节右兄弟页
+// 指针（只有内部页有）。所以：
+//
+//   叶子页   页头 8 字节
+//   内部页   页头 12 字节
+const SQLITE_LEAF_HDR  = 8
+const SQLITE_INNER_HDR = 12
+
+// 解析出来的文件头。
+//
+// 用 class 而不是 struct，因为字段多且需要带着「是否解析成功」
+// 的标记 —— struct 字段不可变，没法在解析失败时逐个留空。
+class SqliteHeader {
+    // 魔数是否匹配。不匹配说明这不是 SQLite 文件。
+    valid: Bool,
+
+    // 页大小（512..65536）。
+    pageSize: Int,
+
+    // 文件里有多少页。注意这个值在 WAL 模式下可能是旧的 ——
+    // 真正的页数要看 WAL 文件。P0 不支持 WAL（见 driver.xle）。
+    pageCount: Int,
+
+    // 文本编码。1=UTF-8。
+    encoding: Int,
+
+    // 模式格式号（1..4）。4 才会用到「表就是 B-tree」的现代布局。
+    schemaFormat: Int,
+
+    // SQLite 库版本号，如 3045001。仅用于诊断输出。
+    libVersion: Int,
+
+    // 是否处于 WAL 模式（写格式版本 2）。P0 遇到就明确报错，
+    // 不静默读旧数据。
+    wal: Bool,
+
+    // 解析失败时的原因。valid 为 false 时读它。
+    error: String,
+
+    constructor() {
+        self.valid        = false
+        self.pageSize     = 0
+        self.pageCount    = 0
+        self.encoding     = 1
+        self.schemaFormat = 0
+        self.libVersion   = 0
+        self.wal          = false
+        self.error        = ""
+    }
+}
+
+// 解析 100 字节的文件头。
+//
+// 传入的是**整个文件的前 100 字节**（调用方保证长度 >= 100）。
+fn sqliteParseHeader(b: Array) -> SqliteHeader {
+    let h = new SqliteHeader()
+
+    if (len(b) < 100) {
+        h.error = "文件不足 100 字节，不是合法的 SQLite 数据库"
+        return h
+    }
+
+    // 魔数逐字节比。用文本比更省事，但 SQLite 文件可能是
+    // UTF-16 编码的库（虽然少见），而魔数永远是 ASCII，
+    // 所以直接比字节最稳。
+    let magic = bbToText(bbSlice(b, 0, 15))
+    if (magic != SQLITE_MAGIC) {
+        h.error = "文件头不是 `SQLite format 3`，可能不是 SQLite 数据库"
+        return h
+    }
+
+    let ps = bbU16BE(b, 16)
+    // 65536 编码成 1 —— 见文件头注释里那段历史补丁。
+    if (ps == 1) { ps = 65536 }
+    if (ps < 512 || ps > 65536) {
+        h.error = "页大小 " + toString(ps) + " 不合法（应为 512..65536 的 2 的幂）"
+        return h
+    }
+    h.pageSize = ps
+
+    h.pageCount    = bbU32BE(b, 28)
+    h.schemaFormat = bbU32BE(b, 44)
+    h.encoding     = bbU32BE(b, 56)
+    h.libVersion   = bbU32BE(b, 96)
+
+    // 写格式版本 2 = WAL。P0 不实现 WAL 重放，遇到必须报错，
+    // 否则会读到 WAL 里还没 checkpoint 的旧页面 —— 数据看起来
+    // 是「最近几分钟的写入全丢了」，极难排查。
+    let writeVer = bbU8(b, 18)
+    if (writeVer == 2) { h.wal = true }
+
+    h.valid = true
+    return h
+}
+
+// 页头。
+class SqlitePage {
+    // 页号（从 1 开始，页 1 是文件头所在页）。
+    pageNo: Int,
+
+    // 页类型。见 SQLITE_PAGE_* 常量。0 表示「不是合法的页」。
+    kind: Int,
+
+    // 这一页有几条 cell。
+    cellCount: Int,
+
+    // cell 指针数组在页内的起始偏移（相对页首）。
+    //
+    // ── 为什么 cell 指针要单独存一个数组 ──────────────────
+    //
+    // 因为 cell 的**物理顺序和逻辑顺序不同**。B-tree 要求 key 有序，
+    // 而插入会往中间塞 —— 如果真按顺序搬移 cell 内容，每次插入都是
+    // O(页大小) 的 memmove。SQLite 的做法是：cell 内容随便放（通常
+    // 从页尾往前长），另外在页头后面维护一个指针数组，数组本身
+    // 保持有序。插入只需在指针数组里插一个 2 字节的值。
+    //
+    // 所以遍历一页的 cell 必须走指针数组，不能顺着页内容往后扫。
+    cellStart: Int,
+
+    // 页内碎片字节数。写回时会用到，只读时忽略。
+    fragmented: Int,
+
+    // 右兄弟页指针（只有内部页有，叶子页为 0）。
+    rightChild: Int,
+
+    // 页的原始字节（完整的 pageSize 字节，**含页 1 的文件头**）。
+    raw: Array,
+
+    // 页头在 raw 里的起始偏移。页 1 是 100，其余是 0。
+    //
+    // ── 为什么把它存进对象而不是每次算 ─────────────────
+    //
+    // 因为页头的字段偏移（cellCount 在第 3 字节、cellStart 在第 5 字节）
+    // 和 cell 指针的语义**基准不同**：
+    //
+    //   页头字段偏移   → 相对「页头起点」（即 raw + hdrBase）
+    //   cell 指针的值  → 相对「页首」（即 raw 的第 0 字节）
+    //
+    // 混用这两者的症状见 sqlitePageBytes 的注释（读出来的 payload
+    // 是建表语句的中间一段）。存进对象是为了让两者在一个地方
+    // 说清楚，调用方不用每次重新推导。
+    hdrBase: Int,
+
+    // 解析失败原因。
+    error: String,
+
+    constructor() {
+        self.pageNo      = 0
+        self.kind        = 0
+        self.cellCount   = 0
+        self.cellStart   = 0
+        self.fragmented  = 0
+        self.rightChild  = 0
+        self.raw         = []
+        self.hdrBase     = 0
+        self.error       = ""
+    }
+
+    fn isLeaf() -> Bool {
+        return self.kind == SQLITE_PAGE_LEAF_TABLE || self.kind == SQLITE_PAGE_LEAF_INDEX
+    }
+
+    fn isTable() -> Bool {
+        return self.kind == SQLITE_PAGE_LEAF_TABLE || self.kind == SQLITE_PAGE_INTERIOR_TABLE
+    }
+
+    fn describe() -> String {
+        return "page " + toString(self.pageNo) + " kind=" + sqlitePageKindName(self.kind) +
+               " cells=" + toString(self.cellCount) + " cellStart=" + toString(self.cellStart)
+    }
+}
+
+fn sqlitePageKindName(k: Int) -> String {
+    if (k == SQLITE_PAGE_INTERIOR_INDEX) { return "interior-index" }
+    if (k == SQLITE_PAGE_INTERIOR_TABLE) { return "interior-table" }
+    if (k == SQLITE_PAGE_LEAF_INDEX)     { return "leaf-index" }
+    if (k == SQLITE_PAGE_LEAF_TABLE)     { return "leaf-table" }
+    return "unknown(" + toString(k) + ")"
+}
+
+// 第 pageNo 页的字节。**返回完整的 pageSize 字节，页 1 不特判**。
+//
+// ── 页 1 的 100 字节文件头怎么处理 ────────────────────────
+//
+// 这是 SQLite 文件格式最容易踩的坑，也是本项目实际卡住两轮的地方：
+//
+//   页 1 的布局 = [100 字节文件头] + [B-tree 页头 + cell]
+//   其他页      = [B-tree 页头 + cell]
+//
+// 但**cell 指针里的偏移是相对页首（含文件头）的**。所以有两种做法：
+//
+//   ① 本函数对页 1 返回去掉前 100 字节的切片 —— 上层的「页内偏移」
+//      与「cell 指针」就对不上了，必须逐个地方减 100。
+//   ② 本函数返回完整页，另用 `sqlitePageHdrBase(pageNo)` 告诉上层
+//      「页头从哪开始」，cell 指针直接当绝对页内偏移用。
+//
+// 一开始写的是 ①，症状是：页 1 的类型读成 'S'（0x53），cellCount
+// 读成 26996；把页头基准改成 100 之后，cell **指针**又偏了 100 字节，
+// 读出来的 payload 是建表语句的中间一段（`name TEXT NOT NULL,`），
+// 于是记录解码把 SQL 文本当成列名，得到「31 列、全是 BLOB」。
+//
+// 选 ② 的原因：cell 指针是文件里的**绝对页内偏移**，不能让两层
+// 各自记一个基准。统一成「返回完整页 + 页头基准单独给」之后，
+// 只要记住一条：**页头的字段偏移加 base，cell 指针直接当偏移用**。
+fn sqlitePageBytes(file: Array, pageNo: Int, pageSize: Int) -> Array {
+    let off = (pageNo - 1) * pageSize
+    if (off < 0 || off + pageSize > len(file)) {
+        // 越界返回空数组，调用方用 len 判 —— 不返回 null，
+        // 理由见 jsonpath.xle 里那段「语言没有可空类型」。
+        return []
+    }
+    return bbSlice(file, off, off + pageSize)
+}
+
+// 页头的起始偏移。页 1 是 100（文件头之后），其余是 0。
+fn sqlitePageHdrBase(pageNo: Int) -> Int {
+    if (pageNo == 1) { return SQLITE_FILE_HEADER_SIZE }
+    return 0
+}
+
+// 解析一页的页头。
+fn sqliteParsePage(raw: Array, pageNo: Int) -> SqlitePage {
+    let p = new SqlitePage()
+    p.pageNo  = pageNo
+    p.raw     = raw
+    p.hdrBase = sqlitePageHdrBase(pageNo)
+
+    if (len(raw) < p.hdrBase + SQLITE_LEAF_HDR) {
+        p.error = "页 " + toString(pageNo) + " 不足 " +
+                  toString(p.hdrBase + SQLITE_LEAF_HDR) + " 字节"
+        return p
+    }
+
+    // 页头字段全部相对 hdrBase 读 —— 页 1 要跳过 100 字节文件头。
+    p.kind = bbU8(raw, p.hdrBase)
+
+    let known = p.kind == SQLITE_PAGE_INTERIOR_INDEX ||
+                p.kind == SQLITE_PAGE_INTERIOR_TABLE ||
+                p.kind == SQLITE_PAGE_LEAF_INDEX ||
+                p.kind == SQLITE_PAGE_LEAF_TABLE
+    if (!known) {
+        p.error = "页 " + toString(pageNo) + " 类型 " + toString(p.kind) + " 不是 B-tree 页" +
+                  "（2/5/10/13 之外的值可能是 freelist 或 overflow 页）"
+        return p
+    }
+
+    // 前两个字节是「第一个空闲块的偏移」，只写时有用，读时跳过。
+    p.cellCount  = bbU16BE(raw, p.hdrBase + 3)
+    p.cellStart  = bbU16BE(raw, p.hdrBase + 5)
+    p.fragmented = bbU8(raw, p.hdrBase + 7)
+
+    if (!p.isLeaf()) {
+        // 内部页在页头 8 字节之后紧跟着 4 字节右兄弟指针。
+        if (len(raw) >= p.hdrBase + SQLITE_INNER_HDR) {
+            p.rightChild = bbU32BE(raw, p.hdrBase + 8)
+        }
+    }
+
+    return p
+}
+
+// 第 i 条 cell 在页内的偏移。
+//
+// ── 两个偏移的基准不一样，这是本文件最需要小心的一处 ──────
+//
+//   cell **指针数组**的位置 = hdrBase + 页头长度 + i*2
+//   cell **内容**的地址值    = 直接从指针数组里读，**不加 hdrBase**
+//
+// 因为指针里存的是「相对页首」的绝对偏移（页首 = raw[0]），而
+// 指针数组本身的位置要跟着页头走。把它们混在一起的症状是：读了
+// 指针但地址偏了 100 字节，于是 payload 从建表语句中间开始，
+// 记录解码把 SQL 文本当成列名（实测得到「31 列，全是 BLOB」）。
+//
+// i 越界返回 -1。
+fn sqliteCellOffset(p: SqlitePage, i: Int) -> Int {
+    if (i < 0 || i >= p.cellCount) { return 0 - 1 }
+    // 页头总长：叶子 8 字节，内部 12 字节。都是从 hdrBase 起算。
+    var hdrLen = SQLITE_LEAF_HDR
+    if (!p.isLeaf()) { hdrLen = SQLITE_INNER_HDR }
+    let at = p.hdrBase + hdrLen + i * 2
+    if (at + 2 > len(p.raw)) { return 0 - 1 }
+    let off = bbU16BE(p.raw, at)
+    // 指针值本身就是绝对页内偏移，直接返回，不加 hdrBase。
+    if (off >= len(p.raw)) { return 0 - 1 }
+    return off
+}
+
+// 文件 → 所有页。调试与小型库用。
+//
+// ── 为什么不建议对生产库用它 ──────────────────────────
+//
+// 因为它把整个文件读进内存。一个 10GB 的库会直接 OOM。真正
+// 的遍历应该按需读页（先算偏移再只取 pageSize 字节）。P0 为了
+// 简洁统一走「全读」，并在 driver 里限制文件大小上限。
+fn sqliteAllPages(file: Array, pageSize: Int) -> Array {
+    let out = []
+    let n = len(file) / pageSize
+    var i = 1
+    while (i <= n) {
+        arrPush(out, sqlitePageBytes(file, i, pageSize))
+        i = i + 1
+    }
+    return out
+}

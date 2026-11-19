@@ -1,0 +1,112 @@
+---- 判空 ----
+true
+false
+true
+false
+false
+---- 单侧 trim ----
+[abc  ]
+[   abc]
+[abc]
+[abc]
+[]
+[]
+---- 补齐 ----
+[007]
+[7..]
+[--ab--]
+[-ab--]
+[abcdef]
+[00]
+---- 显示宽度 ----
+3
+2
+4
+5
+2
+[张三    ]
+6
+[张三]
+---- 切分 ----
+2
+b.c.d
+1
+a.b.c
+2
+0
+张三
+李四、王五
+---- 按行 ----
+3
+c
+2
+1
+1
+0
+3
+3
+0
+---- 替换与查找 ----
+bbaa
+aaaa
+bbbb
+丙乙甲
+6
+-1
+-1
+2
+4
+0
+0
+---- 反转 ----
+cba
+三张
+
+b张a
+---- 摘要 ----
+[abc]
+[]
+[abc...]
+[abc]
+[abc]
+[]
+[张三...]
+---- 数字判定 ----
+true
+true
+true
+true
+false
+false
+false
+false
+true
+true
+false
+false
+true
+false
+---- 画线 ----
+-----
+===
+[]
+---- 路径 ----
+c.txt
+b
+c.txt
+[]
+/a/b
+/a
+.
+/
+txt
+[]
+[]
+/a/b
+/a/b
+b
+a
+---- 模板 ----
+name=张三, n=42
+张三-{miss}
+plain

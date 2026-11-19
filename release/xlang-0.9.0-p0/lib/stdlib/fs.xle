@@ -1,0 +1,409 @@
+// ============================================================
+// std.fs —— 文件系统
+// ============================================================
+//
+// 内建那 11 个是**原子操作**（读、写、删、列目录……）。这一层补的
+// 是组合与便利工具：
+//
+//   · 路径处理（拼接、规范化、取父目录、判绝对路径）
+//   · 按行读写（日志与配置最常用的形态）
+//   · 递归列目录、按扩展名过滤
+//   · 存在才读、缺失就建、带默认值
+//   · 临时文件与临时目录
+//
+// ── 为什么路径处理不做成 Windows 反斜杠 ─────────────────────
+//
+// 标准库面向的文本是跨平台的，而 '\\' 在 X 源码里是转义字符，
+// 让用户在字符串里写 "C:\\a\\b" 只会制造麻烦。所以这一层统一用
+// '/'：Windows 的 API 两者都接受，Linux 只认 '/'。用户写
+// "C:/a/b" 在两个平台都能用。
+//
+// ── 关于 fsWrite 与 fsReplace 的选择 ────────────────────────
+//
+//   fsWrite    直接覆盖。快，但「写一半被杀」会留下半截文件。
+//   fsReplace  临时文件 + 改名。慢一次改名，但崩溃安全。
+//
+// 下面的 saveText 用 fsReplace —— 配置文件与数据库表恰恰是最怕
+// 半截文件的东西。
+
+import std.str
+
+// ============================================================
+// 路径
+// ============================================================
+
+// 拼接路径，不产生双斜杠。任一为空则返回另一个。
+fn fsJoin(a: String, b: String) -> String {
+    if (a == "") { return b }
+    if (b == "") { return a }
+    if (strEnds(a, "/")) { return a + b }
+    return a + "/" + b
+}
+
+// 拼接任意多段：fsJoinAll 接受一个数组。
+fn fsJoinAll(parts: Array) -> String {
+    var out = ""
+    var i = 0
+    while (i < len(parts)) {
+        out = fsJoin(out, toString(parts[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// 路径最后一段
+fn fsBaseName(p: String) -> String {
+    var i = len(p) - 1
+    while (i >= 0 && strAt(p, i) == "/") { i = i - 1 }
+    if (i < 0) { return "" }
+    var end = i
+    while (i >= 0 && strAt(p, i) != "/") { i = i - 1 }
+    return strSub(p, i + 1, end + 1)
+}
+
+// 父目录。"a/b/c" → "a/b"；"c" → ""；"/c" → "/"
+fn fsDirName(p: String) -> String {
+    var i = len(p) - 1
+    while (i >= 0 && strAt(p, i) == "/") { i = i - 1 }
+    while (i >= 0) {
+        if (strAt(p, i) == "/") {
+            // 根目录：返回 "/" 而不是 ""
+            if (i == 0) { return "/" }
+            return strSub(p, 0, i)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 扩展名（不含点，小写）。"a/B.TXT" → "txt"，"a.tar.gz" → "gz"
+//
+// 必须取**最后一个**点：用 strFind（第一个点）会让 "a.tar.gz" 得到
+// "tar.gz"，那不是一个扩展名，而是两个。这一点在压缩包、备份文件
+// （.sql.gz、.log.1）上立刻表现出来。
+fn fsExtName(p: String) -> String {
+    let base = fsBaseName(p)
+    // 从后往前找最后一个点。前导点（".gitignore"）不算扩展名 ——
+    // 那是隐藏文件的标记，不是后缀。
+    var i = len(base) - 1
+    while (i > 0) {
+        if (strAt(base, i) == ".") {
+            return strLower(strSub(base, i + 1, len(base)))
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 是否绝对路径。同时认 "C:/..." 与 "/..."。
+fn fsIsAbsolute(p: String) -> Bool {
+    if (strStarts(p, "/")) { return true }
+    // 盘符形式：X:/ 或 X:\
+    if (len(p) >= 3) {
+        let c1 = strAt(p, 1)
+        if (c1 == ":" && (strAt(p, 2) == "/" || strAt(p, 2) == "\\")) {
+            return true
+        }
+    }
+    return false
+}
+
+// 规范化：把反斜杠统一成斜杠，去掉重复斜杠与结尾斜杠，处理 "." 与 ".."。
+//
+// ── 为什么不能用字符串替换了事 ──────────────────────────────
+//
+// 纯文本替换处理不了 "a/b/../c" —— 那需要栈式处理。".." 弹出上一
+// 段，"." 直接丢弃。手写一遍，因为这类路径出现在配置文件与命令行
+// 参数里，而「拼出来的路径带一串 ../ 但能打开」会让日志难以阅读。
+fn fsNormalize(p: String) -> String {
+    if (p == "") { return "" }
+    // 先统一分隔符
+    var s = ""
+    var i = 0
+    while (i < len(p)) {
+        let c = strAt(p, i)
+        if (c == "\\") { s = s + "/" } else { s = s + c }
+        i = i + 1
+    }
+
+    let abs = strStarts(s, "/")
+    let parts = strSplit(s, "/")
+    let stack = array(0, "")
+
+    var k = 0
+    while (k < len(parts)) {
+        let seg = parts[k]
+        if (seg == "" || seg == ".") {
+            // 空段（连续斜杠）与当前目录都是空操作
+        } else if (seg == "..") {
+            if (len(stack) > 0 && toString(stack[len(stack) - 1]) != "..") {
+                arrPop(stack)
+            } else if (!abs) {
+                // 相对路径的 ".." 在开头时保留 —— "a/../../b" 不能
+                // 简化成 "b"，那会改变指向。
+                arrPush(stack, "..")
+            }
+            // 绝对路径的 ".." 走到根就停住，与 Linux 一致
+        } else {
+            arrPush(stack, seg)
+        }
+        k = k + 1
+    }
+
+    var out = strJoin(stack, "/")
+    if (abs) { out = "/" + out }
+    if (out == "") { out = "." }
+    return out
+}
+
+// ============================================================
+// 按行读写
+// ============================================================
+//
+// 日志、配置、CSV、行式数据库都是「一行一条」。这几个函数把
+// 「读出来 → 按行切 → 去掉空行」这条链子收成一步。
+
+// 读文件并按行切开。文件不存在时返回空数组（不报错）——
+// 「读日志」这个场景里文件还没建是正常的。
+fn fsReadLines(path: String) -> Array {
+    let text = fsReadOr(path, "")
+    if (len(text) == 0) { return array(0, "") }
+    return fsSplitLines(text)
+}
+
+// 把文本按行切开，同时吃掉 \r\n 的 \r，并丢弃末尾空行。
+//
+// 与 strLines 的差别：这里额外跳过空行。配置文件里的空行是排版，
+// 不是数据 —— 把它们当数据会让「遍历每一行」的代码要处处判空。
+fn fsSplitLines(text: String) -> Array {
+    let raw = strLines(text)
+    let out = array(0, "")
+    var i = 0
+    while (i < len(raw)) {
+        let ln = raw[i]
+        if (len(strTrim(ln)) > 0) { arrPush(out, ln) }
+        i = i + 1
+    }
+    return out
+}
+
+// 写一个字符串数组，每行一条，末尾带换行。
+//
+// 为什么用 fsReplace：日志与配置最怕半截文件。一次多花一个 rename
+// 的开销，换「永远不会读到写了一半的内容」。
+fn fsWriteLines(path: String, lines: Array) -> Bool {
+    var body = ""
+    var i = 0
+    while (i < len(lines)) {
+        body = body + toString(lines[i]) + "\n"
+        i = i + 1
+    }
+    return fsReplace(path, body)
+}
+
+// 追加一行（自动补换行）。日志用这个。
+fn fsAppendLine(path: String, line: String) -> Bool {
+    return fsAppend(path, line + "\n")
+}
+
+// 读整个文件，不存在时返回默认值。等价于 fsReadOr，但名字更直白。
+fn fsReadText(path: String, def: String) -> String {
+    return fsReadOr(path, def)
+}
+
+// 安全写入：父目录不存在就先建出来。
+//
+// ── 为什么需要它 ────────────────────────────────────────────
+//
+// fsWrite("logs/2024/01/a.log", ...) 在 logs/2024/01 不存在时直接
+// 失败。而「写日志」这个动作失败通常没人处理 —— 于是日志静默消失，
+// 出问题时才发现从来没记下来。
+fn fsWriteDeep(path: String, text: String) -> Bool {
+    let dir = fsDirName(path)
+    if (len(dir) > 0 && dir != ".") {
+        if (!fsEnsureDir(dir)) { return false }
+    }
+    return fsReplace(path, text)
+}
+
+// ============================================================
+// 目录
+// ============================================================
+
+// 递归建目录。返回是否最终可用。
+fn fsEnsureDir(path: String) -> Bool {
+    if (fsIsDir(path)) { return true }
+    if (path == "" || path == "/") { return false }
+    // 先建父目录再建自己 —— 递归到根自然停止
+    let parent = fsDirName(path)
+    if (len(parent) > 0 && parent != path) {
+        if (!fsEnsureDir(parent)) { return false }
+    }
+    return fsMkdir(path)
+}
+
+// 列目录，只返回文件（不含子目录）。
+fn fsListFiles(dir: String) -> Array {
+    let out = array(0, "")
+    let names = fsList(dir)
+    var i = 0
+    while (i < len(names)) {
+        let n = toString(names[i])
+        let full = fsJoin(dir, n)
+        if (!fsIsDir(full)) { arrPush(out, n) }
+        i = i + 1
+    }
+    return out
+}
+
+// 列目录，只返回子目录。
+fn fsListDirs(dir: String) -> Array {
+    let out = array(0, "")
+    let names = fsList(dir)
+    var i = 0
+    while (i < len(names)) {
+        let n = toString(names[i])
+        if (fsIsDir(fsJoin(dir, n))) { arrPush(out, n) }
+        i = i + 1
+    }
+    return out
+}
+
+// 按扩展名过滤（不含点，大小写不敏感）。
+fn fsListByExt(dir: String, ext: String) -> Array {
+    let want = strLower(ext)
+    let out = array(0, "")
+    let names = fsListFiles(dir)
+    var i = 0
+    while (i < len(names)) {
+        if (fsExtName(toString(names[i])) == want) {
+            arrPush(out, names[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 递归列目录下所有文件的**完整路径**。
+//
+// depth 限制递归层数：符号链接成环时没有这个限制会栈溢出。传 0
+// 表示只列当前层（与 fsListFiles 等价）。
+fn fsWalk(dir: String, depth: Int) -> Array {
+    let out = array(0, "")
+    if (depth <= 0) { return out }
+    let names = fsList(dir)
+    var i = 0
+    while (i < len(names)) {
+        let n = toString(names[i])
+        let full = fsJoin(dir, n)
+        if (fsIsDir(full)) {
+            let sub = fsWalk(full, depth - 1)
+            var j = 0
+            while (j < len(sub)) {
+                arrPush(out, sub[j])
+                j = j + 1
+            }
+        } else {
+            arrPush(out, full)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 统计目录下文件数量与总字节数。返回 [文件数, 总字节]。
+fn fsDirStats(dir: String) -> Array {
+    let files = fsWalk(dir, 8)
+    var total = 0
+    var i = 0
+    while (i < len(files)) {
+        let sz = fsSize(toString(files[i]))
+        if (sz > 0) { total = total + sz }
+        i = i + 1
+    }
+    let out = array(2, 0)
+    out[0] = len(files)
+    out[1] = total
+    return out
+}
+
+// ============================================================
+// 便利组合
+// ============================================================
+
+// 文件不存在就创建空文件。返回是否最终存在。
+fn fsTouch(path: String) -> Bool {
+    if (fsExists(path)) { return true }
+    return fsWrite(path, "")
+}
+
+// 内容不同的情况下才写。返回是否真的写了。
+//
+// 用途：反复保存同一份配置时不产生无谓的磁盘写与 mtime 变动 ——
+// 后者会触发文件监听器重载，在开发工具里表现为「什么都没改，
+// 但整个项目重新加载了」。
+fn fsWriteIfChanged(path: String, text: String) -> Bool {
+    if (fsExists(path)) {
+        let old = fsReadOr(path, "")
+        if (old == text) { return false }
+    }
+    return fsReplace(path, text)
+}
+
+// 读文件，一行都不匹配时给默认值。用于极简的 key=value 配置。
+fn fsFindLine(path: String, prefix: String, def: String) -> String {
+    let lines = fsReadLines(path)
+    var i = 0
+    while (i < len(lines)) {
+        let ln = toString(lines[i])
+        if (strStarts(ln, prefix)) { return ln }
+        i = i + 1
+    }
+    return def
+}
+
+// 解析 key=value 形式的配置为扁平键值数组 [k1,v1,k2,v2,...]。
+// 忽略空行与 # 开头的注释行，值两侧空白被去掉。
+fn fsParseKV(path: String) -> Array {
+    let out = array(0, "")
+    let lines = fsReadLines(path)
+    var i = 0
+    while (i < len(lines)) {
+        let ln = strTrim(toString(lines[i]))
+        if (len(ln) > 0 && !strStarts(ln, "#")) {
+            let eq = strFind(ln, "=")
+            if (eq > 0) {
+                arrPush(out, strTrim(strSub(ln, 0, eq)))
+                arrPush(out, strTrim(strSub(ln, eq + 1, len(ln))))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 从键值数组里取值（找不到给默认值）。与 fsParseKV 配对使用。
+fn fsKVGet(kv: Array, key: String, def: String) -> String {
+    var i = 0
+    while (i + 1 < len(kv)) {
+        if (toString(kv[i]) == key) { return toString(kv[i + 1]) }
+        i = i + 2
+    }
+    return def
+}
+
+// 复制文件（读+写）。返回是否成功。
+//
+// 用 fsExists 判断源，而不是「读出来看是否为空」——
+// 后者有两个错：源内容恰好是 \0 时被误判为不存在；空文件
+// （0 字节）也会被当成不存在。
+fn fsCopy(src: String, dst: String) -> Bool {
+    if (!fsExists(src)) { return false }
+    let text = fsRead(src)
+    return fsWriteDeep(dst, text)
+}
+
+// 临时目录下的路径。pid 让并发运行的进程不撞名。
+fn fsTempPath(name: String) -> String {
+    return fsJoin("C:/xtmp", name)
+}

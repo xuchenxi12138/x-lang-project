@@ -1,0 +1,219 @@
+// ui/control/button.xle — 按钮
+//
+// ── 按钮是 UI 库里最被低估的控件 ────────────────────
+//
+// 看起来它就是「一个矩形 + 居中文字 + 点击回调」，但真实世界里
+// 按钮有 5 个视觉状态（常态、悬停、按下、焦点、禁用）× 4 种
+// 语义配色（次要、主要、危险、幽灵），加起来 20 种组合。如果再
+// 让每个调用点自己判断状态、自己挑颜色，那 20 种组合会散落在
+// 整个代码库里，而且必然有几处顺序写反（先判 hover 再判 active，
+// 按下时颜色就不对）。
+//
+// 所以这里把状态机收在 Button 内部：
+//
+//   · 调用方只负责喂 hovered / pressed / enabled（从输入层来）
+//   · Button 自己决定该用哪种样式
+//
+// ── 为什么 kind 是 Int 不是 enum ──────────────────
+//
+// 语言还没有 enum。用字符串的话，绘制热路径上要做字符串比较；
+// 用 Int 常量，比较是一次整数比较。代价是可读性 —— 所以下面
+// 给了 BTN_* 常量，调用点写 Button.primary(...) 而不是
+// `let b = ...; b.kind = 1`，可读性从工厂方法拿回来。
+//
+// ── 为什么 pressed 不存成字段 ──────────────────────
+//
+// 即时模式下「按下」是这一帧的瞬时状态，来自输入层。存成字段
+// 就要保证「帧末复位」，而漏复位会让按钮永远亮着 —— 这是
+// 即时 UI 最经典的 bug。让它做参数，从类型上就不可能忘记复位。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 语义档次。数值没有含义，只用于相等比较。
+const BTN_SECONDARY = 0   // 次要动作：取消、返回
+const BTN_PRIMARY   = 1   // 主要动作：确定、保存（一屏只该有一个）
+const BTN_DANGER    = 2   // 破坏性：删除、清空
+const BTN_GHOST     = 3   // 无底色：工具栏图标、行内链接
+
+class Button extends Widget {
+    label: String,
+    kind: Int,
+
+    // 点下去要做的事。null 表示「纯展示按钮」—— 不报错，
+    // 因为很多按钮的动作由外部轮询 clicked() 决定，不需要回调。
+    onClick: Func,
+
+    constructor(r: Rect, label: String) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.label   = label
+        self.kind    = BTN_SECONDARY
+        self.style   = Style.plain()
+    }
+
+    // ── 工厂 ────────────────────────────────────
+    //
+    // 用工厂而不是构造参数，是为了让调用点读起来像声明：
+    //   let ok = Button.primary(r, "保存")
+    // 比
+    //   let ok = new Button(r, "保存", BTN_PRIMARY)
+    // 少一个「1 是什么意思」的疑问，且新增档次时不用改签名。
+
+    // 次要按钮的显式工厂。
+    //
+    // ── 为什么需要它 ──────────────────────────
+    //
+    // 默认构造出来就是次要按钮，所以「构造 + 什么都不做」本来也行。
+    // 但调用点读 `new Button(r, "取消")` 时无法一眼看出档次 ——
+    // 而 `Button.secondary(r, "取消")` 就把意图写在名字上了。
+    // 在「一组按钮里一个是 primary 一个是 secondary」的地方，
+    // 这种对称性值这四行。
+    static fn secondary(r: Rect, label: String) -> Button {
+        let b = new Button(r, label)
+        b.kind = BTN_SECONDARY
+        return b
+    }
+
+    static fn primary(r: Rect, label: String) -> Button {
+        let b = new Button(r, label)
+        b.kind = BTN_PRIMARY
+        return b
+    }
+
+    static fn danger(r: Rect, label: String) -> Button {
+        let b = new Button(r, label)
+        b.kind = BTN_DANGER
+        return b
+    }
+
+    static fn ghost(r: Rect, label: String) -> Button {
+        let b = new Button(r, label)
+        b.kind = BTN_GHOST
+        return b
+    }
+
+    // ── 状态 ────────────────────────────────────
+
+    fn setLabel(s: String) -> Button {
+        self.label = s
+        return self
+    }
+
+    fn onClickDo(f: Func) -> Button {
+        self.onClick = f
+        return self
+    }
+
+    // ── 样式推导 ─────────────────────────────────
+    //
+    // 这个函数是 Button 的核心。它把 (kind, enabled) 映射成一组
+    // 三态颜色，然后交给 Style。所有「该用哪个颜色」的判断只在
+    // 这一处，draw 只管画。
+    //
+    // ── 禁用态为什么不用硬编码灰 ──────────────────
+    //
+    // 硬编码 0x808080 在深色主题上偏亮、在浅色主题上偏暗，两边
+    // 都不对。正确做法是「用主题自己的 surface + textDim」——
+    // 这样禁用态在任何主题下都自动是「低对比」，而不需要为每个
+    // 主题单独调灰。
+    fn palette(th: Theme) -> Style {
+        if (!self.enabled) {
+            return Style {
+                fill: th.surface,
+                fillHover: th.surface,
+                fillActive: th.surface,
+                border: th.border, borderW: 1,
+                radius: 4,
+                text: th.disabled, textDim: th.disabled, align: 0,
+                gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+                alpha: 100, rotDeg: 0.0, scale: 100, clip: false,
+                shadow: UI_NONE, shadowX: 0, shadowY: 2,
+            }
+        }
+
+        if (self.kind == BTN_PRIMARY) {
+            return Style.primary(th)
+        }
+        if (self.kind == BTN_DANGER) {
+            return Style.danger(th)
+        }
+        if (self.kind == BTN_GHOST) {
+            return Style.ghost(th)
+        }
+        return Style {
+            fill: th.surface,
+            fillHover: th.surfaceHover,
+            fillActive: th.surfaceActive,
+            border: th.border, borderW: 1,
+            radius: 4,
+            text: th.text, textDim: th.textDim, align: 0,
+            gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+            alpha: 100, rotDeg: 0.0, scale: 100, clip: false,
+            shadow: UI_NONE, shadowX: 0, shadowY: 2,
+        }
+    }
+
+    // ── 绘制 ────────────────────────────────────
+    //
+    // 注意参数里的 pressed：它只在这一帧有效，不存字段。
+    // 这样「忘记复位」这种 bug 在类型层面不存在。
+    fn drawPressed(th: Theme, pressed: Bool) {
+        if (!self.vis) { return }
+
+        let s = self.palette(th)
+        let fill = Style.fillFor(s, self.hovered, pressed, self.enabled)
+
+        // 背景：有圆角走圆角，没圆角走矩形。分开写是因为
+        // winFillRound 的半径会被夹紧到 min(w,h)/2，传 0 时
+        // 行为虽然也是直角，但多一次分支判断不如直接分流。
+        let rad = s.radius
+        if (rad > 0) {
+            winFillRound(self.r.x, self.r.y, self.r.w, self.r.h, rad, fill)
+            if (s.border != UI_NONE && s.borderW > 0) {
+                winBorderRound(self.r.x, self.r.y, self.r.w, self.r.h,
+                               rad, s.borderW, s.border)
+            }
+        } else {
+            winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, fill)
+            if (s.border != UI_NONE && s.borderW > 0) {
+                winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h,
+                              s.borderW, s.border)
+            }
+        }
+
+        // 文字。padding 左 8px 作为最小内边距，超长时省略 ——
+        // 按钮宽度通常由布局决定，文字超长是调用方算错了宽度，
+        // 但 UI 不该因此画到框外。
+        let pad = 8
+        let avail = self.r.w - pad * 2
+        var label = self.label
+        if (winTextWidth(label) > avail) {
+            label = uiEllipsize(label, avail)
+        }
+
+        // GHOST 档在悬停/按下时才有底色，文字色也跟着走 —— 否则
+        // 深底上的深字会看不见。
+        uiTextInRect(self.r, label, s.text)
+
+        // 焦点环最后画，保证它在最上层。
+        self.drawFocusRing(th)
+    }
+
+    // Widget 的 abstract draw 签名只有 th。为了不丢 pressed 信息，
+    // 默认实现按「没按下」画 —— 需要精确状态时调 drawPressed。
+    //
+    // 这不是偷懒：绝大多数场景按下与悬停视觉上足够接近，而
+    // 完整状态需要输入层配合。Frame 那套工具（见 widget/frame.xle）
+    // 会自动喂 pressed。
+    fn draw(th: Theme) {
+        self.drawPressed(th, false)
+    }
+}

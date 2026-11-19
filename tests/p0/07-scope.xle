@@ -1,0 +1,57 @@
+// 07-scope.x — 作用域
+//
+// 验证点：
+//   1. 块内声明的变量在块外不可见
+//   2. 内层可以遮蔽外层同名变量
+//   3. 函数局部变量与全局（顶层）变量互不干扰
+//   4. 循环体内每轮重新声明变量
+//
+// 这个测试文件当初暴露了 P0 编译器最隐蔽的一个 bug：
+// 块作用域退出时 local_count 回退，但字节码里的 STORE_LOCAL 槽位号
+// 仍然指向那个槽位，导致帧分配的局部变量区比实际使用的少，
+// 局部变量和操作数栈重叠。修法是单独记 max_local_count 峰值。
+
+println("=== 遮蔽 ===")
+let x = 1
+println(x)          // 1
+{
+    let x = 2
+    println(x)      // 2
+}
+println(x)          // 1（外层未受影响）
+
+println("=== 嵌套遮蔽 ===")
+let a = 10
+{
+    let b = 20
+    {
+        let a = 30
+        println(a)  // 30
+        println(b)  // 20
+    }
+    println(a)      // 10
+}
+println(a)          // 10
+
+println("=== 循环内声明 ===")
+var i = 0
+var last = 0
+while i < 3 {
+    let temp = i * 10
+    last = temp
+    i += 1
+}
+println(last)       // 20
+
+println("=== 函数之间独立 ===")
+fn f1() -> Int {
+    let v = 100
+    return v
+}
+fn f2() -> Int {
+    let v = 200
+    return v
+}
+println(f1())       // 100
+println(f2())       // 200
+println(f1())       // 100（f2 没污染 f1 的槽位）

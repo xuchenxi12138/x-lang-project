@@ -1,0 +1,552 @@
+// db/postgres/driver.xle — PostgreSQL 数据源
+//
+// ── 连接流程 ────────────────────────────────────
+//
+//   ① 发 StartupMessage（无类型字节）：
+//        [4] 协议版本 196608 (= 3.0)
+//        "user" \0 <用户名> \0
+//        "database" \0 <库名> \0
+//        "client_encoding" \0 "UTF8" \0
+//        \0
+//
+//   ② 服务端回一串消息，直到 ReadyForQuery：
+//        'R' AuthenticationXxx     ← 可能有多轮
+//        'S' ParameterStatus
+//        'K' BackendKeyData
+//        'Z' ReadyForQuery        ← 结束标志
+//
+//   ③ 之后每个查询：发 'Q' → 收 'T'/'D'/'C'/'E' → 收 'Z'
+//
+// ── 认证方式的演进 ────────────────────────────────
+//
+//   AuthenticationOk            (0) 直接通过（trust）
+//   AuthenticationCleartext     (3) 明文，只在本地 socket 或 TLS 下
+//   AuthenticationMD5           (5) MD5 挑战应答（老默认）
+//   AuthenticationSASL         (10) 列出可用机制，PG 10+ 给 SCRAM-SHA-256
+//   AuthenticationSASLContinue (11) 服务端发 server-first
+//   AuthenticationSASLFinal    (12) 服务端发 server-final
+//
+// ── 为什么 MD5 也要实现 ─────────────────────────
+//
+// 因为很多遗留部署还在用 md5。它的算法是：
+//   "md5" + md5(md5(password + username) + salt)
+// 只需要 MD5，不需要 HMAC/PBKDF2。但 P0 没有 MD5 实现 —— 这是一个
+// 明确的缺口，见 md5 的说明。
+
+from "../core/datasource.xle" import sqlBind, execAll, DataSource
+from "../core/result.xle" import ResultSet
+from "../core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "../codec/base64.xle" import b64Encode, b64EncodeText, b64Decode, b64DecodeText, b64Value, b64UrlEncode, b64UrlDecode, B64_ALPHABET
+from "../codec/md5.xle" import md5K, md5S, md5HexOf, md5HexText, Md5, MD5_MASK32
+from "message.xle" import pgBuildMsg, pgBuildStartup, pgReadMsg, pgTypeName, pgBuildQuery, pgBuildTerminate, pgBuildSync, pgParseError, pgReadCStr, pgBool
+from "resultset.xle" import pgParseRowDescription, pgParseDataRow, pgParseCommandTag, pgDescribe, PgColumn, PG_OID_BOOL, PG_OID_BYTEA, PG_OID_CHAR, PG_OID_NAME, PG_OID_INT8, PG_OID_INT2, PG_OID_INT4, PG_OID_TEXT, PG_OID_OID, PG_OID_JSON, PG_OID_FLOAT4, PG_OID_FLOAT8, PG_OID_UNKNOWN, PG_OID_MONEY, PG_OID_BPCHAR, PG_OID_VARCHAR, PG_OID_DATE, PG_OID_TIME, PG_OID_TIMESTAMP, PG_OID_TIMESTAMPTZ, PG_OID_INTERVAL, PG_OID_TIMETZ, PG_OID_NUMERIC, PG_OID_UUID, PG_OID_JSONB, PG_OID_INT4RANGE, PG_OID_INT8RANGE, PG_OID_TEXTARRAY, PG_OID_INT4ARRAY, PG_OID_VARCHARARR
+from "scram.xle" import scramClientNonce, scramSplitAttrs, scramAttr, ScramClient, SCRAM_ALPHABET
+
+// 协议版本 3.0 编码成 int32：主版本 << 16 | 次版本
+const PG_PROTOCOL_3 = 196608
+
+class PostgresDataSource extends DataSource {
+    user: String,
+    password: String,
+    database: String,
+
+    conn: Conn,
+
+    // 服务端参数（server_version、client_encoding 等）。
+    params: Array,
+
+    // 事务状态：'I' 空闲、'T' 事务中、'E' 失败事务。
+    txStatus: String,
+
+    constructor(ep: Endpoint, user: String, password: String, database: String) {
+        self.ep        = ep
+        self.user      = user
+        self.password  = password
+        self.database  = database
+        self.dialect   = dialectOf(DB_POSTGRES)
+        self.connected = false
+        self.lastError = ""
+        self.conn      = new Conn(0 - 1, ep.host, ep.port)
+        self.params    = []
+        self.txStatus  = "I"
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    // postgres://user:pwd@host:5432/dbname
+    //
+    // ── 为什么也收 user/password 两个参数 ───────────────
+    //
+    // 因为上层统一工厂（db/index.xle 的 openDb）要对七个驱动用同一个
+    // 调用形状。URL 里通常已经带了凭据，但有时凭据来自环境变量或
+    // 配置中心，URL 里只写 host/db —— 那种情况靠这两个参数补。
+    //
+    // 优先级：**URL 里有的优先**。因为 URL 是「这次连接的具体描述」，
+    // 而参数是「默认值」。反过来会让「同一个 URL 在不同调用点连到
+    // 不同账号」，是很难查的配置漂移。
+    static fn ofUrl(url: String, user: String, password: String) -> PostgresDataSource {
+        let u = pgParseUrl(url)
+        var usr = toString(u[3])
+        var pwd = toString(u[4])
+        if (len(usr) == 0) { usr = user }
+        if (len(pwd) == 0) { pwd = password }
+        return new PostgresDataSource(endpointOf(toString(u[1]), toInt(u[2])),
+                                      usr, pwd, toString(u[5]))
+    }
+
+    // ── 连接 ────────────────────────────────────
+
+    fn connect() -> Bool {
+        self.lastError = ""
+        let c = Conn.dial(self.ep)
+        if (!c.isOpen()) {
+            self.lastError = "连接 " + endpointString(self.ep) + " 失败：" + c.lastError
+            return false
+        }
+        self.conn = c
+
+        // ① 启动包
+        let sp = []
+        bbPutU32BE(sp, PG_PROTOCOL_3)
+        bbPutUtf8(sp, "user")
+        bbPut(sp, 0)
+        bbPutUtf8(sp, self.user)
+        bbPut(sp, 0)
+        if (len(self.database) > 0) {
+            bbPutUtf8(sp, "database")
+            bbPut(sp, 0)
+            bbPutUtf8(sp, self.database)
+            bbPut(sp, 0)
+        }
+        bbPutUtf8(sp, "client_encoding")
+        bbPut(sp, 0)
+        bbPutUtf8(sp, "UTF8")
+        bbPut(sp, 0)
+        bbPut(sp, 0)     // 参数列表结束
+
+        if (c.sendBytes(pgBuildStartup(sp)) < 0) {
+            self.lastError = "发送启动包失败"
+            c.close()
+            return false
+        }
+
+        // ② 处理认证与初始化消息
+        if (!self.handshake()) {
+            c.close()
+            return false
+        }
+
+        self.connected = true
+        return true
+    }
+
+    // 处理启动后的一串消息，直到 ReadyForQuery。
+    fn handshake() -> Bool {
+        // ── 为什么允许 null ────────────────────────────
+        //
+        // 因为 SCRAM 状态只在「服务端选了 SCRAM」时才需要。用 trust
+        // 或 MD5 认证的连接全程不碰它。语言没有「可选类型」，所以
+        // 声明成类实例 + null 初始值，编译器会给一条警告 —— 那条
+        // 警告在这里是正常的，它提醒的是「别在赋值前调用它的方法」，
+        // 而每个使用点都先判了 null。
+        var scram: ScramClient = null
+        var rounds = 0
+
+        while rounds < 32 {
+            let m = pgReadMsg(self.conn)
+            if (!pgBool(m, 0)) {
+                self.lastError = "读取启动响应失败：" + toString(m[3])
+                return false
+            }
+            let t = toInt(m[1])
+            let p = m[2]
+
+            // ── 'R' 认证 ---
+            if (t == 0x52) {
+                let code = bbU32BE(p, 0)
+                if (code == 0) {
+                    // AuthenticationOk，继续等 ReadyForQuery
+                    rounds = rounds + 1
+                    continue
+                }
+                if (code == 3) {
+                    // 明文口令
+                    let pw = []
+                    bbPutUtf8(pw, self.password)
+                    bbPut(pw, 0)
+                    if (self.conn.sendBytes(pgBuildMsg(0x70, pw)) < 0) {
+                        self.lastError = "发送明文口令失败"
+                        return false
+                    }
+                    rounds = rounds + 1
+                    continue
+                }
+                if (code == 5) {
+                    // MD5 挑战应答
+                    let salt = bbSlice(p, 4, 8)
+                    let hashed = pgMd5Password(self.password, self.user, salt)
+                    let pw = []
+                    bbPutUtf8(pw, hashed)
+                    bbPut(pw, 0)
+                    if (self.conn.sendBytes(pgBuildMsg(0x70, pw)) < 0) {
+                        self.lastError = "发送 MD5 口令失败"
+                        return false
+                    }
+                    rounds = rounds + 1
+                    continue
+                }
+                if (code == 10) {
+                    // SASL：列出可用机制，选 SCRAM-SHA-256
+                    let mechs = pgParseSaslMechanisms(p)
+                    if (!pgHasMechanism(mechs, "SCRAM-SHA-256")) {
+                        self.lastError = "服务端只支持这些 SASL 机制：" + mechs
+                                       + "\n  P0 只实现 SCRAM-SHA-256"
+                        return false
+                    }
+                    scram = new ScramClient(self.password)
+                    let first = scram.firstMessage()
+                    // SASLInitialResponse：机制名 NUL + 长度 + 内容
+                    let body = []
+                    bbPutUtf8(body, "SCRAM-SHA-256")
+                    bbPut(body, 0)
+                    bbPutU32BE(body, len(first))
+                    bbPutUtf8(body, first)
+                    if (self.conn.sendBytes(pgBuildMsg(0x70, body)) < 0) {
+                        self.lastError = "发送 SASL 首包失败"
+                        return false
+                    }
+                    rounds = rounds + 1
+                    continue
+                }
+                if (code == 11) {
+                    // SASLContinue：服务端发 server-first
+                    if (scram == null) {
+                        self.lastError = "未预期的 SASLContinue"
+                        return false
+                    }
+                    let serverFirst = bbToText(p)
+                    let fin = scram.finalMessage(serverFirst)
+                    if (len(fin) == 0) {
+                        self.lastError = "SCRAM 计算失败：" + scram.error
+                        return false
+                    }
+                    let body = []
+                    bbPutUtf8(body, fin)
+                    if (self.conn.sendBytes(pgBuildMsg(0x70, body)) < 0) {
+                        self.lastError = "发送 SASL 应答失败"
+                        return false
+                    }
+                    rounds = rounds + 1
+                    continue
+                }
+                if (code == 12) {
+                    // SASLFinal：验证服务端签名
+                    if (scram == null) {
+                        self.lastError = "未预期的 SASLFinal"
+                        return false
+                    }
+                    let serverFinal = bbToText(p)
+                    if (!scram.verifyServerFinal(serverFinal)) {
+                        self.lastError = "SCRAM 服务端验证失败：" + scram.error
+                        return false
+                    }
+                    rounds = rounds + 1
+                    continue
+                }
+                self.lastError = "不支持的认证方式（code=" + toString(code) + "）\n"
+                               + "  P0 支持：trust(0)、cleartext(3)、MD5(5)、SCRAM-SHA-256(10)\n"
+                               + "  help: 检查 pg_hba.conf 的 auth-method"
+                return false
+            }
+
+            // ── 'S' ParameterStatus ---
+            if (t == 0x53) {
+                let nm = pgReadCStr(p, 0)
+                let vl = pgReadCStr(p, toInt(nm[1]))
+                arrPush(self.params, toString(nm[0]))
+                arrPush(self.params, toString(vl[0]))
+                rounds = rounds + 1
+                continue
+            }
+
+            // ── 'K' BackendKeyData（取消查询要用，P0 忽略）---
+            if (t == 0x4B) {
+                rounds = rounds + 1
+                continue
+            }
+
+            // ── 'Z' ReadyForQuery ---
+            if (t == 0x5A) {
+                if (len(p) > 0) { self.txStatus = bbToText(bbSlice(p, 0, 1)) }
+                return true
+            }
+
+            // ── 'E' ErrorResponse ---
+            if (t == 0x45) {
+                self.lastError = "启动失败：" + pgParseError(p)
+                return false
+            }
+
+            // ── 'N' NoticeResponse：非致命，忽略 ---
+            if (t == 0x4E) {
+                rounds = rounds + 1
+                continue
+            }
+
+            // 其它消息：跳过（协议向前兼容的宽容处理）
+            rounds = rounds + 1
+        }
+        self.lastError = "启动过程消息过多（>" + toString(rounds) + "）"
+        return false
+    }
+
+    fn close() {
+        if (self.conn != null && self.conn.isOpen()) {
+            self.conn.sendBytes(pgBuildTerminate())
+            self.conn.close()
+        }
+        self.connected = false
+    }
+
+    fn ping() -> Bool {
+        if (!self.connected || self.conn == null) { return false }
+        if (!self.conn.isOpen()) {
+            self.connected = false
+            return false
+        }
+        let r = self.query("SELECT 1")
+        return r.ok
+    }
+
+    // ── 执行 ────────────────────────────────────
+
+    fn query(sql: String) -> ResultSet {
+        return self.run(sql)
+    }
+
+    fn execute(sql: String) -> ResultSet {
+        return self.run(sql)
+    }
+
+    // 发一条简单查询，收集到 ReadyForQuery 为止。
+    //
+    // ── 为什么必须有「收集到 Z 为止」这个边界 ────────────
+    //
+    // PG 的响应是**多消息流**，且没有「总长度」字段。如果读到
+    // CommandComplete 就返回，剩下的 ReadyForQuery 会留在缓冲里，
+    // 下一次查询读到的第一个消息就是它 —— 于是永远错位一格。
+    // 'Z' 是协议规定的「这条命令彻底结束」信号，必须读掉。
+    fn run(sql: String) -> ResultSet {
+        let t0 = monoMillis()
+        if (!self.connected || self.conn == null) {
+            if (!self.connect()) { return ResultSet.fail("未连接：" + self.lastError) }
+        }
+
+        if (self.conn.sendBytes(pgBuildQuery(sql)) < 0) {
+            self.lastError = "发送查询失败：" + self.conn.lastError
+            self.connected = false
+            return ResultSet.fail(self.lastError)
+        }
+
+        var cols = []
+        let names = []
+        let rows = []
+        let rowNulls = []
+        var affected = 0 - 1
+        var tag = ""
+        var errMsg = ""
+        var gotError = false
+
+        var rounds = 0
+        while rounds < 1000000 {
+            let m = pgReadMsg(self.conn)
+            if (!pgBool(m, 0)) {
+                self.lastError = "读取查询响应失败：" + toString(m[3])
+                self.connected = false
+                return ResultSet.fail(self.lastError)
+            }
+            let t = toInt(m[1])
+            let p = m[2]
+
+            // RowDescription
+            if (t == 0x54) {
+                cols = pgParseRowDescription(p)
+                var i = 0
+                while i < len(cols) {
+                    let c: PgColumn = cols[i]
+                    arrPush(names, c.name)
+                    i = i + 1
+                }
+                rounds = rounds + 1
+                continue
+            }
+
+            // DataRow
+            if (t == 0x44) {
+                let dr = pgParseDataRow(p)
+                arrPush(rows, dr[0])
+                arrPush(rowNulls, dr[1])
+                rounds = rounds + 1
+                continue
+            }
+
+            // CommandComplete
+            if (t == 0x43) {
+                let ct = pgParseCommandTag(p)
+                tag = toString(ct[0])
+                affected = toInt(ct[1])
+                rounds = rounds + 1
+                continue
+            }
+
+            // ErrorResponse
+            if (t == 0x45) {
+                errMsg = pgParseError(p)
+                gotError = true
+                rounds = rounds + 1
+                continue
+            }
+
+            // ReadyForQuery：结束
+            if (t == 0x5A) {
+                if (len(p) > 0) { self.txStatus = bbToText(bbSlice(p, 0, 1)) }
+                break
+            }
+
+            // EmptyQueryResponse / Notice / 其它：跳过
+            rounds = rounds + 1
+        }
+
+        let elapsed = monoMillis() - t0
+
+        if (gotError) {
+            self.lastError = errMsg
+            let rs = ResultSet.fail(errMsg)
+            rs.elapsedMs = elapsed
+            return rs
+        }
+
+        let rs = ResultSet.make(names, rows)
+        rs.nulls = rowNulls
+        if (affected >= 0) { rs.affected = affected }
+        rs.elapsedMs = elapsed
+        rs.raw = pgDescribe(cols)
+        if (len(tag) > 0) { rs.raw = tag + " | " + rs.raw }
+        return rs
+    }
+
+    // ── 便捷查询 ────────────────────────────────
+
+    fn serverVersion() -> String {
+        var i = 0
+        while i + 1 < len(self.params) {
+            if (toString(self.params[i]) == "server_version") {
+                return toString(self.params[i + 1])
+            }
+            i = i + 2
+        }
+        return ""
+    }
+
+    fn describe() -> String {
+        var state = "未连接"
+        if (self.connected) { state = "已连接" }
+        var s = "PostgreSQL @" + endpointString(self.ep)
+              + " db=" + self.database
+              + " user=" + self.user
+              + " [" + state + "]"
+        let v = self.serverVersion()
+        if (len(v) > 0) { s = s + " " + v }
+        return s
+    }
+}
+
+// ── SASL 机制列表解析 ─────────────────────────────
+//
+// 负载是「NUL 结尾的机制名」重复，最后有一个空字符串结束。
+fn pgParseSaslMechanisms(p: Array) -> String {
+    var out = ""
+    var pos = 0
+    while pos < len(p) {
+        let s = pgReadCStr(p, pos)
+        let name = toString(s[0])
+        if (len(name) == 0) { break }
+        if (len(out) > 0) { out = out + ", " }
+        out = out + name
+        pos = toInt(s[1])
+    }
+    return out
+}
+
+fn pgHasMechanism(list: String, want: String) -> Bool {
+    let parts = strSplit(list, ", ")
+    var i = 0
+    while i < len(parts) {
+        if (toString(parts[i]) == want) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── MD5 认证 ──────────────────────────────────────
+//
+// PostgreSQL 的 md5 认证算法：
+//   inner = md5(password + username)
+//   outer = md5(inner + salt4)
+//   发给服务端的是 "md5" + outer
+//
+// ── 为什么这个方案已被弃用 ────────────────────────
+//
+// 因为服务端存的是 md5(password+username)，一旦拖库可直接冒充客户端
+// （它就是「等价口令」）。SCRAM 修掉了这个缺陷。
+fn pgMd5Password(password: String, user: String, salt: Array) -> String {
+    let inner = md5HexText(password + user)
+    // 外层要对 "inner 的十六进制文本" + 盐的原始字节 求摘要
+    let buf = bbFromUtf8(inner)
+    bbPutBytes(buf, salt)
+    let outer = md5HexOf(buf)
+    return "md5" + outer
+}
+
+// ── URL 解析 ──────────────────────────────────────
+//
+// 返回 [scheme, host, port, user, password, database]
+fn pgParseUrl(url: String) -> Array {
+    var rest = url
+    let k = strFind(url, "://")
+    if (k >= 0) { rest = strSub(url, k + 3, len(url)) }
+
+    var user = "postgres"
+    var password = ""
+    let at = strFind(rest, "@")
+    if (at >= 0) {
+        let cred = strSub(rest, 0, at)
+        rest = strSub(rest, at + 1, len(rest))
+        let colon = strFind(cred, ":")
+        if (colon >= 0) {
+            user = strSub(cred, 0, colon)
+            password = strSub(cred, colon + 1, len(cred))
+        } else {
+            user = cred
+        }
+    }
+
+    var host = rest
+    var port = 5432
+    var db = user
+    let slash = strFind(rest, "/")
+    if (slash >= 0) {
+        host = strSub(rest, 0, slash)
+        db = strSub(rest, slash + 1, len(rest))
+    }
+    let colon2 = strFind(host, ":")
+    if (colon2 >= 0) {
+        port = strParseInt(strSub(host, colon2 + 1, len(host)))
+        host = strSub(host, 0, colon2)
+    }
+    if (len(host) == 0) { host = "127.0.0.1" }
+    return ["postgres", host, port, user, password, db]
+}

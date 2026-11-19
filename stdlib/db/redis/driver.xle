@@ -1,0 +1,500 @@
+// db/redis/driver.xle — Redis 数据源
+//
+// ── Redis 与关系库的根本差异 ──────────────────────
+//
+// 关系库是「SQL 文本进、结果集出」，而 Redis 是「命令数组进、RESP
+// 值出」。没有 SQL、没有列名、没有类型系统。
+//
+// 强行套 DataSource 接口会导致语义扭曲，所以这里的映射规则是：
+//
+//   query(cmd...)    返回值按「行 × 列」摊平
+//   execute(cmd...)  返回 affected（DEL/EXPIRE 这类返回整数命令的值）
+//
+// 具体摊平规则：
+//
+//   * 返回单个值（GET/SET/INCR）     → 1 行 1 列
+//   * 返回扁平数组（MGET/LRANGE）    → N 行 1 列
+//   * 返回键值交替（HGETALL）        → N/2 行 2 列 [field, value]
+//   * 返回嵌套数组（SMEMBERS 的旧格式）→ 逐项展开
+//   * nil                           → 0 行（并在 nulls 里标记）
+//
+// ── 为什么提供 typed 便捷方法 ────────────────────
+//
+// 因为 `ds.query("GET", "k").scalar()` 这种写法对每个调用点都是
+// 三行样板。get/set/del/incr/hgetall/lpush/lrange 这些是最常用的
+// 十几条命令，值得有专门的方法 —— 它们内部仍然走同一个 query 路径，
+// 只是把结果解包成直观的类型。
+
+from "../core/datasource.xle" import sqlBind, execAll, DataSource
+from "../core/result.xle" import ResultSet
+from "../core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "resp.xle" import respCommand, respCommandRaw, respRead, respValue, respItem, respFlatten, myBool, RESP_CRLF
+
+class RedisDataSource extends DataSource {
+    // 密码（空串表示不认证）。
+    password: String,
+
+    // 逻辑库编号（0~15）。SELECT 命令切换。
+    dbIndex: Int,
+
+    conn: Conn,
+
+    constructor(ep: Endpoint, password: String, dbIndex: Int) {
+        self.ep        = ep
+        self.password  = password
+        self.dbIndex   = dbIndex
+        self.dialect   = dialectOf(DB_REDIS)
+        self.connected = false
+        self.lastError = ""
+        self.conn      = new Conn(0 - 1, ep.host, ep.port)
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    // redis://[:password@]host[:port][/db]
+    //
+    // 签名与其它驱动对齐（见 postgres/driver.xle 里 ofUrl 的说明）。
+    // URL 里的密码优先；user 对 Redis 无意义（Redis 6 的 ACL 才有
+    // 用户名，P0 只走单密码 AUTH）。
+    static fn ofUrl(url: String, user: String, password: String) -> RedisDataSource {
+        let u = redisParseUrl(url)
+        var pwd = toString(u[3])
+        if (len(pwd) == 0) { pwd = password }
+        return new RedisDataSource(endpointOf(toString(u[1]), toInt(u[2])),
+                                   pwd, toInt(u[4]))
+    }
+
+    // ── 生命周期 ────────────────────────────────
+
+    fn connect() -> Bool {
+        self.lastError = ""
+        let c = Conn.dial(self.ep)
+        if (!c.isOpen()) {
+            self.lastError = "连接 " + endpointString(self.ep) + " 失败：" + c.lastError
+            return false
+        }
+        self.conn = c
+
+        // ① 认证。Redis 6 起有 ACL（AUTH user pass），但绝大多数部署
+        //    仍然只用 requirepass（AUTH pass）。两种都试一次。
+        if (len(self.password) > 0) {
+            let r = self.call("AUTH", [self.password])
+            if (toString(r[0]) == "error") {
+                self.lastError = "AUTH 失败：" + toString(r[1])
+                c.close()
+                return false
+            }
+        }
+
+        // ② 选择逻辑库。0 是默认库，跳过可以省一次往返。
+        if (self.dbIndex > 0) {
+            let r = self.call("SELECT", [toString(self.dbIndex)])
+            if (toString(r[0]) == "error") {
+                self.lastError = "SELECT " + toString(self.dbIndex)
+                               + " 失败：" + toString(r[1])
+                c.close()
+                return false
+            }
+        }
+
+        self.connected = true
+        return true
+    }
+
+    fn close() {
+        if (self.conn != null && self.conn.isOpen()) {
+            self.conn.close()
+        }
+        self.connected = false
+    }
+
+    fn ping() -> Bool {
+        if (!self.connected || self.conn == null) { return false }
+        if (!self.conn.isOpen()) {
+            self.connected = false
+            return false
+        }
+        let r = self.call("PING", [])
+        return toString(r[1]) == "PONG"
+    }
+
+    // ── 执行 ────────────────────────────────────
+
+    // 通用：发一条命令，返回原始 [类型, 值]。
+    //
+    // ── 为什么暴露原始返回 ────────────────────────
+    //
+    // 因为 RESP 的类型信息（simple / bulk / int / array / nil）
+    // 在摊平成 ResultSet 时会丢失，而某些调用方需要它（比如判断
+    // SET NX 到底成功了没有 —— 成功返回 simple OK，失败返回 nil）。
+    fn call(cmd: String, args: Array) -> Array {
+        if (self.conn == null || !self.conn.isOpen()) {
+            // 自动重连一次
+            if (!self.connect()) { return ["error", self.lastError] }
+        }
+        let all = [cmd]
+        var i = 0
+        while i < len(args) {
+            arrPush(all, toString(args[i]))
+            i = i + 1
+        }
+        if (self.conn.sendBytes(respCommand(all)) < 0) {
+            self.lastError = "发送命令失败：" + self.conn.lastError
+            self.connected = false
+            return ["error", self.lastError]
+        }
+        return respRead(self.conn)
+    }
+
+    // 把 Variadic 命令结果摊平成 ResultSet。
+    fn resultOf(cmd: String, args: Array) -> ResultSet {
+        let t0 = monoMillis()
+        let r = self.call(cmd, args)
+        let kind = toString(r[0])
+
+        if (kind == "error") {
+            self.lastError = toString(r[1])
+            return ResultSet.fail(self.lastError)
+        }
+        if (kind == "eof") {
+            self.connected = false
+            self.lastError = "连接已断开"
+            return ResultSet.fail(self.lastError)
+        }
+
+        let rs = redisToResult(r, cmd)
+        rs.elapsedMs = monoMillis() - t0
+        return rs
+    }
+
+    // query(sql) —— 在 Redis 下 sql 就是命令名。
+    //
+    // ── 为什么允许用空格分隔的整条命令 ─────────────────
+    //
+    // 因为 `ds.query("GET user:1")` 比 `ds.query("GET", ["user:1"])`
+    // 顺手得多，而且调试时能直接粘一条 redis-cli 命令。代价是参数里
+    // 有空格时会切错 —— 所以只在这条路径上切，明确需要带空格的参数
+    // 时改用 queryCmd。
+    fn query(sql: String) -> ResultSet {
+        let parts = redisSplit(sql)
+        if (len(parts) == 0) {
+            return ResultSet.fail("空命令")
+        }
+        let cmd = toString(parts[0])
+        let args = arrSlice(parts, 1, len(parts))
+        return self.resultOf(cmd, args)
+    }
+
+    fn execute(sql: String) -> ResultSet {
+        return self.query(sql)
+    }
+
+    // 显式给命令与参数（参数里可以有空格）。
+    fn queryCmd(cmd: String, args: Array) -> ResultSet {
+        return self.resultOf(cmd, args)
+    }
+
+    // ── 便捷方法 ────────────────────────────────
+    //
+    // 每个都是「调 call + 解包」，不引入任何新协议逻辑。
+
+    fn get(key: String) -> String {
+        let r = self.call("GET", [key])
+        if (toString(r[0]) == "nil") { return "" }
+        return respValue(r)
+    }
+
+    fn set(key: String, value: String) -> Bool {
+        let r = self.call("SET", [key, value])
+        return toString(r[1]) == "OK"
+    }
+
+    // SET 带过期（秒）。
+    fn setEx(key: String, value: String, seconds: Int) -> Bool {
+        let r = self.call("SETEX", [key, toString(seconds), value])
+        return toString(r[1]) == "OK"
+    }
+
+    fn del(key: String) -> Int {
+        let r = self.call("DEL", [key])
+        if (toString(r[0]) != "int") { return 0 }
+        return toInt(r[1])
+    }
+
+    fn exists(key: String) -> Bool {
+        let r = self.call("EXISTS", [key])
+        if (toString(r[0]) != "int") { return false }
+        return toInt(r[1]) > 0
+    }
+
+    fn incr(key: String) -> Int {
+        let r = self.call("INCR", [key])
+        if (toString(r[0]) != "int") { return 0 }
+        return toInt(r[1])
+    }
+
+    fn expire(key: String, seconds: Int) -> Bool {
+        let r = self.call("EXPIRE", [key, toString(seconds)])
+        if (toString(r[0]) != "int") { return false }
+        return toInt(r[1]) == 1
+    }
+
+    // TTL：-1 = 永不过期，-2 = 键不存在。
+    fn ttl(key: String) -> Int {
+        let r = self.call("TTL", [key])
+        if (toString(r[0]) != "int") { return 0 - 2 }
+        return toInt(r[1])
+    }
+
+    // 哈希：取一个字段。
+    fn hget(key: String, field: String) -> String {
+        let r = self.call("HGET", [key, field])
+        if (toString(r[0]) == "nil") { return "" }
+        return respValue(r)
+    }
+
+    fn hset(key: String, field: String, value: String) -> Int {
+        let r = self.call("HSET", [key, field, value])
+        if (toString(r[0]) != "int") { return 0 }
+        return toInt(r[1])
+    }
+
+    // 哈希：取全部字段，返回 [字段数组, 值数组] 交错的扁平数组。
+    fn hgetall(key: String) -> ResultSet {
+        return self.resultOf("HGETALL", [key])
+    }
+
+    fn lpush(key: String, value: String) -> Int {
+        let r = self.call("LPUSH", [key, value])
+        if (toString(r[0]) != "int") { return 0 }
+        return toInt(r[1])
+    }
+
+    fn rpush(key: String, value: String) -> Int {
+        let r = self.call("RPUSH", [key, value])
+        if (toString(r[0]) != "int") { return 0 }
+        return toInt(r[1])
+    }
+
+    fn lrange(key: String, start: Int, stop: Int) -> ResultSet {
+        return self.resultOf("LRANGE", [key, toString(start), toString(stop)])
+    }
+
+    fn llen(key: String) -> Int {
+        let r = self.call("LLEN", [key])
+        if (toString(r[0]) != "int") { return 0 }
+        return toInt(r[1])
+    }
+
+    fn sadd(key: String, member: String) -> Int {
+        let r = self.call("SADD", [key, member])
+        if (toString(r[0]) != "int") { return 0 }
+        return toInt(r[1])
+    }
+
+    fn smembers(key: String) -> ResultSet {
+        return self.resultOf("SMEMBERS", [key])
+    }
+
+    // 键列表（调试用）。生产环境不要用 KEYS —— 它会阻塞服务端。
+    fn keys(pattern: String) -> ResultSet {
+        return self.resultOf("KEYS", [pattern])
+    }
+
+    fn flushDb() -> Bool {
+        let r = self.call("FLUSHDB", [])
+        return toString(r[1]) == "OK"
+    }
+
+    // ── 诊断 ────────────────────────────────────
+
+    fn describe() -> String {
+        var state = "未连接"
+        if (self.connected) { state = "已连接" }
+        return "Redis @" + endpointString(self.ep)
+             + " db=" + toString(self.dbIndex)
+             + " [" + state + "]"
+    }
+}
+
+// ── RESP 值 → ResultSet ───────────────────────────
+//
+// 摊平规则见文件头。这里单独成函数是因为它有比较多分支，塞进
+// resultOf 会让那个函数难以阅读。
+fn redisToResult(r: Array, cmd: String) -> ResultSet {
+    let kind = toString(r[0])
+
+    // nil：一条记录都没有。
+    //
+    // ── 为什么用「空结果集 + nulls 标记」而不是一行空值 ──
+    //
+    // 因为 GET 一个不存在的键必须能和应用层「键存在但值就是空串」
+    // 区分开。前者 count() == 0，后者 count() == 1 且 isNull 为 false。
+    if (kind == "nil") {
+        let rs = ResultSet.make(["value"], [])
+        rs.raw = "nil"
+        return rs
+    }
+
+    // 单值：1 行 1 列
+    if (kind == "bulk" || kind == "simple" || kind == "int") {
+        let rs = ResultSet.make(["value"], [[respValue(r)]])
+        rs.raw = kind
+        return rs
+    }
+
+    // 数组
+    if (kind == "array") {
+        let items = r[1]
+        let n = len(items)
+
+        // ① 空数组
+        if (n == 0) {
+            let rs = ResultSet.make(["value"], [])
+            rs.raw = "empty-array"
+            return rs
+        }
+
+        // ② 全是标量：N 行 1 列。但 HGETALL 是 [field, value, field,
+        //    value…] 的交替结构，按命令名区分。
+        //
+        // ── 为什么要按命令名特判 ──────────────────────
+        //
+        // 因为「扁平数组」有两种完全不同的语义：LRANGE 是 N 个值，
+        // HGETALL 是 N/2 对。只看返回值无法分辨（都是一个扁平数组），
+        // 所以只能靠命令名。这是一处不得已的耦合，注释在此说明。
+        if (!redisIsPairCommand(cmd)) {
+            let rows = []
+            var i = 0
+            while i < n {
+                let one = []
+                arrPush(one, respItem(items, i))
+                arrPush(rows, one)
+                i = i + 1
+            }
+            let rs = ResultSet.make(["value"], rows)
+            rs.raw = "array"
+            return rs
+        }
+
+        // ③ 键值交替（HGETALL / CONFIG GET）：N/2 行 2 列
+        let rows = []
+        let nulls = []
+        var k = 0
+        while k + 1 < n {
+            let one = []
+            arrPush(one, respItem(items, k))
+            arrPush(one, respItem(items, k + 1))
+            arrPush(rows, one)
+            let nf = []
+            arrPush(nf, false)
+            arrPush(nf, false)
+            arrPush(nulls, nf)
+            k = k + 2
+        }
+        let rs = ResultSet.make(["field", "value"], rows)
+        rs.nulls = nulls
+        rs.raw = "pairs"
+        return rs
+    }
+
+    // 其余（嵌套数组等）：逐项拍平
+    let flat = respFlatten(r[1])
+    let rs = ResultSet.make(["value"], flat)
+    rs.raw = kind
+    return rs
+}
+
+// 这条命令的返回值是「键值交替」吗？
+//
+// 只列出会返回交替结构的命令。ZRANGE ... WITHSCORES 也是交替的，
+// 但它是否带 WITHSCORES 取决于参数，所以不在这里 —— 需要时用
+// queryCmd 拿原始返回自己处理。
+fn redisIsPairCommand(cmd: String) -> Bool {
+    let u = strUpper(cmd)
+    return u == "HGETALL" || u == "CONFIG" || u == "XINFO"
+}
+
+// ── 命令拆分 ──────────────────────────────────────
+//
+// 把 "SET k v" 拆成 ["SET", "k", "v"]。
+//
+// ── 为什么不支持引号 ────────────────────────────
+//
+// redis-cli 支持引号，但它有一套自己的转义规则（\xHH、单双引号
+// 混合）。P0 实现完整版会引入一堆只为便利存在的代码，而「需要带
+// 空格的值」是极少数场景 —— 那条路走 queryCmd 就够了。这里明确
+// 只按空白切分，行为可预测。
+fn redisSplit(s: String) -> Array {
+    let out = []
+    var cur = ""
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = strSub(s, i, i + 1)
+        if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") {
+            if (len(cur) > 0) {
+                arrPush(out, cur)
+                cur = ""
+            }
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    if (len(cur) > 0) { arrPush(out, cur) }
+    return out
+}
+
+// ── URL 解析 ──────────────────────────────────────
+//
+// redis://:pwd@host:port/db      （AUTH 只需要密码）
+// redis://user:pwd@host:port/db  （ACL 用户名，P0 取密码部分）
+// redis://host:port/db
+//
+// 返回 [scheme, host, port, password, dbIndex]
+fn redisParseUrl(url: String) -> Array {
+    var rest = url
+    var scheme = "redis"
+    let k = strFind(url, "://")
+    if (k >= 0) {
+        scheme = strSub(url, 0, k)
+        rest   = strSub(url, k + 3, len(url))
+    }
+
+    var password = ""
+    let at = strFind(rest, "@")
+    if (at >= 0) {
+        let cred = strSub(rest, 0, at)
+        rest = strSub(rest, at + 1, len(rest))
+        // 去掉可能的用户名前缀
+        let colon = strFind(cred, ":")
+        if (colon >= 0) {
+            password = strSub(cred, colon + 1, len(cred))
+        } else {
+            password = cred
+        }
+    }
+
+    var host = rest
+    var port = 6379
+    var dbIdx = 0
+
+    let slash = strFind(rest, "/")
+    if (slash >= 0) {
+        host  = strSub(rest, 0, slash)
+        let dbs = strSub(rest, slash + 1, len(rest))
+        dbIdx = strParseInt(dbs)
+    }
+    let colon2 = strFind(host, ":")
+    if (colon2 >= 0) {
+        port = strParseInt(strSub(host, colon2 + 1, len(host)))
+        host = strSub(host, 0, colon2)
+    }
+    if (len(host) == 0) { host = "127.0.0.1" }
+
+    return [scheme, host, port, password, dbIdx]
+}

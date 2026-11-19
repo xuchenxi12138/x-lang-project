@@ -1,0 +1,177 @@
+// ============================================================
+// std.http —— 请求解析、响应构造、查询串、URL 编解码
+// ============================================================
+//
+// 这是**纯函数层**的测试：不起 socket，只测解析与编码。
+//
+// ── 为什么把这两层分开测 ────────────────────────────────────
+//
+// 带 socket 的测试（起服务端、连客户端）需要两个进程配合，
+// 在四档一致性框架里很难做 —— 解释器、.xbc 往返、超指令关闭、
+// AOT 产物四种执行方式，每一种都要拉起一对进程并保证端口不冲突。
+// 那种测试一旦不稳定，就会被人习惯性跳过，于是真的坏了也没人知道。
+//
+// 而这一层覆盖的是**最容易出错、也最需要确定性**的部分：HTTP
+// 报文是字节协议，一个空格、一个 \r\n 的位置错了就整条请求作废；
+// URL 编码错一个字节就是乱码。这些全部是纯函数，四档必须逐字节
+// 一致 —— 这正是 run_tests.sh 能验证的。
+//
+// socket 那一层的端到端验证在 httpServer 的文档注释里给了完整
+// 示例代码，且由 tests/p0/32-http-live 单独跑（它起真实端口）。
+
+from std.http import httpServer, httpServerOn, httpPort, httpRoute, httpMatch, httpPump, netSleep, httpParse, httpSplitLines, httpHeader, httpHeaderInt, httpDechunk, httpPair, httpHexToInt, httpHexDigit, httpBadRequest, httpStatusText, httpRespond, httpRespondWith, httpRespondJson, httpRespondHtml, httpRespondText, httpNotFound, httpClose, httpServerClose, httpParseQuery, httpQueryGet, httpQueryInt, httpUrlDecode, httpUrlEncode, httpHex2, httpHexChar, httpUrlDecodeBytes, httpGet, httpPost, httpRequest, httpParseResponse, httpRespStatus, httpRespHeader, httpRespBody, HTTP_METHOD, HTTP_PATH, HTTP_QUERY, HTTP_VERSION, HTTP_HEADERS, HTTP_BODY, HTTP_MAX_BODY, HTTP_MAX_HEADER, SRV_LISTENER, SRV_CLIENTS, SRV_BUFS, SRV_ROUTES, SRV_PORT, HTTP_CONN, RESP_STATUS, RESP_HEADERS, RESP_BODY
+
+fn main() -> Void {
+    println("---- 状态码原因短语 ----")
+    println(httpStatusText(200))
+    println(httpStatusText(201))
+    println(httpStatusText(204))
+    println(httpStatusText(301))
+    println(httpStatusText(404))
+    println(httpStatusText(500))
+    println(httpStatusText(999))      // Unknown（自定义码不拒绝）
+
+    println("---- 请求行解析 ----")
+    let r1 = httpParse("GET /hello HTTP/1.1\r\nHost: a\r\n\r\n")
+    println(r1[HTTP_METHOD])
+    println(r1[HTTP_PATH])
+    println("[" + r1[HTTP_QUERY] + "]")
+    println(r1[HTTP_VERSION])
+    println(httpHeader(r1[HTTP_HEADERS], "host", "?"))
+
+    println("---- 查询串 ----")
+    let r2 = httpParse("GET /api?x=1&y=2 HTTP/1.1\r\nHost: a\r\n\r\n")
+    println(r2[HTTP_PATH])
+    println(r2[HTTP_QUERY])
+    let kv = httpParseQuery(r2[HTTP_QUERY])
+    println(len(kv))
+    println(httpQueryGet(kv, "x", "?"))
+    println(httpQueryGet(kv, "y", "?"))
+    println(httpQueryGet(kv, "z", "def"))
+
+    println("---- 查询串细节 ----")
+    // 空值、缺等号、重复键
+    //
+    // 4 对而不是 3 对：`b`（没有等号）也算一对，值是空串。
+    // 这是有意的 —— 表单里 `<input name="b">` 未勾选时就是只发名字
+    // 不发值，把它丢掉等于让服务端无法区分「没这个字段」与
+    // 「字段在但值为空」，而这两者的业务含义完全不同。
+    let q = httpParseQuery("a=&b&c=1&c=2")
+    println(len(q))                    // 8（四对）
+    println("[" + httpQueryGet(q, "a", "?") + "]")
+    println("[" + httpQueryGet(q, "b", "?") + "]")
+    println(httpQueryGet(q, "c", "?"))  // 第一个（重复键保留，取首个）
+    println(httpQueryInt(q, "c", -1))
+
+    println("---- 查询串整数 ----")
+    let qi = httpParseQuery("n=42&bad=xyz&neg=-7")
+    println(httpQueryInt(qi, "n", -1))
+    println(httpQueryInt(qi, "bad", -1))    // 非数字给默认值
+    println(httpQueryInt(qi, "missing", -1))
+    println(httpQueryInt(qi, "neg", 0))
+
+    println("---- 请求头 ----")
+    let r3 = httpParse("POST /x HTTP/1.1\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nX-Custom: A B\r\n\r\nhello")
+    println(r3[HTTP_METHOD])
+    println(httpHeader(r3[HTTP_HEADERS], "content-type", "?"))
+    println(httpHeader(r3[HTTP_HEADERS], "x-custom", "?"))
+    println(httpHeaderInt(r3[HTTP_HEADERS], "content-length", -1))
+    println(httpHeader(r3[HTTP_HEADERS], "missing", "none"))
+
+    println("---- body ----")
+    println(r3[HTTP_BODY])
+    println(len(r3[HTTP_BODY]))
+
+    // 裸 \n 分隔也认（手写客户端常这样发）
+    let r4 = httpParse("GET /n HTTP/1.1\nHost: a\n\n")
+    println(r4[HTTP_METHOD])
+    println(r4[HTTP_PATH])
+
+    // 头不完整：返回空数组，表示「继续等」
+    println(len(httpParse("GET / HTTP/1.1\r\nHost: a")))
+    println(len(httpParse("")))
+
+    // 请求行拼不出来：method 给 "!"，让调用方回 400
+    let bad = httpParse("garbage\r\n\r\n")
+    println(bad[HTTP_METHOD])
+
+    println("---- 分块编码 ----")
+    let chunked = "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+    let r5 = httpParse(chunked)
+    println("[" + r5[HTTP_BODY] + "]")
+
+    println("---- URL 解码（ASCII） ----")
+    println("[" + httpUrlDecode("abc") + "]")
+    println("[" + httpUrlDecode("a+b") + "]")
+    println("[" + httpUrlDecode("%20") + "]")
+    println("[" + httpUrlDecode("%41") + "]")
+    println("[" + httpUrlDecode("%zz") + "]")     // 非法序列保留原样
+
+    println("---- URL 解码（中文，逐字节） ----")
+    // %E5%BC%A0%E4%B8%89 = 「张三」的 UTF-8 字节
+    println("[" + httpUrlDecode("%E5%BC%A0%E4%B8%89") + "]")
+    println("[" + httpUrlDecode("%E4%B8%AD%E6%96%87") + "]")
+    // 混合：转义 + 非转义
+    println("[" + httpUrlDecode("a%E4%B8%ADb") + "]")
+
+    println("---- URL 编码 ----")
+    println(httpUrlEncode("abc"))
+    println(httpUrlEncode("a b"))
+    println(httpUrlEncode("a&b=c"))
+    println(httpUrlEncode("张三"))
+    // 往返一致
+    let orig = "张三 你好!&x=1"
+    println(httpUrlDecode(httpUrlEncode(orig)) == orig)
+
+    println("---- 字节互转 ----")
+    let bytes = strBytes("中")
+    println(len(bytes))                // 3 字节
+    println(toInt(bytes[0]))           // 228
+    println(toInt(bytes[1]))           // 184
+    println(toInt(bytes[2]))           // 173
+    println(strFromBytes(bytes))       // 中
+    println(len(strFromBytes(array(0, 0))))   // 空数组给空串
+
+    println("---- 响应解析 ----")
+    let resp = httpParseResponse("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi")
+    println(httpRespStatus(resp))
+    println(httpRespHeader(resp, "content-type", "?"))
+    println(httpRespBody(resp))
+
+    // 状态行坏掉：status 给 -1，body 放错误描述（不是空串）
+    //
+    // ── 为什么 body 要放错误描述而不是留空 ──────────────────
+    //
+    // 调用方拿到 status = -1 时，唯一能做的就是报错。此时 body
+    // 里有一句「状态行格式不对：HTTP/1.1 abc OK」远比一个空串有用
+    // —— 它直接告诉用户服务端返回了什么，而不是让人去抓包。
+    let badresp = httpParseResponse("HTTP/1.1 abc OK\r\n\r\n")
+    println(httpRespStatus(badresp))
+    println(len(httpRespBody(badresp)) > 0)
+
+    println("---- 路由表 ----")
+    let srv = array(5, 0)
+    srv[0] = 0
+    srv[1] = array(0, 0)
+    srv[2] = array(0, "")
+    srv[3] = array(0, "")
+    srv[4] = 8080
+    httpRoute(srv, "GET", "/hello", 1)
+    httpRoute(srv, "POST", "/submit", 2)
+    httpRoute(srv, "GET", "/static/*", 3)
+    println(httpMatch(srv, "GET", "/hello"))       // 1
+    println(httpMatch(srv, "get", "/hello"))       // 1（方法名大小写不敏感）
+    println(httpMatch(srv, "GET", "/nope"))        // -1
+    println(httpMatch(srv, "POST", "/submit"))     // 2
+    // 精确优先于通配
+    println(httpMatch(srv, "GET", "/static/a.js")) // 3
+    println(httpMatch(srv, "GET", "/staticx"))     // -1（前缀要求带 /）
+
+    println("---- 客户端 URL 校验 ----")
+    // https 明确拒绝（P0 没有 TLS，假装支持比不支持危险）
+    let noTls = httpGet("https://example.com/")
+    println(toInt(noTls[0]))
+    println(len(httpRespBody(noTls)) > 0)
+
+    println("http module ok")
+}

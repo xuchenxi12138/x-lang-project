@@ -1,0 +1,217 @@
+// service/post_service.xle — 文章业务逻辑
+//
+// ── 业务层的职责：把「仓储能做什么」翻译成「业务允许做什么」──
+//
+// 仓储只知道增删改查。以下是业务规则，不该下沉到仓储：
+//
+//   · 标题不能重复
+//   · 草稿变已发布时，正文不能为空
+//   · 删除已发布的文章要记一条日志（审计）
+//   · 标签自动去重、去空、加 # 前缀校验
+//
+// 这些规则如果写进仓储，换存储实现时会被迫重写一遍 —— 而重写时
+// 一定会漏掉某一条（因为没人记得全）。
+//
+// ── 返回值的设计 ─────────────────────────
+//
+// 所有方法返回 [ok, 数据或错误]。不抛异常（语言没有 try/catch）。
+// 这样调用方每一处都必须显式处理失败 —— 而「必须处理」正是对业务
+// 错误最合适的态度（它们是正常流程的一部分，不是意外）。
+
+import "../model/post.xle"
+import "../repository/post_repo.xle"
+
+class PostService {
+    repo: PostRepository
+
+    // 审计日志（本示例用内存）。
+    audit: Array
+
+    // 是否已装配完成。见 controllerReady() 的说明。
+    ready: Bool
+
+    constructor(repo: PostRepository) {
+        self.repo  = repo
+        self.audit = []
+        self.ready = false
+    }
+
+    // ── 创建 ──────────────────────────────────
+
+    // 创建一篇文章。返回 [ok, Post, error]。
+    fn create(title: String, body: String, author: String, tags: Array, status: String) -> Array {
+        let p = new Post(title, body, author)
+        p.tags   = self.normalizeTags(tags)
+        p.status = status
+
+        // 校验
+        let bad = p.validate()
+        if (len(bad) > 0) {
+            return [false, p, bad]
+        }
+
+        // 业务规则：标题不能重复
+        if (self.titleTaken(title, 0)) {
+            return [false, p, "标题 `" + title + "` 已被使用"]
+        }
+
+        // 业务规则：直接发布时正文不能为空
+        if (p.status == "published" && len(p.body) == 0) {
+            return [false, p, "已发布的文章正文不能为空"]
+        }
+
+        let id = self.repo.insert(p)
+        self.log("create", id, "创建文章：" + title)
+        return [true, p, ""]
+    }
+
+    // ── 更新 ──────────────────────────────────
+
+    // 更新。返回 [ok, Post, error]。
+    fn update(id: Int, title: String, body: String, author: String,
+              tags: Array, status: String) -> Array {
+        if (!self.repo.exists(id)) {
+            return [false, new Post("", "", ""), "文章 #" + toString(id) + " 不存在"]
+        }
+        let old = self.repo.findById(id)
+
+        let p = new Post(title, body, author)
+        p.id     = id
+        p.tags   = self.normalizeTags(tags)
+        p.status = status
+        p.createdAt = old.createdAt
+
+        let bad = p.validate()
+        if (len(bad) > 0) {
+            return [false, p, bad]
+        }
+        // 标题查重时排除自己
+        if (self.titleTaken(title, id)) {
+            return [false, p, "标题 `" + title + "` 已被其它文章使用"]
+        }
+        if (p.status == "published" && len(p.body) == 0) {
+            return [false, p, "已发布的文章正文不能为空"]
+        }
+
+        let r = self.repo.update(p)
+        if (r[0] != true) {
+            return [false, p, toString(r[1])]
+        }
+
+        // ── 状态迁移要单独记审计 ────────────────
+        //
+        // 因为「草稿 → 发布」是一个不可逆的业务动作（会对外可见），
+        // 而「改了个错别字」不是。两者的审计粒度不同。
+        if (old.status != p.status) {
+            self.log("publish", id, "状态 " + old.status + " → " + p.status)
+        }
+        self.log("update", id, "更新文章：" + title)
+        return [true, p, ""]
+    }
+
+    // ── 删除 ──────────────────────────────────
+
+    fn remove(id: Int) -> Array {
+        if (!self.repo.exists(id)) {
+            return [false, "文章 #" + toString(id) + " 不存在"]
+        }
+        let p = self.repo.findById(id)
+        let r = self.repo.remove(id)
+        if (r[0] != true) {
+            return [false, toString(r[1])]
+        }
+        self.log("delete", id, "删除[" + p.status + "]文章：" + p.title)
+        return [true, ""]
+    }
+
+    // ── 查询 ──────────────────────────────────
+
+    fn findById(id: Int) -> Post {
+        return self.repo.findById(id)
+    }
+
+    fn list(offset: Int, limit: Int) -> Array {
+        return self.repo.findPage(offset, limit)
+    }
+
+    fn listByStatus(status: String) -> Array {
+        return self.repo.findByStatus(status)
+    }
+
+    fn listByTag(tag: String) -> Array {
+        return self.repo.findByTag(tag)
+    }
+
+    // ── 内部规则 ──────────────────────────────
+
+    // 标题是否已被占用（排除 excludeId 自己）。
+    fn titleTaken(title: String, excludeId: Int) -> Bool {
+        // ── 比较前先归一化 ────────────────────
+        //
+        // 因为「Hello」和「hello 」在业务上应该算重复（用户不会
+        // 觉得这是两篇文章）。归一化规则：去首尾空白 + 全部小写。
+        //
+        // 注意这只用于**查重**，实际存储保留原文 —— 否则用户写的
+        // 「Hello World」会变成「hello world」，看起来像 bug。
+        let needle = strLower(strTrim(title))
+        let all = self.repo.findAll()
+        var i = 0
+        while i < len(all) {
+            let p: Post = all[i]
+            if (p.id != excludeId) {
+                if (strLower(strTrim(p.title)) == needle) {
+                    return true
+                }
+            }
+            i = i + 1
+        }
+        return false
+    }
+
+    // 标签归一化：去空、去重、去 # 前缀、保序。
+    fn normalizeTags(raw: Array) -> Array {
+        let out = []
+        var i = 0
+        while i < len(raw) {
+            let t: String = raw[i]
+            var v = strTrim(t)
+            if (strStarts(v, "#")) {
+                v = strSub(v, 1, len(v))
+                v = strTrim(v)
+            }
+            if (len(v) > 0) {
+                if (!postHasTag(out, v)) {
+                    arrPush(out, v)
+                }
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    fn log(action: String, id: Int, detail: String) {
+        arrPush(self.audit, action + " #" + toString(id) + " " + detail)
+    }
+
+    fn auditLines() -> Array {
+        return self.audit
+    }
+
+    // 标记服务已装配完成（由 main 的装配流程调用）。
+    //
+    // ── 为什么需要这个方法 ──────────────────
+    //
+    // 因为构造函数只保证「字段都赋了值」，不保证「依赖的组件能工作」。
+    // 真实项目里这里会做「预热」（加载缓存、校验数据库连接）。本示例
+    // 没有外部依赖，所以只是一个标记位 —— 但保留这个位置，让「装配
+    // 完成」这个动作有地方可放。
+    fn controllerReady() -> Bool {
+        self.ready = true
+        return true
+    }
+
+    fn describe() -> String {
+        return "PostService(" + self.repo.describe() + ", " +
+               toString(len(self.audit)) + " 审计记录)"
+    }
+}

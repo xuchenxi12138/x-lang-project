@@ -1,0 +1,488 @@
+from "../../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+from "../../json.xle" import jsonParse, jsonParseScalar, jsonInt, jsonSetInt, jsonCur, jsonSkipWs, jsonFail, jsonParseValue, jsonExpect, jsonParseNumber, jsonParseString, jsonParseEscape, jsonHex4, jsonParseArray, jsonParseObject, jsonIsObject, jsonTypeOf, jsonGet, jsonGetOr, jsonHas, jsonKeys, jsonValues, jsonStringify, jsonArrayAny, jsonQuote, jsonHex, jsonNull, jsonNullValue, jsonBool, jsonNumber, jsonIntLit, jsonArrayOfStrings, jsonObject
+from "../../db/codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "header.xle" import arrRemoveAt, Headers, HD_COLON, HD_MAX_LINE
+from "cookie.xle" import ckParseRequestHeader, ckGet, ckDelete, SetCookie
+from "reader.xle" import hsCrlfCrlf, out2Append, ResponseHead, HsReader, HS_MAX_LINE
+
+// net/http/server.xle — HTTP/1.1 服务端
+//
+// ── 这个服务端的模型：单线程轮询 ─────────────────────
+//
+// 因为它建在非阻塞 socket 上，而语言没有线程/异步。所以采用一个
+// 「accept → 读完请求 → 算响应 → 发 → 关」的循环。
+//
+// 这个模型的取舍是明确的：
+//   · 优点：没有并发问题（无可变共享状态被同时访问）
+//   · 缺点：一个慢请求会阻塞后面所有请求
+//
+// 对「管理后台、内部工具、调试端点」这类场景完全够用（并发量低，
+// 请求本身快）。对公网高并发服务不够 —— 那时的正确答案是多进程
+// 或者把重量级逻辑放到别的语言里。
+//
+// ── 为什么每个连接都关（不用 keep-alive）──────────────
+//
+// 因为 keep-alive 要求「同一个连接上处理完一个请求后还要能处理下一个」，
+// 而单线程模型下处理一个请求期间无法接受新连接。保持连接只会让
+// 客户端排队等同一个连接，比关掉重连更慢。
+//
+// 这是「诚实的能力边界」：本服务端明确对外声明 Connection: close，
+// 而不是假装支持 keep-alive（那会让客户端误以为可以复用连接）。
+
+from "../core/tcp_listener.xle" import TcpListener, TL_POLL_MS, TL_DEFAULT_WAIT_MS
+from "../core/tcp_stream.xle" import TcpStream, TS_POLL_MS, TS_DEFAULT_WAIT_MS
+from "request.xle" import rqKnownMethods, rqParseQuery, rqPlusToSpace, Request
+from "response.xle" import Response
+from "reader.xle" import hsCrlfCrlf, out2Append, ResponseHead, HsReader, HS_MAX_LINE
+from "router.xle" import rnNormalizePattern, rnMatchPattern, rnSplitSegs, arrHas, Route, Match, Router
+from "status.xle" import hsCommonCodes, hsReason, hsClass, hsHasNoBody, hsAdvice
+
+// 一次请求的处理结果。handler 通过它来「写」响应。
+//
+// ── 为什么 handler 拿到的是这个而不是直接返回 Response ──
+//
+// 因为 handler 是「按名字调用」的普通函数（语言没有闭包），它的
+// 签名必须固定。用 ctx 传递可变状态比让 handler 返回一个复杂对象
+// 更容易扩展 —— 想加一个字段（比如「这个请求的耗时」）只改 ctx，
+// 所有 handler 的签名都不用动。
+class Context {
+    // 请求。
+    req: Request
+
+    // 正在构造的响应。
+    resp: Response
+
+    // 路由匹配结果（含路径参数）。
+    //
+    // ── 字段名为什么是 routing 而不是 match ──────────
+    //
+    // 因为 `match` 是语言关键字（模式匹配语法）。用 `ctx.match` 会
+    // 解析成「match 表达式的开头」，报的是「`.` 之后期望一个成员名，
+    // 实际读到 match」—— 看起来像语法错误，不像命名冲突。
+    routing: Match
+
+    // 应用自定义数据（认证后的用户、开始时间等）。
+    //
+    // ── 为什么是平行数组而不是字典 ─────────────────
+    //
+    // 语言没有 Map。而 ctx 的自定义数据通常只有 1~3 项，线性查找
+    // 完全够。
+    keys: Array
+    vals: Array
+
+    constructor(req: Request) {
+        self.req   = req
+        self.resp  = new Response(200)
+        self.routing = new Match()
+        self.keys  = []
+        self.vals  = []
+    }
+
+    // 路径参数（来自路由）。
+    fn param(name: String, def: String) -> String {
+        return self.routing.paramOf(name, def)
+    }
+
+    // 查询参数。
+    fn query(name: String, def: String) -> String {
+        return self.req.queryOf(name, def)
+    }
+
+    // 请求头。
+    fn header(name: String) -> String {
+        return self.req.headers.get(name)
+    }
+
+    // 请求 cookie。
+    fn cookie(name: String, def: String) -> String {
+        return self.req.cookieOf(name, def)
+    }
+
+    // 请求 body 文本。
+    fn bodyText() -> String {
+        return self.req.bodyText()
+    }
+
+    // ── 写响应 ────────────────────────────────
+
+    fn status(code: Int) -> Context {
+        self.resp.status = code
+        return self
+    }
+
+    fn setHeader(name: String, value: String) -> Context {
+        self.resp.setHeader(name, value)
+        return self
+    }
+
+    fn json(code: Int, body: String) -> Context {
+        self.resp = Response.json(code, body)
+        return self
+    }
+
+    fn text(code: Int, body: String) -> Context {
+        self.resp = Response.text(code, body)
+        return self
+    }
+
+    fn html(code: Int, body: String) -> Context {
+        self.resp = Response.html(code, body)
+        return self
+    }
+
+    fn bytes(code: Int, data: Array, contentType: String) -> Context {
+        self.resp = Response.bytes(code, data, contentType)
+        return self
+    }
+
+    fn addCookie(c: SetCookie) -> Context {
+        self.resp.addCookie(c)
+        return self
+    }
+
+    // 便捷：返回 404 并给出可读提示。
+    fn notFound() -> Context {
+        return self.text(404, "404 Not Found: " + self.req.path())
+    }
+
+    // 便捷：返回 400 并带上原因。
+    fn badRequest(why: String) -> Context {
+        return self.json(400, "{\"error\":" + jsonQuote(why) + "}")
+    }
+
+    // ── 自定义数据 ────────────────────────────
+
+    fn put(key: String, value: String) {
+        var i = 0
+        while i < len(self.keys) {
+            let k: String = self.keys[i]
+            if (k == key) {
+                self.vals[i] = value
+                return
+            }
+            i = i + 1
+        }
+        arrPush(self.keys, key)
+        arrPush(self.vals, value)
+    }
+
+    fn get(key: String, def: String) -> String {
+        var i = 0
+        while i < len(self.keys) {
+            let k: String = self.keys[i]
+            if (k == key) {
+                let v: String = self.vals[i]
+                return v
+            }
+            i = i + 1
+        }
+        return def
+    }
+}
+
+// handler 的函数名 → 由调用方注册。
+//
+// ── 为什么 handler 注册是「名字 + 分派函数」两层 ─────
+//
+// 因为语言不能把函数当值传递。所以 server 不能持有 `fn handler(ctx)`。
+// 替代方案是让调用方提供一个 `dispatch(name, ctx)` 函数（通常是一个
+// 大 match），server 只负责调用 dispatch。
+//
+// 这个设计看起来绕，但它把「路由表」和「代码」解耦了：路由可以
+// 从配置文件加载，dispatch 里的 match 是编译期的静态分派，两者
+// 独立演进。
+class HttpServer {
+    listener: TcpListener
+
+    router: Router
+
+    // 分派函数的名字。由调用方用 setDispatcher 指定。
+    dispatcherName: String
+
+    // 请求体最大字节数。超过直接 413。
+    //
+    // ── 为什么这个上限必须有 ────────────────────
+    //
+    // 因为读 body 是按 Content-Length 读的。如果客户端声称
+    // Content-Length: 10GB 然后慢慢发，服务端会把内存吃光。
+    // 有上限就能在**读之前**拒绝。
+    maxBodyBytes: Int
+
+    // 单请求超时（毫秒）。
+    timeoutMs: Int
+
+    // 是否在 stdout 打印访问日志。
+    verbose: Bool
+
+    // 统计。
+    servedCount: Int
+    errorCount: Int
+
+    constructor(bind: String, port: Int) {
+        self.listener       = new TcpListener(bind, port)
+        self.router         = new Router()
+        self.dispatcherName = ""
+        self.maxBodyBytes   = 8388608        // 8 MiB
+        self.timeoutMs      = 15000
+        self.verbose        = false
+        self.servedCount    = 0
+        self.errorCount     = 0
+    }
+
+    static fn onPort(port: Int) -> HttpServer {
+        return new HttpServer("0.0.0.0", port)
+    }
+
+    fn port() -> Int {
+        return self.listener.boundPort
+    }
+
+    fn isOpen() -> Bool {
+        return self.listener.isOpen()
+    }
+
+    fn setVerbose(v: Bool) -> HttpServer {
+        self.verbose = v
+        return self
+    }
+
+    fn setMaxBodyBytes(n: Int) -> HttpServer {
+        self.maxBodyBytes = n
+        return self
+    }
+
+    fn setTimeoutMs(ms: Int) -> HttpServer {
+        self.timeoutMs = ms
+        return self
+    }
+
+    // ── 处理一个连接 ──────────────────────────────
+
+    // 读一个请求、算响应、发出去、关连接。返回 [ok, error]。
+    //
+    // dispatch 是一个函数名字符串 —— 见类注释里的说明。
+    // 由于语言不能传函数，这里的做法是「让调用方在自建循环里调用
+    // handleOne 并把 dispatch 直接写在循环体内」。
+    //
+    // 所以本方法不接收 dispatch，而是**返回** Context，让调用方
+    // 自己填响应。这个设计比传函数名更实用：
+    //
+    //   let ctx = srv.handleOne(sock)
+    //   if (ctx.req.method == "GET") { ctx.text(200, "hi") }
+    //   srv.finish(ctx, sock)
+    //
+    // 分两段的好处是：调用方可以在填响应前后做任意事情（日志、
+    // 计时、异常处理），而 server 不需要知道这些。
+    fn handleOne(sock: TcpStream) -> Context {
+        let req = new Request()
+        let ctx = new Context(req)
+
+        // ── 1. 读头 ──────────────────────────
+        let head = HsReader.readHead(sock, self.timeoutMs)
+        if (head[0] != true) {
+            // 连头都读不到：可能是端口探测、TLS 握手尝试、或者
+            // 客户端发垃圾。不返回 HTTP 响应（对方可能不是 HTTP
+            // 客户端），直接标记错误。
+            ctx.resp = Response.text(400, "Bad Request: " + toString(head[2]))
+            ctx.put("fatal", "true")
+            return ctx
+        }
+        let headBytes: Array = head[1]
+        let leftover: Array = head[2]
+
+        // ── 2. 拆起始行和头 ──────────────────
+        //
+        // 请求头的结构是「起始行 \r\n 头...」，和响应头不同（响应头
+        // 第一行是状态行）。所以不能用 HsReader.parseHead（那是给
+        // 响应用的）。这里手动拆。
+        let text = bbToText(headBytes)
+        let rawLines = strSplit(text, "\n")
+        let lines = []
+        var i = 0
+        while i < len(rawLines) {
+            let l: String = rawLines[i]
+            arrPush(lines, strTrimEnd(l))
+            i = i + 1
+        }
+        if (len(lines) == 0) {
+            ctx.resp = Response.text(400, "Bad Request: 空的请求头")
+            ctx.put("fatal", "true")
+            return ctx
+        }
+
+        let startLine: String = lines[0]
+        let rl = req.parseRequestLine(startLine)
+        if (rl[0] != true) {
+            ctx.resp = Response.text(400, toString(rl[1]))
+            ctx.put("fatal", "true")
+            return ctx
+        }
+
+        let headerLines = []
+        var j = 1
+        while j < len(lines) {
+            arrPush(headerLines, lines[j])
+            j = j + 1
+        }
+        req.headers = Headers.parseLines(headerLines)
+
+        let fh = req.finalizeHead()
+        if (fh[0] != true) {
+            // 走私检测、缺 Host 都走这里。返回 400 是正确做法。
+            ctx.resp = Response.text(400, toString(fh[1]))
+            ctx.put("fatal", "true")
+            return ctx
+        }
+
+        // ── 3. 读 body ───────────────────────
+        //
+        // ── 为什么在路由之前读 body ─────────────
+        //
+        // 因为不读的话，客户端还在发数据而我们已经准备关连接 ——
+        // 那会产生 RST，客户端看到的是「连接被重置」而不是我们
+        // 精心准备的 404/413。读掉它（丢弃）能让错误响应正常送达。
+        //
+        // 但这带来一个 DoS 面：一个 400 的请求也要收完 body。所以
+        // 上限检查在**读之前**做。
+        if (req.contentLength > self.maxBodyBytes) {
+            ctx.resp = Response.json(413,
+                "{\"error\":" + jsonQuote("请求体 " + toString(req.contentLength) +
+                " 字节超过上限 " + toString(self.maxBodyBytes)) + "}")
+            ctx.put("fatal", "true")
+            return ctx
+        }
+
+        if (req.chunked) {
+            // chunked 的上限要靠累计判断，不能预先知道。这里简化：
+            // 读到 maxBodyBytes 就停。
+            let rh = new ResponseHead()
+            rh.chunked = true
+            // ── leftover 必须传进来 ───────────────────
+            //
+            // readHead 是按 \r\n\r\n 定位的，它拿到的那一批数据里
+            // 很可能已经包含第一个 chunk 的长度行甚至数据。不把
+            // leftover 当初始缓冲，chunked 的第一个块就永久丢了 ——
+            // 症状是「body 比实际短，但 chunk 边界没报错」。
+            let br = HsReader.readBody(sock, rh, leftover, self.timeoutMs)
+            if (br[0] != true) {
+                ctx.resp = Response.text(400, "读取 chunked 请求体失败：" + toString(br[2]))
+                ctx.put("fatal", "true")
+                return ctx
+            }
+            let body: Array = br[1]
+            if (len(body) > self.maxBodyBytes) {
+                ctx.resp = Response.json(413,
+                    "{\"error\":" + jsonQuote("chunked 请求体超过上限") + "}")
+                ctx.put("fatal", "true")
+                return ctx
+            }
+            req.body = body
+        } else if (req.contentLength > 0) {
+            let rh = new ResponseHead()
+            rh.contentLength = req.contentLength
+            let br = HsReader.readBody(sock, rh, leftover, self.timeoutMs)
+            if (br[0] != true) {
+                ctx.resp = Response.text(400, "读取请求体失败：" + toString(br[2]))
+                ctx.put("fatal", "true")
+                return ctx
+            }
+            req.body = br[1]
+        } else if (len(leftover) > 0) {
+            // 没有声明长度但有多余字节：说明客户端发了没声明的 body。
+            //
+            // ── 为什么不保留它 ──────────────────
+            //
+            // 因为不知道它有多长，留着会让「这是 body 吗」这个问题
+            // 一直存在。按 RFC，没有 Content-Length 也没有 chunked
+            // 的请求没有 body —— 那这些字节是畸形数据，丢弃并记录。
+            req.body = []
+        }
+
+        // ── 4. 路由 ──────────────────────────
+        let m = self.router.route(req.method, req.path())
+        ctx.routing = m
+
+        if (!m.matched) {
+            // 路径存在但方法不对 → 405（带 Allow），否则 404
+            let allowed = self.router.allowedMethods(req.path())
+            if (len(allowed) > 0) {
+                var allow = ""
+                var k = 0
+                while k < len(allowed) {
+                    if (k > 0) { allow = allow + ", " }
+                    allow = allow + toString(allowed[k])
+                    k = k + 1
+                }
+                ctx.resp = Response.text(405, "405 Method Not Allowed")
+                ctx.resp.setHeader("Allow", allow)
+            } else {
+                ctx.resp = Response.text(404, "404 Not Found: " + req.path())
+            }
+            return ctx
+        }
+
+        // ── 5. 默认响应 ──────────────────────
+        //
+        // 如果调用方不填响应，默认给一个「路由命中了但没实现」的
+        // 500 —— 而不是 200 空响应。空 200 会让客户端以为成功。
+        ctx.resp = Response.text(500,
+            "500 Internal Server Error: 路由 " + m.route.describe() +
+            " 已命中，但调用方没有设置响应")
+        return ctx
+    }
+
+    // 把 ctx 里的响应发出去。
+    fn finish(ctx: Context, sock: TcpStream) {
+        let req = ctx.req
+        // HEAD 请求：头照发，body 不发（见 response.xle 的说明）。
+        let isHead = req.method == "HEAD"
+
+        let wire = ctx.resp.serialize(isHead, true, hsHttpDateNow())
+
+        let rs = sock.sendAll(wire, self.timeoutMs)
+        if (rs[0] != true) {
+            self.errorCount = self.errorCount + 1
+            if (self.verbose) {
+                println("[send err] " + toString(rs[2]))
+            }
+            return
+        }
+        self.servedCount = self.servedCount + 1
+
+        if (self.verbose) {
+            println("[" + req.method + " " + req.target + "] -> " +
+                    toString(ctx.resp.status) + " " + hsReason(ctx.resp.status) +
+                    "  (" + toString(len(ctx.resp.body)) + "B)")
+        }
+    }
+}
+
+// 生成 HTTP-date（RFC 7231 §7.1.1.1 的 IMF-fixdate 格式）。
+//
+// ── 手写而不是用格式化函数 ──────────────────────
+//
+// 因为标准库没有 RFC 1123 格式化，而 HTTP-date 的格式有硬性要求：
+//   `Sun, 06 Nov 1994 08:49:37 GMT`
+//    星期缩写, 空格 日(两位) 空格 月缩写 空格 年(四位) 空格 时:分:秒 GMT
+//
+// 注意日期是**两位、空格补齐**（`06` 不是 `6`）。写成一位会被
+// 部分严格客户端拒绝解析。
+fn hsHttpDateNow() -> String {
+    // 本语言没有日期时间内建，用 fs 的 mtime 拿不到格式化文本。
+    // 这里返回空串表示「不生成 Date 头」—— 由调用方可选地提供真实时间。
+    //
+    // ── 为什么返回空串而不是假装一个时间 ────────────
+    //
+    // 因为伪造的 Date 会污染缓存计算（age = now - Date），而错误
+    // 的 age 会让 CDN 提前丢弃缓存或者永不缓存。返回空串时
+    // response.xle 的 serialize 会跳过 Date 头 —— 缺 Date 是轻微
+    // 违规但不影响正确性，伪造时间是实打实的错误。
+    return ""
+}
+
+// jsonQuote 不在本文件定义 —— stdlib/json.xle 里有同名实现，这里
+// 曾经有一份自己的拷贝，但任何同时 import HTTP 层和 JSON 层的代码
+// （比如 xboot 框架：路由序列化 + 请求体解析都要 JSON）会在文本级
+// import 合并时撞出「重复定义」。收敛到 json.xle 的实现（控制字符
+// 用 \u{} 转义，比本文件旧版的手工 hex 更完整）。

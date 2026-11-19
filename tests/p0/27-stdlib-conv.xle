@@ -1,0 +1,196 @@
+// ============================================================
+// std.conv —— 类型转换与格式化
+// ============================================================
+//
+// 内建只有 toInt / toFloat / toString 三个，而且都是严格的
+// （toInt("abc") 直接报错）。这一层补的是**宽松版本 + 格式化**。
+//
+// ── 为什么宽松版本是必需的 ──────────────────────────────────
+//
+// 读配置文件、解析命令行参数、处理用户输入 —— 这三个场景里
+// 「值不合法」不是 bug，是**预期内的正常情况**。此时程序要做的
+// 是退回默认值继续跑，而不是崩掉。所以 toIntOr / toFloatOr /
+// toBoolOr 这一组的存在理由不是「图省事」，是「唯一正确的行为」。
+//
+// 反过来，toBase / fromHex 这些是**严格**的：参数非法就是程序员
+// 写错了，必须 fail 掉。宽严分开是这一层最重要的设计。
+
+from std.conv import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+fn main() -> Void {
+    println("---- 宽松解析 ----")
+    // 合法输入
+    println(toIntOr("42", 0))           // 42
+    println(toIntOr(" 42 ", 0))         // 42（会 trim）
+    println(toIntOr("-7", 0))           // -7
+    println(toIntOr("+7", 0))           // 7
+    // 非法输入退回默认值，不报错 —— 这是本模块的核心价值
+    println(toIntOr("abc", -1))         // -1
+    println(toIntOr("", -1))            // -1
+    println(toIntOr("1.5", -1))         // -1（int 解析不吃小数点）
+    println(toIntOr("1a", -1))          // -1
+    println(toIntOr("-", -1))           // -1
+    println(toFloatOr("3.5", 0.0))      // 3.5
+    println(toFloatOr(" 3.5 ", 0.0))    // 3.5
+    println(toFloatOr("1e3", 0.0))      // 1000.0
+    println(toFloatOr("-2.5e-1", 0.0))  // -0.25
+    println(toFloatOr("abc", -9.0))     // -9.0
+    println(toFloatOr("1e", -9.0))      // -9.0（指数后没数字）
+    println(toFloatOr("1.2.3", -9.0))   // -9.0（两个小数点）
+    // 整数字符串也能当 float 用
+    println(toFloatOr("42", 0.0))       // 42.0
+
+    println("---- 布尔 ----")
+    // 认这些「真」的写法（大小写不敏感，会 trim）
+    println(toBool("true"))     // true
+    println(toBool("TRUE"))     // true
+    println(toBool("True"))     // true
+    println(toBool("yes"))      // true
+    println(toBool("Y"))        // true
+    println(toBool("on"))       // true
+    println(toBool("1"))        // true
+    println(toBool(" 1 "))      // true
+    // 其余一律假 —— 注意 toBool 不认识的不猜，直接给 false
+    println(toBool("false"))    // false
+    println(toBool("no"))       // false
+    println(toBool("0"))        // false
+    println(toBool(""))         // false
+    println(toBool("maybe"))    // false
+
+    // toBoolOr 才区分「明确是假」与「看不懂」
+    println(toBoolOr("false", true))    // false（明确假）
+    println(toBoolOr("no", true))       // false
+    println(toBoolOr("off", true))      // false
+    println(toBoolOr("0", true))        // false
+    println(toBoolOr("", true))         // false（空串算假）
+    println(toBoolOr("maybe", true))    // true（看不懂 → 默认值）
+    println(toBoolOr("maybe", false))   // false（看不懂 → 默认值）
+
+    println(boolToString(true))         // true
+    println(boolToString(false))        // false
+
+    println("---- 进制转换 ----")
+    println(toBase(255, 16))     // ff
+    println(toBase(255, 2))      // 11111111
+    println(toBase(255, 8))      // 377
+    println(toBase(0, 16))       // 0
+    println(toBase(1, 2))        // 1
+    // 负数带前导 '-'，且不受 C 的负数取模影响
+    println(toBase(-255, 16))    // -ff
+    println(toBase(-1, 2))       // -1
+    // 36 进制用满 0-9a-z
+    println(toBase(35, 36))      // z
+    println(toBase(36, 36))      // 10
+    println(toHex(255))          // ff
+    println(toHex(4096))         // 1000
+    println(toBin(5))            // 101
+    println(toOct(64))           // 100
+
+    println("---- 进制解析 ----")
+    println(fromHex("ff"))       // 255
+    println(fromHex("FF"))       // 255（大小写都认）
+    println(fromHex("0xff"))     // 255（忽略 0x 前缀）
+    println(fromHex("0XFF"))     // 255
+    println(fromHex(" 10 "))     // 16
+    println(fromHex("0"))        // 0
+    println(fromBin("101"))      // 5
+    println(fromBin("11111111")) // 255
+    println(fromBin("0"))        // 0
+    // 往返一致
+    println(fromHex(toHex(12345)))     // 12345
+    println(fromBin(toBin(97)))        // 97
+
+    println("---- 定宽数字 ----")
+    println("[" + padZero(7, 3) + "]")      // [007]
+    println("[" + padZero(42, 4) + "]")     // [0042]
+    println("[" + padZero(12345, 3) + "]")  // [12345]（已够宽不截断）
+    println("[" + padZero(0, 2) + "]")      // [00]
+    // 负号要留在外面，不能被补零吃掉 —— 这是最容易写错的一处
+    println("[" + padZero(-7, 3) + "]")     // [-007]
+    println("[" + padZero(-7, 5) + "]")     // [-0007]
+
+    println("---- 定点小数 ----")
+    println(fixed(3.14159, 2))    // 3.14
+    println(fixed(3.14159, 0))    // 3
+    println(fixed(3.999, 0))      // 4（四舍五入，不是截断）
+    println(fixed(2.5, 0))        // 3（round 是「四舍五入远离零」）
+    println(fixed(-3.14159, 2))   // -3.14
+    println(fixed(0.0, 2))        // 0.00
+    // 关键用例：0.1+0.2 的浮点误差不该出现在报表里
+    println(fixed(0.1 + 0.2, 2))  // 0.30
+    // 整数部分要正确补零，否则 1.5 会打成 "1.5" 而不是 "01.50"
+    println(fixed(1.5, 2))        // 1.50
+    println(fixed(0.05, 1))       // 0.1
+    println(fixed(1.0, 3))        // 1.000
+    // 小数位越界会被夹住，不报错
+    println(fixed(1.5, -1))       // 2
+    println(fixed(1.0, 20))       // 1.000000000000000
+
+    println("---- 千分位 ----")
+    println(thousands(1234567))   // 1,234,567
+    println(thousands(1000))      // 1,000
+    println(thousands(999))       // 999
+    println(thousands(0))         // 0
+    println(thousands(-1234567))  // -1,234,567（负号在外面）
+    println(thousands(123))       // 123
+    println(thousands(1234))      // 1,234
+
+    println("---- 百分比 ----")
+    println(percent(0.7532, 1))   // 75.3%
+    println(percent(1.0, 0))      // 100%
+    println(percent(0.0, 2))      // 0.00%
+    println(percent(-0.5, 0))     // -50%
+
+    println("---- 字节可读化 ----")
+    println(bytes(512.0))         // 512 B
+    println(bytes(1024.0))        // 1.0 KB
+    println(bytes(1536.0))        // 1.5 KB
+    println(bytes(1048576.0))     // 1.0 MB
+    println(bytes(1073741824.0))  // 1.0 GB
+    // B 不带小数，KB 起带一位
+    println(bytes(0.0))           // 0 B
+    println(bytes(-2048.0))       // -2.0 KB
+
+    println("---- 数组与字符串 ----")
+    let xs = array(3, 0)
+    xs[0] = 1
+    xs[1] = 2
+    xs[2] = 3
+    println(numbersToString(xs))       // 1,2,3
+    println(numbersToString(array(0, 0)))   // 空行
+
+    let parsed = stringToNumbers("1.5, 2.5 ,3")
+    println(len(parsed))          // 3
+    println(parsed[0])            // 1.5
+    println(parsed[2])            // 3.0
+    // 中间的空项会被跳过，不报错
+    let parsed2 = stringToNumbers("1,,2")
+    println(len(parsed2))         // 2
+    println(len(stringToNumbers("")))   // 0
+
+    let ints = stringToInts("10, 20 ,30")
+    println(len(ints))            // 3
+    println(ints[1])              // 20
+    println(len(stringToInts("1,,2")))  // 2
+
+    println("---- 字符判定 ----")
+    println(isSpace(" "))         // true
+    println(isSpace("\t"))        // true
+    println(isSpace("\n"))        // true
+    println(isSpace("a"))         // false
+    // 全角空格不是 ASCII 空白
+    println(isSpace("　"))        // false
+    println(isPrintableAscii("a"))    // true
+    println(isPrintableAscii(" "))    // true
+    println(isPrintableAscii("~"))    // true
+    println(isPrintableAscii("张"))   // false（非 ASCII）
+    println(isPrintableAscii("ab"))   // false（不是单字符）
+    println("[" + escapeChar("\n") + "]")   // [\n]
+    println("[" + escapeChar("\t") + "]")   // [\t]
+    println("[" + escapeChar("\r") + "]")   // [\r]
+    // 其它控制字符走 \u{..}
+    println("[" + escapeChar(strFromCode(7)) + "]")    // [\u{7}]
+    // 普通字符原样
+    println("[" + escapeChar("a") + "]")    // [a]
+    println("[" + escapeChar("张") + "]")   // [张]
+}

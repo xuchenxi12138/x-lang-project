@@ -1,0 +1,72 @@
+// ui/control/radio.xle — 单选框（圆形 + 中心点）
+//
+// ── 单个 Radio 只是「一行的画法」 ────────────────
+//
+// 它身上的 on 字段在 RadioGroup 的场景下是**由组算出来的**，
+// 不是自己维护的状态。这不是设计缺陷，而是刻意为之：
+//
+// 单选语义是「一组里选一个」，选中状态属于组。如果每个 Radio
+// 都真持有自己的 on，就有 N 份必须同步的状态，而「两个同时
+// 选中」这种 bug 只在特定操作顺序下出现。
+//
+// 只有在你真的想单独画一个圆圈（比如一个图例）时，才直接用
+// Radio 并自己管 on。
+
+from "toggle.xle" import Toggle, CK_BOX, CK_GAP
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+class Radio extends Toggle {
+    constructor(r: Rect, label: String, on: Bool) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.label     = label
+        self.on        = on
+        self.tintColor = UI_NONE
+        self.style     = Style.plain()
+    }
+
+    static fn of(r: Rect, label: String, on: Bool) -> Radio {
+        return new Radio(r, label, on)
+    }
+
+    fn drawIndicator(th: Theme, b: Rect) {
+        var ring = th.border
+        var dot = th.accent
+        var inner = th.surface
+
+        if (self.on && self.enabled) {
+            ring = th.accent
+        } else if (self.hovered && self.enabled) {
+            inner = th.surfaceHover
+        }
+
+        if (!self.enabled) {
+            ring = th.border
+            dot = th.disabled
+            inner = th.surface
+        }
+
+        // 外圈：实心圆 + 内缩一像素的面板色圆，视觉上等于「描边圆」。
+        //
+        // ── winEllipse 收的是外接矩形 ─────────────────
+        //
+        // 签名是 (x, y, w, h, color)，不是圆心 + 半径。第一版按
+        // 圆心半径写，结果是「半径 8 的圆」被解释成「宽 8 高 8 的
+        // 椭圆放在原点」，整个指示器跑到左上角去了。
+        winEllipse(b.x, b.y, b.w, b.h, ring)
+        winEllipse(b.x + 1, b.y + 1, b.w - 2, b.h - 2, inner)
+
+        if (!self.on) { return }
+
+        // 中心点：直径取内圈的一半，留出足够留白。
+        let dw = (b.w - 2) / 2
+        if (dw < 2) { dw = 2 }
+        let off = (b.w - dw) / 2
+        winEllipse(b.x + off, b.y + off, dw, dw, dot)
+    }
+}

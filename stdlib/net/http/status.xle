@@ -1,0 +1,180 @@
+// net/http/status.xle — HTTP 状态码
+//
+// ── 为什么状态码需要单独一个文件 ───────────────────
+//
+// 因为「返回正确的状态码」是 HTTP 服务最容易做错的部分，而错误的
+// 状态码会让客户端的行为完全偏离预期，且**不报错**。几个真实的高
+// 频错误：
+//
+//   用 200 返回错误   → 客户端/网关/监控全部认为成功，重试机制失效
+//   用 302 做 POST 重定向 → 浏览器把 POST 改成 GET，body 丢了
+//   用 400 表示认证失败  → 客户端不会去刷新 token，只是报「参数错」
+//   用 500 表示参数错误  → 触发告警风暴，掩盖真正的服务故障
+//
+// 本文件的价值不是「列出所有码」（那到处都有），而是**给每个码
+// 一句「什么时候该用它、什么时候不该用」**。
+
+// 常见状态码。返回名字的双元素数组：[码, 原因短语]。
+//
+// ── 为什么用函数返回数组而不是常量 ─────────────────
+//
+// 因为顶层 const 只接受标量字面量（数组常量会被编译器拒绝）。
+// 这是语言的既有约束，不是这里的取舍。
+fn hsCommonCodes() -> Array {
+    return [
+        [100, "Continue"],
+        [200, "OK"],
+        [201, "Created"],
+        [202, "Accepted"],
+        [204, "No Content"],
+        [206, "Partial Content"],
+        [301, "Moved Permanently"],
+        [302, "Found"],
+        [303, "See Other"],
+        [304, "Not Modified"],
+        [307, "Temporary Redirect"],
+        [308, "Permanent Redirect"],
+        [400, "Bad Request"],
+        [401, "Unauthorized"],
+        [403, "Forbidden"],
+        [404, "Not Found"],
+        [405, "Method Not Allowed"],
+        [406, "Not Acceptable"],
+        [408, "Request Timeout"],
+        [409, "Conflict"],
+        [410, "Gone"],
+        [411, "Length Required"],
+        [412, "Precondition Failed"],
+        [413, "Payload Too Large"],
+        [414, "URI Too Long"],
+        [415, "Unsupported Media Type"],
+        [416, "Range Not Satisfiable"],
+        [422, "Unprocessable Entity"],
+        [429, "Too Many Requests"],
+        [431, "Request Header Fields Too Large"],
+        [500, "Internal Server Error"],
+        [501, "Not Implemented"],
+        [502, "Bad Gateway"],
+        [503, "Service Unavailable"],
+        [504, "Gateway Timeout"],
+        [505, "HTTP Version Not Supported"]
+    ]
+}
+
+// 码 → 原因短语。未知码返回空串（调用方据此决定是否自己给短语）。
+//
+// ── 为什么未知码返回空串而不是 "Unknown" ──────────
+//
+// 因为 "Unknown" 会被原样写进响应行（`HTTP/1.1 599 Unknown`），
+// 而这看起来像我们认识 599 一样。返回空串让调用方明确知道「这里
+// 需要它自己给一个短语」，从而不会发出一个语义含糊的响应。
+fn hsReason(code: Int) -> String {
+    let all = hsCommonCodes()
+    var i = 0
+    while i < len(all) {
+        let row: Array = all[i]
+        let c: Int = row[0]
+        if (c == code) {
+            let r: String = row[1]
+            return r
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 码的类别（1~5）。
+//
+// ── 用途：不要用它做业务判断 ────────────────────
+//
+// 「2xx 就是成功」这个简化有反例：202 表示「已接受但还没处理」，
+// 客户端必须轮询；206 是部分内容，只拿到一段数据。用 hsClass(code)
+// == 2 判断「业务成功」会把它们误判成完整成功。
+//
+// 它适合的场景是「兜底分类」：日志聚合、监控告警分级。
+fn hsClass(code: Int) -> Int {
+    return code / 100
+}
+
+// 该状态码的响应是否默认不带 body。
+//
+// ── 为什么这个很重要 ───────────────────────────
+//
+// 204 和 304 **禁止**带 body（RFC 7230 §3.3.2）。带了会怎样：
+//
+//   · 严格客户端（Go、Rust 的 http 库）会报「协议错误」
+//   · 宽松客户端会把 body 当成**下一个响应的开头**（keep-alive 复用
+//     连接时），于是所有后续响应错位
+//
+// 后一种症状是「偶发地整个页面乱掉」，且只在高并发下出现。
+fn hsHasNoBody(code: Int) -> Bool {
+    if (code == 204) { return true }
+    if (code == 304) { return true }
+    if (code >= 100 && code < 200) { return true }
+    return false
+}
+
+// 一句话使用建议。给错误处理代码当注释用。
+fn hsAdvice(code: Int) -> String {
+    if (code == 200) {
+        return "成功且有响应体。注意：不要在错误响应上用它 —— 那会让重试、监控、客户端 catch 全部失效"
+    }
+    if (code == 201) {
+        return "资源已创建。应同时发 Location 头指向新资源"
+    }
+    if (code == 204) {
+        return "成功但没有响应体（PUT/DELETE 的典型返回）。禁止带 body"
+    }
+    if (code == 301) {
+        return "永久重定向。浏览器和搜索引擎会缓存 —— 用在临时跳转上会导致「改了配置但用户进不来」"
+    }
+    if (code == 302) {
+        return "临时重定向。注意：浏览器会把 POST 改成 GET（这是历史包袱），要保方法用 307"
+    }
+    if (code == 304) {
+        return "内容未变化（配合 ETag / Last-Modified）。禁止带 body"
+    }
+    if (code == 307) {
+        return "临时重定向且**保持原方法**。POST 重定向必须用它或 308"
+    }
+    if (code == 400) {
+        return "请求本身有错（格式、参数类型）。不要用它表示「没登录」或「没权限」"
+    }
+    if (code == 401) {
+        return "未认证（缺凭证或凭证失效）。必须带 WWW-Authenticate 头告诉客户端怎么认证"
+    }
+    if (code == 403) {
+        return "已认证但无权限。与 401 的区别：401 是「你是谁我不知道」，403 是「我知道你是谁，但不给」"
+    }
+    if (code == 404) {
+        return "资源不存在。不要用它来掩盖 403（那会让攻击者通过码差异探测资源是否存在）"
+    }
+    if (code == 405) {
+        return "方法不允许。必须带 Allow 头列出支持的方法"
+    }
+    if (code == 409) {
+        return "状态冲突（并发修改、唯一键重复）。客户端应重读后重试"
+    }
+    if (code == 413) {
+        return "请求体过大。注意：返回它之前应该先看 Content-Length 拒绝，而不是读完再拒（否则内存已被撑爆）"
+    }
+    if (code == 422) {
+        return "格式正确但语义错误（校验失败）。比 400 更精确，适合表单校验"
+    }
+    if (code == 429) {
+        return "限流。应带 Retry-After 头告诉客户端等多久"
+    }
+    if (code == 500) {
+        return "服务端未预期错误。不要用它表示参数错误 —— 那会触发误告警"
+    }
+    if (code == 501) {
+        return "方法/功能未实现。与 500 的区别：501 是「永远不会支持」，500 是「这次出错了」"
+    }
+    if (code == 503) {
+        return "暂时不可用（过载、维护）。应带 Retry-After。它会让客户端/网关自动摘流量，比 500 更合适"
+    }
+    if (code == 504) {
+        return "网关等上游超时。是网关产生的，不是上游自己发的"
+    }
+    return ""
+}

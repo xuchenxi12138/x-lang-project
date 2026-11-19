@@ -1,0 +1,59 @@
+// ui/layout/card.xle — 卡片（圆角 + 阴影的浮起分区）
+//
+// 圆角 + 阴影，没有标题栏。用于「一组相关信息」，比如仪表盘上的
+// 单个指标块。
+//
+// ── 和 Panel 的分工 ────────────────────────────
+//
+// Panel 切出的是「一个工作区」，边缘是直角、有标题栏，适合放表单
+// 和列表。Card 是「一张卡片」，圆角 + 阴影让它浮在背景之上，适合
+// 并排陈列（三列指标卡、功能入口）。
+//
+// 最直观的判据：Panel 会占满可用区域，Card 通常成排出现。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+class Card extends Widget {
+    pad: Int,
+    radius: Int,
+
+    constructor(r: Rect) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.pad     = 16
+        self.radius  = 8
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect) -> Card {
+        return new Card(r)
+    }
+
+    fn content() -> Rect {
+        return Rect.inset(self.r, self.pad)
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 阴影：先画偏移圆角矩形。半径与本体一致，否则阴影的角
+        // 会比本体更方，看起来「露出一个直角」。
+        winFillRound(self.r.x + 1, self.r.y + 2,
+                     self.r.w, self.r.h, self.radius, th.scrim)
+
+        // 本体。
+        var bg = th.surface
+        if (self.hovered && self.enabled) { bg = th.surfaceHover }
+        winFillRound(self.r.x, self.r.y, self.r.w, self.r.h, self.radius, bg)
+        winBorderRound(self.r.x, self.r.y, self.r.w, self.r.h,
+                       self.radius, 1, th.border)
+    }
+}

@@ -1,0 +1,217 @@
+// ============================================================
+// std.db —— 表引擎：CRUD、WHERE、ORDER BY、聚合、事务、转义
+// ============================================================
+//
+// ── 为什么这张测试覆盖得比其它库更细 ────────────────────────
+//
+// std.db 是唯一一个「有持久状态」的标准库模块：其它模块的函数
+// 输入什么就输出什么，而这里的一次写入会影响后续所有读取。
+// 所以它出错的方式也更多：
+//
+//   · 转义漏一种字符 → 某些记录读回来字段数不对（数据静默损坏）
+//   · 排序下标偏移 1 → 直接下标越界崩溃
+//   · 删除时正序遍历 → 删一半就跳过（「删了但没删干净」）
+//   · 事务快照做成浅拷贝 → 回滚只能恢复行的列表，改过的行内容还在
+//
+// 每一条都是「看起来能跑，结果不对」那一类。所以下面每一项都
+// 断言具体的数值，而不是只打印出来看看。
+
+from std.db import dbEncode, dbDecode, dbPath, dbDataPath, dbIndexPath, dbCreate, dbColIndex, dbLoad, dbSplitRaw, dbFlush, dbInsert, dbToStr, dbResultCols, dbResultRows, dbResultCount, dbSelectAll, dbSelectCols, dbWhere, dbMatch, dbCompare, dbEq, dbLike, dbOrderBy, dbShouldSwap, dbLimit, dbOffset, dbCount, dbSum, dbAvg, dbMin, dbMax, dbCmpOrder, dbUpdate, dbDelete, dbBegin, dbCommit, dbRollback, dbIndex, dbFindDuplicate, dbInsertUnique, dbSave, dbExists, dbDrop, DB_SEP, TBL_DIR, TBL_NAME, TBL_COLS, TBL_ROWS, TBL_DIRTY, RS_COLS, TX_TBL, TX_ROWS, TX_DIRTY
+
+fn main() -> Void {
+    let dir = "C:/xtmp/xtest/db"
+
+    println("---- 建表 ----")
+    let cols = array(4, "")
+    cols[0] = "id"
+    cols[1] = "name"
+    cols[2] = "age"
+    cols[3] = "city"
+    // 先删掉可能残留的旧表。
+    //
+    // ── 为什么这一行是必须的，不是保险 ──────────────────────
+    //
+    // 测试跑第二遍时，上一遍留下的 users.tbl 还在。dbCreate 的
+    // 语义是「打开或创建」—— 它会载入旧文件，于是表结构来自
+    // 磁盘而不是这里的 cols。若旧文件的列数不同，接下来第一次
+    // 插入就会报「有 3 列，插入给了 4 个值」。
+    //
+    // 这条错误信息看起来像插入写错了，实际是测试的初始状态
+    // 没清干净。而四档一致性会把同一个程序跑四遍，这种残留
+    // 必然出现 —— 所以清理必须是测试自身的一部分，而不是指望
+    // 外部脚本先删干净。
+    dbDrop(dir, "users")
+    let t = dbCreate(dir, "users", cols)
+    println(len(dbResultCols(dbSelectAll(t))))     // 4
+    println(dbCount(dbSelectAll(t)))               // 0 （新建是空表）
+
+    println("---- 插入 ----")
+    let r1 = array(4, "")
+    r1[0] = 1
+    r1[1] = "张三"
+    r1[2] = 28
+    r1[3] = "北京"
+    println(dbInsert(t, r1))                       // 0（行号）
+    let r2 = array(4, "")
+    r2[0] = 2
+    r2[1] = "李四"
+    r2[2] = 35
+    r2[3] = "上海"
+    dbInsert(t, r2)
+    let r3 = array(4, "")
+    r3[0] = 3
+    r3[1] = "王五"
+    r3[2] = 19
+    r3[3] = "北京"
+    dbInsert(t, r3)
+    println(dbCount(dbSelectAll(t)))               // 3
+
+    println("---- WHERE ----")
+    // age > 20：按**数值**比，不能按字典序（"9" > "18" 是字典序陷阱）
+    let c1 = array(3, "")
+    c1[0] = "age"
+    c1[1] = ">"
+    c1[2] = "20"
+    println(dbCount(dbWhere(t, c1)))               // 2
+
+    let c2 = array(3, "")
+    c2[0] = "city"
+    c2[1] = "="
+    c2[2] = "北京"
+    println(dbCount(dbWhere(t, c2)))               // 2
+
+    // 多条件默认 AND
+    let c3 = array(6, "")
+    c3[0] = "city"
+    c3[1] = "="
+    c3[2] = "北京"
+    c3[3] = "age"
+    c3[4] = "<"
+    c3[5] = "25"
+    println(dbCount(dbWhere(t, c3)))               // 1
+
+    println("---- LIKE ----")
+    let c4 = array(3, "")
+    c4[0] = "name"
+    c4[1] = "LIKE"
+    c4[2] = "张%"
+    println(dbCount(dbWhere(t, c4)))               // 1
+    // _ 匹配单字符
+    let c5 = array(3, "")
+    c5[0] = "name"
+    c5[1] = "LIKE"
+    c5[2] = "李_"
+    println(dbCount(dbWhere(t, c5)))               // 1
+    // % 在中间
+    let c6 = array(3, "")
+    c6[0] = "name"
+    c6[1] = "LIKE"
+    c6[2] = "%四"
+    println(dbCount(dbWhere(t, c6)))               // 1
+
+    println("---- ORDER BY / LIMIT / OFFSET ----")
+    let all = dbSelectAll(t)
+    // 降序：最大在前（35）
+    let desc = dbOrderBy(all, t, "age", true)
+    let dbody = dbResultRows(desc)
+    println(dbody[0][2])                           // 35
+    println(dbody[2][2])                           // 19
+    // 升序：最小在前（19）
+    let asc = dbOrderBy(all, t, "age", false)
+    println(dbResultRows(asc)[0][2])               // 19
+    // LIMIT
+    println(dbCount(dbLimit(desc, 2)))             // 2
+    println(dbCount(dbLimit(desc, 0)))             // 0
+    println(dbCount(dbLimit(desc, 99)))            // 3（超过总数不报错）
+    // OFFSET
+    println(dbCount(dbOffset(desc, 1)))            // 2
+    println(dbResultRows(dbOffset(desc, 1))[0][2]) // 28（第二大的）
+
+    println("---- 聚合 ----")
+    println(toInt(dbSum(all, "age")))              // 82
+    println(toInt(dbAvg(all, "age")))              // 27（82/3 截断）
+    println(dbMin(all, "age"))                     // 19
+    println(dbMax(all, "age"))                     // 35
+
+    println("---- UPDATE ----")
+    let sc = array(1, "")
+    sc[0] = "age"
+    let sv = array(1, 0)
+    sv[0] = 99
+    // 把「北京」的两行都改成 99
+    println(dbUpdate(t, sc, sv, c2))               // 2
+    println(dbCount(dbWhere(t, c3)))               // 0（<25 的没有了）
+    // 改回来，后面的断言基于原值
+    sv[0] = 28
+    dbUpdate(t, sc, sv, c2)
+
+    println("---- 持久化 ----")
+    println(dbSave(t))                             // true
+    let t2 = dbCreate(dir, "users", cols)          // 重新打开（载入）
+    println(dbCount(dbSelectAll(t2)))              // 3
+    // 内容要真的对，不能只是行数对
+    println(dbResultRows(dbSelectAll(t2))[0][1])   // 张三
+
+    println("---- DELETE ----")
+    println(dbDelete(t2, c2))                      // 2
+    println(dbCount(dbSelectAll(t2)))              // 1
+    println(dbResultRows(dbSelectAll(t2))[0][1])   // 李四（唯一剩下的）
+    dbSave(t2)
+
+    println("---- 事务 ----")
+    let before = dbCount(dbSelectAll(t2))
+    let r9 = array(4, "")
+    r9[0] = 9
+    r9[1] = "临时"
+    r9[2] = 1
+    r9[3] = "广州"
+    let tx = dbBegin(t2)
+    dbInsert(t2, r9)
+    println(dbCount(dbSelectAll(t2)))              // before + 1
+    dbRollback(tx)
+    println(dbCount(dbSelectAll(t2)))              // before
+    // 提交后要真的落盘
+    let tx2 = dbBegin(t2)
+    dbInsert(t2, r9)
+    println(dbCommit(tx2))                         // true
+    let t3 = dbCreate(dir, "users", cols)
+    println(dbCount(dbSelectAll(t3)))              // before + 1
+
+    println("---- 转义（关键） ----")
+    let tcols = array(2, "")
+    tcols[0] = "code"
+    tcols[1] = "note"
+    let tags = dbCreate(dir, "tags", tcols)
+    let ta = array(2, "")
+    ta[0] = "A1"
+    ta[1] = "含\t制表符\n与换行\\和反斜杠"
+    dbInsert(tags, ta)
+    dbSave(tags)
+    // 重载：字段里的制表符与换行必须完好，否则会打乱行结构
+    let tags2 = dbCreate(dir, "tags", tcols)
+    let tbody = dbResultRows(dbSelectAll(tags2))
+    println(len(tbody))                            // 1（没被拆成多行）
+    println(strFind(tbody[0][1], "\t") >= 0)       // true
+    println(strFind(tbody[0][1], "\n") >= 0)       // true
+    println(strFind(tbody[0][1], "\\") >= 0)      // true
+
+    println("---- 唯一性 ----")
+    let ua = array(2, "")
+    ua[0] = "U1"
+    ua[1] = "第一个"
+    println(dbInsertUnique(tags2, ua, "code"))     // 1（行号）
+    let ub = array(2, "")
+    ub[0] = "U1"
+    ub[1] = "重复"
+    println(dbInsertUnique(tags2, ub, "code"))     // -1（拒绝）
+    println(dbCount(dbSelectAll(tags2)))           // 2（没有被插入）
+
+    println("---- 索引与删除 ----")
+    println(dbIndex(tags2, "code"))                // true
+    println(dbExists(dir, "tags"))                 // true
+    println(dbDrop(dir, "tags"))                   // true
+    println(dbExists(dir, "tags"))                 // false
+    println(dbDrop(dir, "tags"))                   // false（已不存在）
+
+    println("db module ok")
+}

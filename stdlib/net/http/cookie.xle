@@ -1,0 +1,298 @@
+from "../../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+// net/http/cookie.xle — Cookie 的解析与生成
+//
+// ── Cookie 为什么值得单独一个文件 ────────────────────
+//
+// 因为它在 RFC 6265 里的语法有四处「和直觉不一样」，随手 split(";")
+// 会在下面每个点上都出错：
+//
+// 【1】值里可以有 =，但不能有 ; 或 ,
+//
+//   `token=a=b=c` 的合法解析是 name=token, value="a=b=c"。
+//   用 split("=") 取 [0] 和 [1] 会得到 token / "a"，静默截断。
+//   必须**只切第一个 =**。
+//
+// 【2】属性名不区分大小写，属性值区分
+//
+//   `Path=` / `path=` 等价；但 `Expires=Wed` 的 "Wed" 大小写有意义。
+//   所以属性名要 strLower，值不能动。
+//
+// 【3】Expires 的值里含逗号
+//
+//   `Expires=Wed, 21 Oct 2015 07:28:00 GMT` —— 这是为什么
+//   Set-Cookie 不能用逗号合并同名头（见 header.xle 文件头【3】）。
+//
+// 【4】对前端可见性由 HttpOnly 决定，不是由 Secure 决定
+//
+//   两个标志经常被混为一谈：
+//   HttpOnly  禁止 document.cookie 读取（防 XSS 偷 cookie）
+//   Secure    只在 HTTPS 上发送（防中间人嗅探）
+//   一个 Secure 但不 HttpOnly 的 cookie 仍然能被 JS 读走。
+
+// 解析一条 Cookie 请求头（`Cookie: a=1; b=2`）。
+//
+// ── 为什么返回「平行数组」而不是「Cookie 类数组」──────
+//
+// 因为请求头里的 cookie 只有 name/value 两个字段，没有属性。
+// 为它建一个带 expires/domain/path 的类会让字段全是空值，调用方
+// 无从知道「这个字段到底有没有意义」。请求侧用名字和值就够了，
+// 属性只在**响应侧**（Set-Cookie）才有。
+//
+// 返回 [names, values]，一一对应。
+fn ckParseRequestHeader(v: String) -> Array {
+    let names  = []
+    let values = []
+    if (len(v) == 0) { return [names, values] }
+
+    let parts = strSplit(v, ";")
+    var i = 0
+    while i < len(parts) {
+        let seg: String = parts[i]
+        let item = strTrim(seg)
+        if (len(item) > 0) {
+            let at = strFind(item, "=")
+            if (at > 0) {
+                let name = strTrim(strSub(item, 0, at))
+                var value = strTrim(strSub(item, at + 1, len(item)))
+                // 有些客户端会把值用双引号包起来（老规范允许）。
+                // 引号不是值的一部分，要去掉 —— 带着引号去比对
+                // 会话 ID 会永远不匹配。
+                if (len(value) >= 2) {
+                    if (strStarts(value, "\"") && strEnds(value, "\"")) {
+                        value = strSub(value, 1, len(value) - 1)
+                    }
+                }
+                if (len(name) > 0) {
+                    arrPush(names, name)
+                    arrPush(values, value)
+                }
+            } else if (at == 0) {
+                // `=value`：名字为空的畸形 cookie。跳过。
+            } else {
+                // 没有 =：按 RFC 6265 §5.2，整个 token 当名字、值为空。
+                // 真实世界里有服务端这么发（`Cookie: flag`）。
+                arrPush(names, item)
+                arrPush(values, "")
+            }
+        }
+        i = i + 1
+    }
+    return [names, values]
+}
+
+// 在请求 Cookie 头里按名字取值，找不到返回 def。
+//
+// ── 为什么提供这个而不是让调用方自己遍历 ─────────────
+//
+// 因为名字查找必须**区分大小写**（cookie 名是区分大小写的，
+// 与 HTTP 头名相反）。这个反直觉点如果让每个调用点自己写，
+// 一定会有人写成 strLower 比较，然后「会话 ID 永远取不到」。
+fn ckGet(names: Array, values: Array, name: String, def: String) -> String {
+    var i = 0
+    while i < len(names) {
+        let n: String = names[i]
+        if (n == name) {
+            let v: String = values[i]
+            return v
+        }
+        i = i + 1
+    }
+    return def
+}
+
+// 一条 Set-Cookie。
+//
+// ── 为什么响应侧要类而请求侧不要 ─────────────────
+//
+// 因为 Set-Cookie 有 7 个属性（Expires / Max-Age / Domain / Path /
+// Secure / HttpOnly / SameSite），每个都有默认值和交互关系
+// （Max-Age 优先于 Expires，见下面的解释）。用参数列表传会变成
+// 一个 8 参数的函数，每个调用点都要数位置。
+class SetCookie {
+    name: String
+    value: String
+
+    // 过期时间（HTTP-date 格式，如 "Wed, 21 Oct 2015 07:28:00 GMT"）。
+    // 空串表示「会话 cookie」（关浏览器就消失）。
+    expires: String
+
+    // 相对过期秒数。0 表示未设置。
+    //
+    // ── 为什么 Max-Age 优先于 Expires ────────────
+    //
+    // RFC 6265 §5.3 明确规定：两者同时存在时 Max-Age 优先。理由是
+    // Max-Age 是相对时间，不受客户端时钟偏差影响 —— 而时钟偏差
+    // 恰恰是 Expires 最常见的失效原因（用户电脑时间不准，cookie
+    // 立刻过期或永不过期）。
+    //
+    // 负数表示「立即删除」。
+    maxAge: Int
+
+    domain: String
+    path: String
+    secure: Bool
+    httpOnly: Bool
+
+    // "Strict" / "Lax" / "None" / ""（未设置）
+    //
+    // ── 为什么必须显式设置 ───────────────────────
+    //
+    // 现代浏览器把「未设置 SameSite」按 Lax 处理（Chrome 80 起）。
+    // 而 Lax 会阻止跨站 POST 携带 cookie —— 于是「从外部站点跳转
+    // 回来的表单提交丢失登录态」。跨站场景必须显式写 None，并且
+    // None 要求同时有 Secure。
+    sameSite: String
+
+    constructor(name: String, value: String) {
+        self.name     = name
+        self.value    = value
+        self.expires  = ""
+        self.maxAge   = 0
+        self.domain   = ""
+        self.path     = "/"
+        self.secure   = false
+        self.httpOnly = false
+        self.sameSite = ""
+    }
+
+    fn withMaxAge(seconds: Int) -> SetCookie {
+        self.maxAge = seconds
+        return self
+    }
+
+    fn withExpires(httpDate: String) -> SetCookie {
+        self.expires = httpDate
+        return self
+    }
+
+    fn withPath(p: String) -> SetCookie {
+        self.path = p
+        return self
+    }
+
+    fn withDomain(d: String) -> SetCookie {
+        self.domain = d
+        return self
+    }
+
+    fn asHttpOnly() -> SetCookie {
+        self.httpOnly = true
+        return self
+    }
+
+    fn asSecure() -> SetCookie {
+        self.secure = true
+        return self
+    }
+
+    fn withSameSite(mode: String) -> SetCookie {
+        self.sameSite = mode
+        return self
+    }
+
+    // 生成 Set-Cookie 头的值（不含 "Set-Cookie: " 前缀）。
+    fn toHeaderValue() -> String {
+        var out = self.name + "=" + self.value
+
+        // ── 输出顺序 ────────────────────────────
+        //
+        // 按 RFC 6265 §4.1.1 的建议顺序：Expires, Max-Age, Domain,
+        // Path, Secure, HttpOnly, SameSite。顺序不影响语义，但影响
+        // 可读性 —— 抓包时按固定顺序看更省事。
+        if (len(self.expires) > 0) {
+            out = out + "; Expires=" + self.expires
+        }
+        if (self.maxAge != 0) {
+            out = out + "; Max-Age=" + toString(self.maxAge)
+        }
+        if (len(self.domain) > 0) {
+            out = out + "; Domain=" + self.domain
+        }
+        if (len(self.path) > 0) {
+            out = out + "; Path=" + self.path
+        }
+        if (self.secure) {
+            out = out + "; Secure"
+        }
+        if (self.httpOnly) {
+            out = out + "; HttpOnly"
+        }
+        if (len(self.sameSite) > 0) {
+            // ── SameSite=None 必须配 Secure ──────────
+            //
+            // 浏览器会**直接拒绝**这个 cookie（不是降级，是不存）。
+            // 不在这里强行加 Secure，因为那会掩盖调用方的配置错误 ——
+            // 明确失败（cookie 没生效）比静默改变行为更容易查到。
+            // 但提供一个检查方法见 validate。
+            out = out + "; SameSite=" + self.sameSite
+        }
+        return out
+    }
+
+    // 检查明显的错误配置。返回空串表示没问题。
+    //
+    // ── 为什么需要这个 ─────────────────────────
+    //
+    // 因为 cookie 配置错了浏览器**不报错**，只是不存。服务端看到的
+    // 现象是「登录成功但下一个请求没带 cookie」，排查方向会跑偏到
+    // 会话存储、网关转发、跨域配置上去。提前检查能省掉这一整轮。
+    fn validate() -> String {
+        if (len(self.name) == 0) {
+            return "cookie 名不能为空"
+        }
+        // 名字里不能有这些分隔符（RFC 6265 §4.1.1 的 token 定义）
+        let bad = ["(", ")", ",", "=", ";", " ", "\t", "\"", "/", "[", "]", "?", "@", ":", "{"]
+        var i = 0
+        while i < len(bad) {
+            let c: String = bad[i]
+            if (strFind(self.name, c) >= 0) {
+                return "cookie 名里不能含 `" + c + "`（浏览器会丢弃整个 cookie）"
+            }
+            i = i + 1
+        }
+        if (self.sameSite == "None" && !self.secure) {
+            return "SameSite=None 必须同时设置 Secure，否则浏览器直接拒绝该 cookie"
+        }
+        if (len(self.sameSite) > 0) {
+            if (self.sameSite != "None" && self.sameSite != "Lax" && self.sameSite != "Strict") {
+                return "SameSite 只能是 None / Lax / Strict，实际是 `" +
+                       self.sameSite + "`（大小写敏感）"
+            }
+        }
+        if (self.maxAge != 0 && len(self.expires) > 0) {
+            // 不是错误，但 Max-Age 会赢，写 Expires 等于白写。
+            // 返回提示而不是错误 —— 调用方可能故意两个都发（兼容老客户端）。
+            return ""
+        }
+        return ""
+    }
+
+    fn isSession() -> Bool {
+        return self.maxAge == 0 && len(self.expires) == 0
+    }
+
+    fn describe() -> String {
+        var kind = "session"
+        if (!self.isSession()) { kind = "persistent" }
+        return "SetCookie " + self.name + "=[" + self.value + "] (" + kind + ")"
+    }
+}
+
+// 删除一个 cookie 的标准写法。
+//
+// ── 为什么不能只发一个空值 ───────────────────────
+//
+// 因为「值变成空」和「cookie 被删掉」是两回事。要删掉必须发一个
+// 同名的 Set-Cookie 且**过期时间在过去**。而且 Domain 和 Path 必须
+// 与原 cookie 完全一致 —— 不一致的话删的是另一个 cookie，原件还在。
+//
+// 这是「退出登录后 cookie 还在」这个经典 bug 的唯一正解。
+fn ckDelete(name: String, path: String, domain: String) -> SetCookie {
+    let c = new SetCookie(name, "")
+    c.withMaxAge(0 - 1)          // 负数 = 立即过期
+    if (len(path) > 0) { c.withPath(path) }
+    if (len(domain) > 0) { c.withDomain(domain) }
+    return c
+}

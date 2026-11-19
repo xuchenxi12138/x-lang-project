@@ -1,0 +1,204 @@
+// xboot.xle — xboot 的启动器
+//
+// ── 这一文件对应 Spring Boot 的哪一块 ──────────────────────
+//
+// SpringApplication.run(App.class, args)。用户写的 main 只有这一行
+// 调用（或者干脆是 fn main() { XBoot.run("conf/application.properties") }），
+// 剩下的全部在这里：
+//
+//   [1] 配置装配      Config.loadFile + applyEnv
+//   [2] 组件扫描      container.scan()（classAll + 注解过滤）
+//   [3] 实例化        container.instantiate()（classNew 无参构造）
+//   [4] 数据源装配    容器里有 @Mapper 才创建（dataSourceFrom，fail fast）
+//   [5] 依赖注入      container.inject()（@Autowired / @Value）
+//   [6] Mapper 装配   @Mapper(entity=...) 解析出 EntityMeta
+//   [7] 路由扫描      scanRoutes（@RestController + @GetMapping ...）
+//   [8] 事件循环      accept → handleOne → dispatchRequest → finish
+//
+// ── 为什么启动器是一个 static 方法而不是 Application 类 ────
+//
+// demo 的 main 不需要持有启动器状态：配置、容器、服务器在 run 内部
+// 连成一条流水线，循环结束后它们的生命周期就结束了。暴露成对象只会
+// 诱惑用户去改流水线内部 —— 那些环节的顺序是有约束的（见上面 [4]
+// 在 [5] 前），暴露状态等于暴露出错机会。要定制行为，配置文件和
+// 注解是入口，不是编程接口。
+
+from "anno.xle" import mappingAnnoNames, isComponentAnno, beanNameOf, camelToSnake, isComponentClass, annoHasInherited, annoGetInherited, annoGetKVInherited, ANNO_COMPONENT, ANNO_SERVICE, ANNO_REPOSITORY, ANNO_CONTROLLER, ANNO_RESTCONTROLLER, ANNO_MAPPER, ANNO_AUTOWIRED, ANNO_VALUE, ANNO_GET_MAPPING, ANNO_POST_MAPPING, ANNO_PUT_MAPPING, ANNO_DELETE_MAPPING, ANNO_PATCH_MAPPING, ANNO_REQUEST_MAPPING, ANNO_TABLE, ANNO_TABLE_ID, ANNO_COLUMN, ANNO_QUERY
+from "ioc.xle" import convertByType, Container
+from "data.xle" import entityMetaOf, fillEntity, sqlValueOf, dataSourceFrom, Entity, EntityField, EntityMeta, QueryWrapper, BaseMapper
+from "web.xle" import wjScalar, wjFields, wjValue, rOk, rOkMsg, rFail, rPage, wjJoinPath, wjBraceToColon, wjAnnoMethod, wjParamCount, scanRoutes, wjLookup, wjLookupFlat, wjScalarStr, wjConvertScalar, wjSafeScan, wjBindEntity, wbBindArgs, dispatchRequest, R_CODE_OK, R_MSG_OK
+from "../../stdlib/net/http/server.xle" import hsHttpDateNow, Context, HttpServer
+from "../../stdlib/net/http/router.xle" import rnNormalizePattern, rnMatchPattern, rnSplitSegs, arrHas, Route, Match, Router
+from "../../stdlib/service/config.xle" import cfgPriority, cfgEnvName, envGet, ConfigEntry, Config
+
+const XBOOT_VERSION = "0.1.0"
+
+class XBoot {
+    // 启动一个注解驱动的 Web 服务。返回退出码（0 = 正常）。
+    //
+    // cfgPath 是 application.properties 的路径（相对运行目录）。
+    // 文件不存在不报错 —— 一个没有配置文件的服务按全默认值启动
+    // （端口 8080），和 Spring Boot 的行为一致：配置是增量覆盖，
+    // 不是启动前提。
+    static fn run(cfgPath: String) -> Int {
+        // ══════════════════════════════════════════
+        // [1] 配置装配
+        // ══════════════════════════════════════════
+        let cfg = new Config()
+        if (len(cfgPath) > 0 && fsExists(cfgPath)) {
+            cfg.loadFile(cfgPath)
+        }
+        // 环境变量覆盖（XBOOT_SERVER_PORT=9090 这类），容器化部署
+        // 的标准姿势 —— 配置文件是基线，环境变量是部署差异。
+        cfg.applyEnv("XBOOT_")
+
+        let port = strParseInt(cfg.getOr("server.port", "8080"))
+        let stopAfter = strParseInt(cfg.getOr("xboot.stop-after-requests", "0"))
+        let verbose = cfg.getOr("xboot.access-log", "false") == "true"
+
+        // ══════════════════════════════════════════
+        // [2] 组件扫描 + [3] 实例化
+        // ══════════════════════════════════════════
+        let c = new Container()
+        c.cfg = cfg          // @Value 注入的配置源
+        let beanCount = c.scan()
+        c.instantiate()
+
+        // ══════════════════════════════════════════
+        // [4] 数据源装配（在注入之前 —— resolveDependency 要能
+        //     按 DataSource 抽象基类找到它）
+        // ══════════════════════════════════════════
+        //
+        // ── 为什么按「有没有 @Mapper」决定 ──────────────
+        //
+        // 纯 API 服务（无数据库）不该被强制配置 db.url。数据源是
+        // 被 Mapper 需要的，Mapper 存在才装配 —— 依赖驱动的装配，
+        // 比开关配置项（xboot.datasource.enabled=...）少一个说谎
+        // 的机会（开着开关没配 url，或者配了 url 没有 mapper）。
+        let mapperIdx = c.mapperIndexes()
+        var ds: DataSource = null
+        if (len(mapperIdx) > 0) {
+            ds = dataSourceFrom(cfg)
+            // 注册成单例，注入阶段 resolveDependency 按
+            // classIs("MySqlDataSource", "DataSource") 匹配抽象类型。
+            c.registerSingleton("dataSource", "MySqlDataSource", ds)
+        }
+
+        // ══════════════════════════════════════════
+        // [5] 依赖注入（@Autowired / @Value）
+        // ══════════════════════════════════════════
+        let filled = c.inject()
+
+        // ══════════════════════════════════════════
+        // [6] Mapper 装配（@Mapper(entity = "User") → EntityMeta）
+        // ══════════════════════════════════════════
+        //
+        // 在 inject 之后：此时 mapper 的 ds 字段已经注入，entity /
+        // meta 是框架自己要填的装配字段（不是用户依赖）。
+        var i = 0
+        while i < len(mapperIdx) {
+            let idx: Int = mapperIdx[i]
+            let mcls = toString(c.classes[idx])
+            let kv = annoGetKVInherited(mcls, "class", "", ANNO_MAPPER)
+            var entityName = ""
+            var k = 0
+            while k < len(kv) {
+                let row: Array = kv[k]
+                if (toString(row[0]) == "entity") {
+                    entityName = toString(row[1])
+                }
+                k = k + 1
+            }
+            if (len(entityName) == 0) {
+                fail("xboot: Mapper `" + mcls +
+                     "` 缺少 entity 参数 —— 写成 @Mapper(entity = \"User\") 形式")
+            }
+            let minst = c.insts[idx]
+            fieldSet(minst, "entity", entityName)
+            fieldSet(minst, "meta", entityMetaOf(entityName))
+            i = i + 1
+        }
+
+        // ══════════════════════════════════════════
+        // [7] 路由扫描 + HTTP 服务器
+        // ══════════════════════════════════════════
+        let server = new HttpServer("0.0.0.0", port)
+        server.setVerbose(verbose)
+        let router = new Router()
+        let routeCount = scanRoutes(c, router)
+        // 替换 HttpServer 构造出来的空路由表 —— 注解扫描的产物
+        // 就是这个服务的全部路由（调用方没有机会手工加路由，手工
+        // 路由的 dispatchRequest 会因 handlerName 无 "::" 而跳过，
+        // 所以想加框架路由之外的路径，请把它做成 @RestController）。
+        server.router = router
+
+        // ══════════════════════════════════════════
+        // 启动 banner
+        // ══════════════════════════════════════════
+        println("=========================================")
+        println("  xboot v" + XBOOT_VERSION + " — Spring Boot 风格框架")
+        println("=========================================")
+        println("  beans: " + toString(beanCount) +
+                "  注入字段: " + toString(filled))
+        if (ds != null) {
+            println("  datasource: " + ds.describe())
+        }
+        println("  routes: " + toString(routeCount))
+        println("  config: " + cfgPath)
+        println("-----------------------------------------")
+        println(c.dump())
+        println("-----------------------------------------")
+        println(router.dumpRoutes())
+        println("=========================================")
+
+        // 能走到这里说明端口已绑定：TcpListener 构造即监听，失败会
+        // 直接 exit(70)（内建 netListen 的硬行为），fail fast。
+        println("  监听 http://127.0.0.1:" + toString(server.port()))
+        if (stopAfter > 0) {
+            println("  处理 " + toString(stopAfter) + " 个请求后自动退出")
+        }
+        println("")
+
+        // ══════════════════════════════════════════
+        // [8] 事件循环（accept → handleOne → dispatch → finish）
+        // ══════════════════════════════════════════
+        //
+        // 与 stdlib HttpServer 的单线程模型一致：一个慢请求阻塞
+        // 后面全部。这对内部工具和 demo 是诚实的能力边界。
+        var running = true
+        while running {
+            let ra = server.listener.acceptWithin(1000)
+            if (ra[0] != true) {
+                // 空闲超时不是错误（见 blog main 的同款注释）。
+                continue
+            }
+            let sock: TcpStream = ra[1]
+
+            let ctx = server.handleOne(sock)
+
+            // 注解路由分派。返回 false = 路由未命中，handleOne 已经
+            // 填好 404/405，无需补响应。
+            dispatchRequest(ctx, c)
+
+            server.finish(ctx, sock)
+            sock.close()
+
+            let n = server.servedCount
+            if (stopAfter > 0 && n >= stopAfter) {
+                running = false
+            }
+        }
+
+        // ══════════════════════════════════════════
+        // 关停
+        // ══════════════════════════════════════════
+        server.listener.close()
+        if (ds != null) {
+            ds.close()
+        }
+        println("")
+        println("xboot 已停止（处理 " + toString(server.servedCount) +
+                " 个请求，" + toString(server.errorCount) + " 个错误）")
+        return 0
+    }
+}

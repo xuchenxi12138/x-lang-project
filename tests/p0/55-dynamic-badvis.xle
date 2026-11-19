@@ -1,0 +1,17 @@
+// 55-dynamic-badvis.xle — methodCall 不绕过访问控制
+//
+// methodCall 是「运行时按名字调用」，不是「无视访问控制」。
+// 类外调 private 方法被拒绝，与直接写 obj.secret() 的判据一致 ——
+// 否则 private 方法在反射面前形同虚设。
+class Vault {
+    private code: String,
+
+    constructor() { self.code = "9-9-9" }
+
+    private fn secret() -> String { return self.code }
+}
+
+fn main() {
+    let v = new Vault()
+    println("unreachable: " + methodCall(v, "secret", []))
+}

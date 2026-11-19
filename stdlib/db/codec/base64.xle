@@ -1,0 +1,147 @@
+// db/codec/base64.xle — Base64 编解码
+//
+// ── 为什么数据库层需要 Base64 ──────────────────────
+//
+// 三处硬需求：
+//   1. PostgreSQL 的 SCRAM-SHA-256 认证，盐和签名都用 Base64 传输
+//   2. MongoDB 的二进制类型（BinData）在 JSON 里就是 Base64
+//   3. Elasticsearch 的 basic 认证头是 "Basic " + Base64(user:pass)
+//
+// ── 为什么不用 strFromBytes 一遍遍拼 ──────────────
+//
+// 因为 Base64 是 3 字节 → 4 字符的位重排，需要的操作是「取第 i 个
+// 字节的第 k 位」。用字节数组（Array）天然适合按下标取，而 String
+// 的 strSub 按码点工作，在二进制上边界会漂移。
+
+from "bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// 标准 Base64 字母表（RFC 4648）。末尾的 = 是填充。
+const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// 编码：字节数组 → Base64 字符串。
+//
+// ── 为什么末尾要补 = ────────────────────────────
+//
+// 因为 Base64 把 3 字节编成 4 字符。输入长度不是 3 的倍数时，最后
+// 一组不足 3 字节，输出仍要凑满 4 字符，缺的位置用 = 表示「这里
+// 没有数据」。不补 = 的解码器（有些实现）能接受，但严格解码器会
+// 报长度错误。补上是标准做法。
+fn b64Encode(data: Array) -> String {
+    var out = ""
+    let n = len(data)
+    var i = 0
+    while i < n {
+        // 取 3 字节，不足的当 0
+        let b0 = bbAt(data, i)
+        var b1 = 0
+        var b2 = 0
+        var have1 = false
+        var have2 = false
+        if (i + 1 < n) { b1 = bbAt(data, i + 1); have1 = true }
+        if (i + 2 < n) { b2 = bbAt(data, i + 2); have2 = true }
+
+        // 24 位分成 4 个 6 位
+        let triple = (b0 << 16) | (b1 << 8) | b2
+        let c0 = (triple >> 18) & 0x3F
+        let c1 = (triple >> 12) & 0x3F
+        let c2 = (triple >> 6) & 0x3F
+        let c3 = triple & 0x3F
+
+        out = out + strSub(B64_ALPHABET, c0, c0 + 1)
+        out = out + strSub(B64_ALPHABET, c1, c1 + 1)
+        if (have1) {
+            out = out + strSub(B64_ALPHABET, c2, c2 + 1)
+        } else {
+            out = out + "="
+        }
+        if (have2) {
+            out = out + strSub(B64_ALPHABET, c3, c3 + 1)
+        } else {
+            out = out + "="
+        }
+        i = i + 3
+    }
+    return out
+}
+
+// 文本的 Base64（先 UTF-8 编码）。
+fn b64EncodeText(s: String) -> String {
+    return b64Encode(bbFromUtf8(s))
+}
+
+// 解码：Base64 字符串 → 字节数组。
+//
+// ── 为什么对非法字符只跳过而不报错 ────────────────
+//
+// 因为 Base64 在实际传输里经常带换行（MIME 每 76 字符折行）。严格
+// 报错会让所有带折行的输入失败，而这类输入极常见（证书、邮件、
+// PEM 文件）。跳过非字母表字符是宽容且正确的做法。
+fn b64Decode(s: String) -> Array {
+    let out = []
+    var buf = 0
+    var bits = 0
+    var i = 0
+    let n = len(s)
+    while i < n {
+        let ch = strSub(s, i, i + 1)
+        // '=' 是填充，之后的都不算数据
+        if (ch == "=") { break }
+        let v = b64Value(ch)
+        if (v < 0) {
+            // 非字母表字符（换行、空格等）跳过
+            i = i + 1
+            continue
+        }
+        // 累积 6 位
+        buf = (buf << 6) | v
+        bits = bits + 6
+        if (bits >= 8) {
+            bits = bits - 8
+            arrPush(out, (buf >> bits) & 0xFF)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 解码成文本。
+fn b64DecodeText(s: String) -> String {
+    return bbToText(b64Decode(s))
+}
+
+// 一个 Base64 字符的值，非法返回 -1。
+//
+// ── 为什么逐字符线性查表而不是算 ──────────────────
+//
+// 因为字母表在 + 和 / 处不连续（'Z'=0x5A 到 'a'=0x61 之间有 6 个
+// 间隔），算偏移需要四个区间判断。查表 64 次比较虽然慢一点，但
+// 不可能写错 —— 而 Base64 写错的表现是「大部分输入正常，某些
+// 特定字节组合解码错」，极难定位。
+fn b64Value(ch: String) -> Int {
+    let k = strFind(B64_ALPHABET, ch)
+    return k
+}
+
+// URL-safe 变体（把 + / 换成 - _）。JWT 和部分 API 用它。
+fn b64UrlEncode(data: Array) -> String {
+    let s = b64Encode(data)
+    var out = s
+    out = strReplace(out, "+", "-")
+    out = strReplace(out, "/", "_")
+    // URL 场景通常去掉填充
+    while strEnds(out, "=") {
+        out = strSub(out, 0, len(out) - 1)
+    }
+    return out
+}
+
+fn b64UrlDecode(s: String) -> Array {
+    var t = s
+    t = strReplace(t, "-", "+")
+    t = strReplace(t, "_", "/")
+    // 补回填充到 4 的倍数
+    while (len(t) % 4) != 0 {
+        t = t + "="
+    }
+    return b64Decode(t)
+}

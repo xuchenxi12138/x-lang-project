@@ -1,0 +1,159 @@
+// db/mysql/auth.xle — MySQL 认证算法
+//
+// ── 两种认证插件的差别 ────────────────────────────
+//
+// mysql_native_password（MySQL 5.x 默认，8.0 起废弃但仍可用）
+//
+//   响应 = SHA1(pwd) XOR SHA1(salt + SHA1(SHA1(pwd)))
+//
+//   思路：口令的 SHA1 摘要叫 s1，s1 的摘要叫 s2，应答是
+//   XOR(SHA1(salt ++ s2), s1)。服务端存的是 s2，它能算出 SHA1(salt++s2)，
+//   异或回来就得到 s1，再和库里的值比对 —— 全程不需要从服务端侧
+//   反推口令。这叫「挑战应答」，盐就是挑战。
+//
+// caching_sha2_password（MySQL 8.0 默认）
+//
+//   fast path（服务端有缓存时）：
+//     XOR(SHA256(pwd), SHA256(SHA256(SHA256(pwd)) ++ salt))
+//
+//   否则服务端会要明文口令（走 RSA 或 TLS 加密的通道）。P0 没有
+//   RSA 也没有 TLS，所以**只能走 fast path**。
+//
+// ── 为什么 P0 只能做 fast path ────────────────────
+//
+// 首次连接一个从没被连过的账号，服务端缓存是空的，它会要求
+// "full authentication"：客户端必须把口令**明文**（RSA 公钥加密或
+// TLS）发过去。P0 没有 RSA 大数运算，也不支持 TLS，所以这条路
+// 走不通。
+//
+// 应对办法写在 driver.xle 里：连接失败时把错误信息明确指出来，并
+// 建议用户在服务端给账号配 mysql_native_password：
+//
+//     ALTER USER 'app'@'%' IDENTIFIED WITH mysql_native_password BY '...';
+//
+// 这是诚实的边界说明，而不是「假装支持然后神秘失败」。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "../codec/sha1.xle" import Sha1, SHA1_H0, SHA1_H1, SHA1_H2, SHA1_H3, SHA1_H4, SHA1_MASK32
+from "../codec/sha256.xle" import Sha256, SHA256_H0, SHA256_H1, SHA256_H2, SHA256_H3, SHA256_H4, SHA256_H5, SHA256_H6, SHA256_H7, SHA256_MASK32
+
+// mysql_native_password 的应答。
+//
+// 返回 XOR 混合后的 20 字节。调用方直接把它作为认证响应的负载。
+//
+// ── 为什么空口令返回空数组 ────────────────────────
+//
+// 协议规定空口令的认证响应长度就是 0。如果按公式算，SHA1("") 是
+// 有值的，会发出 20 字节，服务端会认为是错误口令。
+fn myNativePassword(password: String, salt: Array) -> Array {
+    if (len(password) == 0) { return [] }
+
+    let pwd = bbFromUtf8(password)
+
+    // s1 = SHA1(pwd)
+    let s1 = Sha1.hash(pwd)
+    // s2 = SHA1(s1)
+    let s2 = Sha1.hash(s1)
+    // s3 = SHA1(salt ++ s2)
+    let joined = bbSlice(salt, 0, len(salt))
+    bbPutBytes(joined, s2)
+    let s3 = Sha1.hash(joined)
+
+    // 应答 = s1 XOR s3
+    let out = []
+    var i = 0
+    while i < 20 {
+        arrPush(out, bbAt(s1, i) ^ bbAt(s3, i))
+        i = i + 1
+    }
+    return out
+}
+
+// caching_sha2_password 的 fast path 应答。
+//
+//   XOR(SHA256(pwd), SHA256(SHA256(SHA256(pwd)) ++ salt))
+fn myCachingSha2Password(password: String, salt: Array) -> Array {
+    if (len(password) == 0) { return [] }
+
+    let pwd = bbFromUtf8(password)
+
+    // s1 = SHA256(pwd)
+    let s1 = Sha256.hash(pwd)
+    // s2 = SHA256(s1)
+    let s2 = Sha256.hash(s1)
+    // s3 = SHA256(s2 ++ salt)
+    let joined = bbSlice(s2, 0, len(s2))
+    bbPutBytes(joined, salt)
+    let s3 = Sha256.hash(joined)
+
+    // 应答 = s1 XOR s3
+    let out = []
+    var i = 0
+    while i < 32 {
+        arrPush(out, bbAt(s1, i) ^ bbAt(s3, i))
+        i = i + 1
+    }
+    return out
+}
+
+// 按插件名选择算法。未知插件返回空数组并把名字记在 error 里。
+//
+// ── 为什么要单独一个分发函数 ──────────────────────
+//
+// 因为插件名是服务端在握手包里给的，运行时才知道。调用点必须有
+// 一个「按名字查算法」的地方，而不是 if/else 散落在各处。
+fn myAuthResponse(plugin: String, password: String, salt: Array) -> Array {
+    if (plugin == "mysql_native_password") {
+        return myNativePassword(password, salt)
+    }
+    if (plugin == "caching_sha2_password") {
+        return myCachingSha2Password(password, salt)
+    }
+    if (plugin == "mysql_clear_password") {
+        // 明文插件：直接把口令的 UTF-8 字节发出去（只在 TLS 下安全）。
+        let out = bbFromUtf8(password)
+        bbPut(out, 0)
+        return out
+    }
+    return []
+}
+
+// 这个插件名 P0 是否支持。
+fn myPluginSupported(plugin: String) -> Bool {
+    return plugin == "mysql_native_password"
+        || plugin == "caching_sha2_password"
+        || plugin == "mysql_clear_password"
+}
+
+// 插件是否需要「完整认证」（无法只靠 fast path 完成）。
+//
+// ── 为什么这个判断要暴露出来 ──────────────────────
+//
+// 因为 caching_sha2_password 的 fast path 只在服务端有缓存时可用。
+// 驱动需要在服务端要求完整认证时给出**可操作**的错误提示，而不是
+// 卡在那里等超时。把判断独立出来，driver 就能在正确的时机报错。
+fn myNeedsFullAuth(plugin: String) -> Bool {
+    return plugin == "caching_sha2_password"
+}
+
+// 解释某个插件在 P0 下的限制（用于错误信息）。
+fn myAuthHint(plugin: String) -> String {
+    if (plugin == "caching_sha2_password") {
+        return "caching_sha2_password 只在服务端已有该账号缓存时可用"
+             + "（fast path）。缓存为空时 MySQL 要求完整认证，需要 RSA 或 TLS，"
+             + "P0 都不支持。\n"
+             + "  解决：把账号改成 mysql_native_password ——\n"
+             + "    ALTER USER 'app'@'%' IDENTIFIED WITH mysql_native_password BY '口令';\n"
+             + "    FLUSH PRIVILEGES;"
+    }
+    if (plugin == "sha256_password") {
+        return "sha256_password 全程要求 RSA 或 TLS 通道，P0 不支持。"
+             + "改用 mysql_native_password。"
+    }
+    if (plugin == "mysql_clear_password") {
+        return "mysql_clear_password 会明文传输口令，只在 TLS 下安全。"
+             + "非本机连接不建议使用。"
+    }
+    return "未知认证插件 `" + plugin + "`。P0 支持："
+         + "mysql_native_password / caching_sha2_password / mysql_clear_password。"
+}

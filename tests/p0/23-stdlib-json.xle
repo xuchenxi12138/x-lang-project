@@ -1,0 +1,83 @@
+// ============================================================
+// std.json —— JSON 解析与生成
+// ============================================================
+//
+// X 没有 Map 类型，所以 JSON object 用「扁平键值数组」表示：
+//   {"a":1,"b":2}  →  [a, 1, b, 2]
+// 取字段用 jsonGet，遍历用 jsonKeys / jsonValues。
+//
+// 这是语言缺 Map 的直接后果，不是设计偏好。等语言加上 Map，
+// 这层可以换成真映射而 API 不变。
+
+from std.json import jsonParse, jsonParseScalar, jsonInt, jsonSetInt, jsonCur, jsonSkipWs, jsonFail, jsonParseValue, jsonExpect, jsonParseNumber, jsonParseString, jsonParseEscape, jsonHex4, jsonParseArray, jsonParseObject, jsonIsObject, jsonTypeOf, jsonGet, jsonGetOr, jsonHas, jsonKeys, jsonValues, jsonStringify, jsonArrayAny, jsonQuote, jsonHex, jsonNull, jsonNullValue, jsonBool, jsonNumber, jsonIntLit, jsonArrayOfStrings, jsonObject
+
+fn main() -> Void {
+    println("---- 基本解析 ----")
+    let src = "{\"name\":\"张三\",\"age\":30,\"score\":95.5,\"ok\":true,\"none\":null,\"tags\":[\"a\",\"b\"]}"
+    let o = jsonParse(src)
+    println(jsonKeys(o))                    // [name, age, score, ok, none, tags]
+    println(len(o))                         // 12（6 键 + 6 值）
+    println(jsonHas(o, "name"))             // true
+    println(jsonHas(o, "zzz"))              // false
+
+    // 类型判别按 JSON 的叫法：string / number / boolean / null / array
+    println(jsonTypeOf(jsonGet(o, "name")[0]))   // string
+    println(jsonTypeOf(jsonGet(o, "age")[0]))    // number
+    println(jsonTypeOf(jsonGet(o, "score")[0]))  // number
+    println(jsonTypeOf(jsonGet(o, "ok")[0]))     // boolean
+    println(jsonTypeOf(jsonGet(o, "none")[0]))   // null
+    println(jsonTypeOf(jsonGet(o, "tags")[0]))   // array
+
+    println("---- 取字段 ----")
+    println(jsonGet(o, "name")[0])          // 张三
+    println(jsonGet(o, "age")[0])           // 30
+    println(jsonGet(o, "score")[0])         // 95.5
+    // 键不存在时 jsonGetOr 给默认值（读配置文件最常用的形态）
+    println(jsonGetOr(o, "missing", -1))    // -1
+    println(jsonGetOr(o, "age", -1))        // 30
+
+    println("---- 生成（往返） ----")
+    // 字符串带引号，数字/布尔/null 不带 —— 靠 typeOf 判别，
+    // 不能靠「toString 后能不能转回数字」猜（"123" 会被误判）
+    println(jsonStringify(jsonGet(o, "name")[0]))    // "张三"
+    println(jsonStringify(jsonGet(o, "age")[0]))     // 30
+    println(jsonStringify(jsonGet(o, "score")[0]))   // 95.5
+    println(jsonStringify(jsonGet(o, "ok")[0]))      // true
+    println(jsonStringify(jsonGet(o, "none")[0]))    // null
+
+    println("---- 数组 ----")
+    println(jsonParse("[1,2,3]"))            // [1, 2, 3]
+    println(jsonParse("[1.5,2.5]"))          // [1.5, 2.5]
+    // 整数走 Int，带小数点走 Float：1 不会变成 1.0
+    println(jsonParse("[[1,2],[3,4]]"))      // [[1, 2], [3, 4]]
+    println(jsonParse("[]"))                 // []
+    println(jsonParse("{}"))                 // []
+
+    println("---- 字符串转义 ----")
+    let q = jsonQuote("he said \"hi\"\nand \\ bye\ttab")
+    println(q)                              // "he said \"hi\"\nand \\ bye\ttab"
+    let back = jsonParse(q)
+    println(back[0] == "he said \"hi\"\nand \\ bye\ttab")   // true
+
+    println("---- unicode 转义 ----")
+    println(jsonParse("\"\\u4e16\\u754c\""))   // [世界]
+    // 代理对（emoji 是两个 \u 组成的）
+    println(jsonParse("\"\\uD83D\\uDE00\""))   // [😀]
+
+    println("---- 顶层标量 ----")
+    // 顶层是标量时包一层，保证返回类型恒为 Array
+    println(jsonParse("42"))                 // [42]
+    println(jsonParse("\"hello\""))          // [hello]
+    println(jsonParse("true"))               // [true]
+    println(jsonParse("null"))               // [null]
+
+    println("---- 构造 object ----")
+    let keys = array(2, "")
+    keys[0] = "x"
+    keys[1] = "y"
+    let vals = array(2, 0)
+    vals[0] = 1
+    vals[1] = 2
+    println(jsonObject(keys, vals))          // {"x":1,"y":2}
+    println(jsonArrayOfStrings(keys))        // ["x","y"]
+}

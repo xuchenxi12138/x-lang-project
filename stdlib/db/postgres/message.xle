@@ -1,0 +1,212 @@
+// db/postgres/message.xle — PostgreSQL 报文帧
+//
+// ── PG 与 MySQL 的报文格式差异 ──────────────────────
+//
+// MySQL：4 字节头（3 字节小端长度 + 1 字节序号）+ 负载
+// PG：    1 字节类型 + 4 字节**大端**长度（含自身 4 字节）+ 负载
+//
+// ── 那个「含自身」很关键 ──────────────────────────
+//
+// MySQL 的长度字段只描述负载；PG 的长度字段**包含长度字段自己的
+// 4 字节**。所以读的时候要减 4，写的时候要加 4。这一处差异是
+// 手写 PG 客户端最常见的 off-by-four —— 症状是「第一个报文正常，
+// 之后全部错位」，因为每次多读了 4 字节。
+//
+// ── 为什么 PG 有类型字节而 MySQL 没有 ─────────────
+//
+// 因为 PG 的协议是**异步消息流**：一个查询会陆续返回 RowDescription、
+// DataRow、CommandComplete、ReadyForQuery 等多种消息，客户端必须
+// 靠类型字节区分。而 MySQL 的命令-响应是严格一问一答，靠第 1 字节
+// 的少数几个标记（0x00/0xFE/0xFF）就够区分了。
+
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// 启动包（StartupMessage）没有类型字节，只有长度 + 内容。
+//
+// ── 为什么启动包特殊 ────────────────────────────
+//
+// 因为它是连接建立后的第一条消息，此时客户端和服务端还没协商出
+// 协议版本，消息格式本身也还没定型。PG 的解法是「启动包用统一的
+// 无类型格式」，后续所有消息才有类型。
+
+// 构造一个协议消息：类型字节 + 长度 + 负载。
+fn pgBuildMsg(typeByte: Int, payload: Array) -> Array {
+    let out = []
+    bbPut(out, typeByte)
+    // 长度 = 4（长度字段自身）+ 负载长度
+    bbPutU32BE(out, len(payload) + 4)
+    bbPutBytes(out, payload)
+    return out
+}
+
+// 构造启动包：长度 + 内容（无类型字节）。
+fn pgBuildStartup(payload: Array) -> Array {
+    let out = []
+    bbPutU32BE(out, len(payload) + 4)
+    bbPutBytes(out, payload)
+    return out
+}
+
+// 读一个协议消息，返回 [ok, 类型字节, 负载, 错误]。
+//
+// ── 为什么把类型字节单独返回 ──────────────────────
+//
+// 因为调用方要按类型分派（'T' 是 RowDescription，'D' 是 DataRow，
+// 'C' 是 CommandComplete…）。把它留在负载第 1 字节里会让每个分支
+// 都要多一次 bbAt。
+fn pgReadMsg(c: Conn) -> Array {
+    let r = c.readN(5)
+    if (!pgBool(r, 0)) {
+        return [false, 0, [], "读取报文头失败"]
+    }
+    let head = r[1]
+    let typeByte = bbAt(head, 0)
+    // 长度含自身 4 字节，所以负载 = len - 4
+    let total = bbU32BE(head, 1)
+    let bodyLen = total - 4
+    if (bodyLen < 0) {
+        return [false, typeByte, [], "报文长度非法：" + toString(total)]
+    }
+    if (bodyLen == 0) {
+        return [true, typeByte, [], ""]
+    }
+    let rb = c.readN(bodyLen)
+    if (!pgBool(rb, 0)) {
+        return [false, typeByte, [], "读取报文体失败（要 " + toString(bodyLen) + "）"]
+    }
+    return [true, typeByte, rb[1], ""]
+}
+
+// 读消息类型字节的字符形式（调试用）。
+fn pgTypeName(t: Int) -> String {
+    if (t == 0x52) { return "R Authentication" }
+    if (t == 0x4B) { return "K BackendKeyData" }
+    if (t == 0x53) { return "S ParameterStatus" }
+    if (t == 0x5A) { return "Z ReadyForQuery" }
+    if (t == 0x54) { return "T RowDescription" }
+    if (t == 0x44) { return "D DataRow" }
+    if (t == 0x43) { return "C CommandComplete" }
+    if (t == 0x45) { return "E ErrorResponse" }
+    if (t == 0x4E) { return "N NoticeResponse" }
+    if (t == 0x31) { return "1 ParseComplete" }
+    if (t == 0x32) { return "2 BindComplete" }
+    if (t == 0x33) { return "3 CloseComplete" }
+    if (t == 0x6E) { return "n NoData" }
+    if (t == 0x73) { return "s PortalSuspended" }
+    if (t == 0x49) { return "I EmptyQueryResponse" }
+    if (t == 0x47) { return "G CopyInResponse" }
+    if (t == 0x48) { return "H CopyOutResponse" }
+    if (t == 0x64) { return "d CopyData" }
+    if (t == 0x63) { return "c CopyDone" }
+    if (t == 0x41) { return "A NotificationResponse" }
+    // ── 客户端发的消息 ─────────────────────────
+    //
+    // 服务端不会发这些，但调试协议时经常要打印我们发出去的东西，
+    // 所以一并列出。缺了它们，日志里会出现一堆 "? (0x51)"。
+    //
+    // ── 注意 'E' 的双重身份 ───────────────────────
+    //
+    // 0x45 在服务端→客户端方向是 ErrorResponse，在客户端→服务端
+    // 方向是 Execute（扩展查询的第三段）。协议靠**方向**区分，
+    // 不靠类型字节。所以这个函数只能回答「这个字节像什么」，
+    // 上面已经先命中 ErrorResponse（服务端方向），这里就不再重复。
+    if (t == 0x51) { return "Q Query" }
+    if (t == 0x50) { return "P Parse" }
+    if (t == 0x42) { return "B Bind" }
+    if (t == 0x58) { return "X Terminate" }
+    if (t == 0x70) { return "p Password/SASL" }
+    if (t == 0x46) { return "F FunctionCall" }
+    return "? (0x" + toHex(t) + ")"
+}
+
+// ── 查询消息构造 ──────────────────────────────────
+
+// 简单查询：'Q' + SQL 文本（NUL 结尾）。
+//
+// ── 简单查询 vs 扩展查询 ────────────────────────
+//
+// 简单查询（Q）只发 SQL 文本，服务端一次性返回全部结果。它不能
+// 带参数（参数得自己转义拼进 SQL），也没有预编译。
+//
+// 扩展查询（Parse/Bind/Execute）可以把参数作为**二进制**单独发，
+// 从而彻底避免注入。代价是三段往返。
+//
+// P0 先实现简单查询（能跑通绝大多数场景），参数走核心层的 sqlBind
+// 转义。这明确记录为边界，而不是假装有参数化。
+fn pgBuildQuery(sql: String) -> Array {
+    let p = []
+    bbPutUtf8(p, sql)
+    bbPut(p, 0)
+    return pgBuildMsg(0x51, p)
+}
+
+// 终止连接消息：'X' + 长度 4（无负载）。
+fn pgBuildTerminate() -> Array {
+    let p = []
+    return pgBuildMsg(0x58, p)
+}
+
+// 同步消息：'S' + 长度 4。扩展查询流程里用于「结束一个事务段」。
+fn pgBuildSync() -> Array {
+    return pgBuildMsg(0x53, [])
+}
+
+// ── 错误/通知消息解析 ─────────────────────────────
+//
+// 错误响应的负载是一串「字段类型字节 + 文本 + NUL」，以 0x00 结束。
+// 关键字段：
+//   'S' severity（ERROR / FATAL）
+//   'C' SQLSTATE（如 42P01 = 表不存在）
+//   'M' 人类可读消息
+//   'D' 详细信息
+//   'H' 提示
+fn pgParseError(payload: Array) -> String {
+    var severity = ""
+    var code = ""
+    var message = ""
+    var detail = ""
+    var hint = ""
+
+    var pos = 0
+    let n = len(payload)
+    while pos < n {
+        let tag = bbAt(payload, pos)
+        if (tag == 0) { break }
+        pos = pos + 1
+        let k = bbIndexOf(payload, 0, pos)
+        if (k < 0) { break }
+        let val = bbToText(bbSlice(payload, pos, k))
+        pos = k + 1
+
+        if (tag == 0x53) { severity = val }
+        else if (tag == 0x43) { code = val }
+        else if (tag == 0x4D) { message = val }
+        else if (tag == 0x44) { detail = val }
+        else if (tag == 0x48) { hint = val }
+    }
+
+    var out = ""
+    if (len(code) > 0) {
+        out = code + ": " + message
+    } else {
+        out = message
+    }
+    if (len(detail) > 0) { out = out + "\n  详细：" + detail }
+    if (len(hint) > 0)   { out = out + "\n  提示：" + hint }
+    return out
+}
+
+// 读一个 NUL 结尾字符串（PG 消息里到处都是）。
+fn pgReadCStr(b: Array, pos: Int) -> Array {
+    let k = bbIndexOf(b, 0, pos)
+    if (k < 0) { return [bbToText(bbSlice(b, pos, len(b))), len(b)] }
+    return [bbToText(bbSlice(b, pos, k)), k + 1]
+}
+
+// 安全读 Bool。
+fn pgBool(r: Array, idx: Int) -> Bool {
+    if (idx < 0 || idx >= len(r)) { return false }
+    if (r[idx] == true) { return true }
+    return false
+}

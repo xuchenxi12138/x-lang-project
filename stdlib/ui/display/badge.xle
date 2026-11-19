@@ -1,0 +1,238 @@
+// ui/display/badge.xle — 徽标与状态点
+//
+// ── 徽标看着简单，但它是「不确定性」的容器 ────────────
+//
+// 一个数字徽标要处理：0（不显示）、1-99（显示数字）、
+// 100+（显示 "99+"）、未知数量（显示小圆点）。
+//
+// 一个状态点要处理：四种状态色、可选的光晕、脉动动画。
+//
+// 这些都是「看起来简单、细节极多」的典型。把细节收在类里，
+// 调用方只写 badge.count(5) 或者 badge.dot(ONLINE)。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 徽标超出这个数字时显示 "99+"。
+const BADGE_MAX = 99
+
+// 状态点的语义。
+const DOT_ONLINE  = 0
+const DOT_BUSY    = 1
+const DOT_AWAY    = 2
+const DOT_OFFLINE = 3
+
+class Badge extends Widget {
+    // 数字。0 表示不显示（这是刻意的：0 条未读不该占一个角标）。
+    count: Int,
+
+    // 是否显示圆点模式（只显示一个小点，不带数字）。
+    dotMode: Bool,
+
+    // 状态点语义。-1 表示不是状态点。
+    dotState: Int,
+
+    // 文字（用于纯文字徽标，比如 "NEW"）。
+    text: String,
+
+    // 是否脉动（用于「有新内容」的强调）。
+    pulse: Bool,
+
+    // 脉动相位 0.0~1.0。
+    phase: Float,
+
+    constructor() {
+        // 徽标的矩形由 anchor 决定，初始给个零矩形。
+        self.r        = rectOf(0, 0, 0, 0)
+        self.vis      = true
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.count    = 0
+        self.dotMode  = false
+        self.dotState = 0 - 1
+        self.text     = ""
+        self.pulse    = false
+        self.phase    = 0.0
+        self.style    = Style.plain()
+    }
+
+    static fn of(n: Int) -> Badge {
+        let b = new Badge()
+        b.count = n
+        return b
+    }
+
+    static fn dot(state: Int) -> Badge {
+        let b = new Badge()
+        b.dotMode = true
+        b.dotState = state
+        return b
+    }
+
+    static fn label(s: String) -> Badge {
+        let b = new Badge()
+        b.text = s
+        return b
+    }
+
+    fn setCount(n: Int) -> Badge {
+        self.count = n
+        return self
+    }
+
+    fn setPulse(v: Bool) -> Badge {
+        self.pulse = v
+        return self
+    }
+
+    fn tick(dt: Float) -> Badge {
+        if (!self.pulse) { return self }
+        self.phase = self.phase + dt * 1.6
+        while self.phase > 1.0 { self.phase = self.phase - 1.0 }
+        return self
+    }
+
+    // ── 显示内容 ─────────────────────────────────
+
+    // 该不该画。0 条不画、空文字不画。
+    fn shouldShow() -> Bool {
+        if (!self.vis) { return false }
+        if (self.dotMode) { return true }
+        if (len(self.text) > 0) { return true }
+        return self.count > 0
+    }
+
+    // 显示的文字。
+    fn displayText() -> String {
+        if (len(self.text) > 0) { return self.text }
+        if (self.dotMode) { return "" }
+        if (self.count > BADGE_MAX) { return "99+" }
+        return toString(self.count)
+    }
+
+    // ── 几何 ────────────────────────────────────
+    //
+    // ── 为什么「贴到某个控件的右上角」是独立方法 ────────
+    //
+    // 因为那是徽标 95% 的用法。让调用方自己算 `r.x + r.w - w`
+    // 和 `r.y - h/2` 既啰嗦又容易错（尤其 y 的方向：徽标应该
+    // 压在上边界上，一半在里面一半在外面）。
+    fn attachTo(host: Rect) -> Badge {
+        let s = self.size()
+        // 右上角：右边界与 host 右边界对齐，垂直中心压在上边界。
+        let x = host.x + host.w - s.w + 4
+        let y = host.y - s.h / 2
+        self.r = rectOf(x, y, s.w, s.h)
+        return self
+    }
+
+    // 贴在右上角内侧。用于不想溢出 host 的场景（比如表格行）。
+    fn attachInside(host: Rect) -> Badge {
+        let s = self.size()
+        let x = host.x + host.w - s.w - 4
+        let y = host.y + 4
+        self.r = rectOf(x, y, s.w, s.h)
+        return self
+    }
+
+    // 徽标自身需要的尺寸。
+    fn size() -> Rect {
+        // 状态点 / 圆点模式：固定小圆。
+        if (self.dotMode) {
+            return rectOf(0, 0, 10, 10)
+        }
+        let s = self.displayText()
+        if (len(s) == 0) {
+            return rectOf(0, 0, 0, 0)
+        }
+        // 文字宽 + 左右各 6px 内边距，最小高度 18。
+        var w = winTextWidth(s) + 12
+        if (w < 18) { w = 18 }
+        return rectOf(0, 0, w, 18)
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.shouldShow()) { return }
+        if (self.r.w <= 0 || self.r.h <= 0) { return }
+
+        // 状态点的颜色。
+        var c = th.accent
+        if (self.dotState == DOT_ONLINE)  { c = th.ok }
+        if (self.dotState == DOT_BUSY)    { c = th.err }
+        if (self.dotState == DOT_AWAY)    { c = th.warn }
+        if (self.dotState == DOT_OFFLINE) { c = th.disabled }
+
+        // ── 状态点 / 圆点模式 ──
+        if (self.dotMode) {
+            let rad = self.r.w / 2
+
+            // 脉动：外圈画一个更大的半透明圆（用更暗的颜色近似）。
+            //
+            // 严格说这不是「透明」，而是「在底色和强调色之间取一个
+            // 中间值」。视觉上等价于低不透明度的光晕，而语言没有
+            // alpha 填充原语。
+            if (self.pulse) {
+                let grow = toInt(self.phase * 4.0)
+                let er = rad + grow
+                winEllipse(self.r.x + rad - er, self.r.y + rad - er,
+                           er * 2, er * 2, badgeBlend(th.surface, c, 0.35))
+            }
+
+            winEllipse(self.r.x, self.r.y, self.r.w, self.r.h, c)
+            return
+        }
+
+        // ── 数字 / 文字徽标 ──
+        //
+        // 胶囊形：半径 = 高度/2。
+        var bg = th.accent
+        if (!self.enabled) { bg = th.disabled }
+        winFillRound(self.r.x, self.r.y, self.r.w, self.r.h,
+                     self.r.h / 2, bg)
+
+        // 文字用 onAccent（在强调色上的对比色）。
+        let s = self.displayText()
+        var tc = th.onAccent
+        if (!self.enabled) { tc = th.textDim }
+        uiTextInRect(self.r, s, tc)
+    }
+
+    // 徽标不响应输入 —— 它是状态指示，不是按钮。
+    fn hit(mx: Int, my: Int) -> Bool {
+        return false
+    }
+}
+
+// 局部复用：颜色插值。switch.xle 里有一个同名的，但那个文件
+// 是控件层，display 层不该依赖它（会形成 display→control 的
+// 反向依赖，而依赖方向应该是 control→core 的单向）。
+//
+// 十行的函数复制一次比引入一个跨层依赖便宜 —— 这个判断在
+// 小函数上成立，在大函数上不成立。
+fn badgeBlend(a: Int, b: Int, t: Float) -> Int {
+    if (t <= 0.0) { return a }
+    if (t >= 1.0) { return b }
+    let ar = (a >> 16) & 0xFF
+    let ag = (a >> 8) & 0xFF
+    let ab = a & 0xFF
+    let br = (b >> 16) & 0xFF
+    let bg = (b >> 8) & 0xFF
+    let bb = b & 0xFF
+    var r = toInt(toFloat(ar) + (toFloat(br) - toFloat(ar)) * t + 0.5)
+    var g = toInt(toFloat(ag) + (toFloat(bg) - toFloat(ag)) * t + 0.5)
+    var bl = toInt(toFloat(ab) + (toFloat(bb) - toFloat(ab)) * t + 0.5)
+    if (r < 0) { r = 0 }
+    if (r > 255) { r = 255 }
+    if (g < 0) { g = 0 }
+    if (g > 255) { g = 255 }
+    if (bl < 0) { bl = 0 }
+    if (bl > 255) { bl = 255 }
+    return (r << 16) | (g << 8) | bl
+}

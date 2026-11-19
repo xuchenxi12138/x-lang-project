@@ -1,0 +1,339 @@
+// db/mysql/driver.xle — MySQL 驱动
+//
+// ── 这个类在整体架构里的位置 ──────────────────────
+//
+//   DataSource（抽象基类，core/datasource.xle）
+//        ↑ 实现
+//   MySqlDataSource（本文件）
+//        用 → Conn（core/socket.xle）
+//        用 → packet / handshake / auth / response / resultset
+//
+// 上层（Pool、业务代码）只看到 DataSource 的五个方法：connect /
+// close / ping / query / execute。所有 MySQL 的细节被关在这个
+// 文件里。
+
+from "../core/datasource.xle" import sqlBind, execAll, DataSource
+from "../core/result.xle" import ResultSet
+from "../core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "packet.xle" import myReadPacket, myWritePacket, myReadLenEnc, myWriteLenEnc, myWriteLenEncStr, myWriteLenEncBytes, myReadLenEncBytes, myReadLenEncStr, myReadNulStr, myReadNulBytes, myIsErrPacket, myIsOkPacket, myIsEofPacket, myParseErrPacket, myParseOkPacket, myArrBool, myArrBytes, MY_MAX_PAYLOAD
+from "handshake.xle" import myClientCaps, myParseHandshake, myReadHandshake, HandshakeInfo, MY_CAP_LONG_PASSWORD, MY_CAP_FOUND_ROWS, MY_CAP_LONG_FLAG, MY_CAP_CONNECT_WITH_DB, MY_CAP_PROTOCOL_41, MY_CAP_TRANSACTIONS, MY_CAP_SECURE_CONN, MY_CAP_MULTI_RESULTS, MY_CAP_PLUGIN_AUTH
+from "auth.xle" import myNativePassword, myCachingSha2Password, myAuthResponse, myPluginSupported, myNeedsFullAuth, myAuthHint
+from "response.xle" import myBuildHandshakeResponse, myBuildAuthSwitch, myParseAuthSwitch, myIsMoreDataPacket, myMoreDataKind, MY_CHARSET_UTF8MB4
+from "resultset.xle" import myParseColumn, myParseTextRow, myReadResultSet, ColumnDef, MY_TYPE_DECIMAL, MY_TYPE_TINY, MY_TYPE_SHORT, MY_TYPE_LONG, MY_TYPE_FLOAT, MY_TYPE_DOUBLE, MY_TYPE_NULL, MY_TYPE_TIMESTAMP, MY_TYPE_LONGLONG, MY_TYPE_INT24, MY_TYPE_DATE, MY_TYPE_TIME, MY_TYPE_DATETIME, MY_TYPE_YEAR, MY_TYPE_NEWDATE, MY_TYPE_VARCHAR, MY_TYPE_BIT, MY_TYPE_JSON, MY_TYPE_NEWDECIMAL, MY_TYPE_ENUM, MY_TYPE_SET, MY_TYPE_TINY_BLOB, MY_TYPE_MEDIUM_BLOB, MY_TYPE_LONG_BLOB, MY_TYPE_BLOB, MY_TYPE_VAR_STRING, MY_TYPE_STRING, MY_TYPE_GEOMETRY, MY_FLAG_NOT_NULL, MY_FLAG_UNSIGNED, MY_FLAG_BINARY
+
+// COM_QUERY 命令号。MySQL 的命令都有编号，只有查询是文本 SQL。
+const MY_COM_QUERY = 0x03
+
+// COM_PING
+const MY_COM_PING = 0x0E
+
+// COM_QUIT
+const MY_COM_QUIT = 0x01
+
+class MySqlDataSource extends DataSource {
+    // 账号
+    user: String,
+    password: String,
+    database: String,
+
+    // 底层连接。null 表示未连接。
+    conn: Conn,
+
+    // 握手得到的信息（版本、能力、插件），连接后可用于诊断。
+    hello: HandshakeInfo,
+
+    constructor(ep: Endpoint, user: String, password: String, database: String) {
+        self.ep        = ep
+        self.user      = user
+        self.password  = password
+        self.database  = database
+        self.dialect   = dialectOf(DB_MYSQL)
+        self.connected = false
+        self.lastError = ""
+        self.conn      = new Conn(0 - 1, ep.host, ep.port)
+        let h = new HandshakeInfo()
+        self.hello = h
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    // 从 URL 字符串建数据源。
+    //
+    // 支持的形态（和 JDBC 的写法对齐，便于迁移）：
+    //   mysql://user:pwd@host:3306/dbname
+    //   mysql://user:pwd@host/dbname        （端口默认 3306）
+    //   mysql://host/dbname                 （无账号，匿名）
+    static fn ofUrl(url: String, user: String, password: String) -> MySqlDataSource {
+        let u = myParseUrl(url)
+        return new MySqlDataSource(endpointOf(toString(u[1]), toInt(u[2])),
+                                   user, password, toString(u[3]))
+    }
+
+    // ── DataSource 接口实现 ──────────────────────
+
+    fn connect() -> Bool {
+        self.lastError = ""
+        let c = Conn.dial(self.ep)
+        if (!c.isOpen()) {
+            self.lastError = "连接 " + endpointString(self.ep) + " 失败：" + c.lastError
+            return false
+        }
+        self.conn = c
+
+        // ① 读服务端握手包
+        let hello = myReadHandshake(c)
+        if (!hello.ok) {
+            self.lastError = "握手失败：" + hello.error
+            c.close()
+            return false
+        }
+        self.hello = hello
+
+        if (!myPluginSupported(hello.plugin)) {
+            self.lastError = "不支持的认证插件 `" + hello.plugin + "`\n"
+                           + "  " + myAuthHint(hello.plugin)
+            c.close()
+            return false
+        }
+
+        // ② 发 Handshake Response 41（序号从 1 开始，因为服务端用了 0）
+        let resp = myBuildHandshakeResponse(hello, self.user, self.password, self.database)
+        if (!myWritePacket(c, 1, resp)) {
+            self.lastError = "发送认证响应失败"
+            c.close()
+            return false
+        }
+
+        // ③ 处理认证结果（可能要经过若干轮）
+        let ok = self.finishAuth()
+        if (!ok) {
+            c.close()
+            return false
+        }
+
+        self.connected = true
+        return true
+    }
+
+    // 处理认证的后续往返：OK / ERR / AuthSwitch / MoreData。
+    //
+    // ── 为什么是个循环 ──────────────────────────
+    //
+    // 认证不是一个回合能结束的：
+    //   * 服务端可能要求切换插件（AuthSwitch）→ 重算应答再发
+    //   * caching_sha2 可能先给 0x01 0x03（跳过完整认证）再给 OK
+    // 所以这里用循环，直到拿到 OK 或 ERR。
+    fn finishAuth() -> Bool {
+        var rounds = 0
+        while rounds < 8 {
+            let r = myReadPacket(self.conn)
+            if (!myArrBool(r, 0)) {
+                self.lastError = "等待认证结果失败：" + toString(r[3])
+                return false
+            }
+            let seq = toInt(r[1])
+            let p   = r[2]
+
+            if (myIsOkPacket(p)) {
+                return true
+            }
+            if (myIsErrPacket(p)) {
+                self.lastError = "认证被拒：" + myParseErrPacket(p)
+                return false
+            }
+
+            // Auth Switch Request：服务端要求换插件
+            if (len(p) > 0 && bbAt(p, 0) == 0xFE && len(p) > 1) {
+                let sw = myParseAuthSwitch(p)
+                let plugin = toString(sw[0])
+                let salt   = sw[1]
+                if (!myPluginSupported(plugin)) {
+                    self.lastError = "服务端要求切换到不支持的插件 `" + plugin + "`\n"
+                                   + "  " + myAuthHint(plugin)
+                    return false
+                }
+                let answer = myBuildAuthSwitch(plugin, self.password, salt)
+                if (!myWritePacket(self.conn, seq + 1, answer)) {
+                    self.lastError = "发送切换插件应答失败"
+                    return false
+                }
+                rounds = rounds + 1
+                continue
+            }
+
+            // More Data：caching_sha2 的子命令
+            if (myIsMoreDataPacket(p)) {
+                let kind = myMoreDataKind(p)
+                if (kind == 0x03) {
+                    // fast auth success，紧接着还有 OK 包，继续循环
+                    rounds = rounds + 1
+                    continue
+                }
+                if (kind == 0x04) {
+                    // full authentication 请求 —— P0 走不通
+                    self.lastError = "服务端要求完整认证（full authentication）。\n"
+                                   + "  " + myAuthHint(self.hello.plugin)
+                    return false
+                }
+            }
+
+            // 0x01 0x06 = 要求用公钥加过密的口令（同样走不通）
+            if (len(p) >= 2 && bbAt(p, 0) == 0x01 && bbAt(p, 1) == 0x06) {
+                self.lastError = "服务端要求 RSA 公钥加密口令，P0 无 RSA 实现。\n"
+                               + "  " + myAuthHint(self.hello.plugin)
+                return false
+            }
+
+            self.lastError = "认证过程中收到无法识别的报文：" + bbHex(p, 16)
+            return false
+        }
+        self.lastError = "认证往返轮次过多（>8）"
+        return false
+    }
+
+    fn close() {
+        if (self.conn != null && self.conn.isOpen()) {
+            // 发 COM_QUIT 是礼貌的关闭方式，服务端会立刻回收资源。
+            // 失败也无所谓 —— 直接断 TCP 服务端照样会清理。
+            let q = []
+            bbPut(q, MY_COM_QUIT)
+            myWritePacket(self.conn, 0, q)
+            self.conn.close()
+        }
+        self.connected = false
+    }
+
+    fn ping() -> Bool {
+        if (!self.connected || self.conn == null) { return false }
+        if (!self.conn.isOpen()) {
+            self.connected = false
+            return false
+        }
+        let q = []
+        bbPut(q, MY_COM_PING)
+        if (!myWritePacket(self.conn, 0, q)) {
+            self.connected = false
+            return false
+        }
+        let r = myReadPacket(self.conn)
+        if (!myArrBool(r, 0)) {
+            self.connected = false
+            return false
+        }
+        return myIsOkPacket(r[2])
+    }
+
+    fn query(sql: String) -> ResultSet {
+        return self.run(sql)
+    }
+
+    fn execute(sql: String) -> ResultSet {
+        return self.run(sql)
+    }
+
+    // 执行一条 SQL。
+    //
+    // ── 为什么 query 和 execute 是同一个实现 ───────────
+    //
+    // 因为 MySQL 的 COM_QUERY 不区分「查询」和「更新」—— 服务端自己
+    // 判断该回结果集还是 OK 包。客户端声明「我以为是查询」没有任何
+    // 意义。所以两者共用一条路径，由响应形态决定 ResultSet 的内容。
+    fn run(sql: String) -> ResultSet {
+        // ── 为什么用 monoMillis 而不是 nowMillis ────────────
+        //
+        // elapsedMs 是两个时刻的差。墙上时钟会被 NTP 校正，一次向后
+        // 校正就能让差值变成负数（"这条查询花了 -3000ms"）。单调时钟
+        // 只保证递增，正是为差值设计的。
+        let t0 = monoMillis()
+        if (!self.connected || self.conn == null) {
+            // 尝试自动重连一次。连接池借出的连接可能已被服务端超时断开。
+            if (!self.connect()) {
+                return ResultSet.fail("未连接：" + self.lastError)
+            }
+        }
+
+        let payload = []
+        bbPut(payload, MY_COM_QUERY)
+        bbPutUtf8(payload, sql)
+        if (!myWritePacket(self.conn, 0, payload)) {
+            self.lastError = "发送查询失败：" + self.conn.lastError
+            self.connected = false
+            return ResultSet.fail(self.lastError)
+        }
+
+        let r = myReadResultSet(self.conn, 1)
+        let elapsed = monoMillis() - t0
+        if (!myArrBool(r, 0)) {
+            self.lastError = toString(r[3])
+            return ResultSet.fail(self.lastError)
+        }
+        let rs: ResultSet = r[1]
+        rs.elapsedMs = toInt(elapsed)
+        return rs
+    }
+
+    // ── 诊断 ────────────────────────────────────
+
+    fn describe() -> String {
+        var state = "未连接"
+        if (self.connected) { state = "已连接" }
+        return "MySQL @" + endpointString(self.ep)
+             + " db=" + self.database
+             + " user=" + self.user
+             + " [" + state + "]"
+             + " " + self.hello.describe()
+    }
+
+    // 服务端版本号（连接后可用）。
+    fn serverVersion() -> String {
+        return self.hello.serverVersion
+    }
+}
+
+// ── URL 解析 ──────────────────────────────────────
+//
+// 返回 [scheme, host, port, database]。
+//
+// ── 为什么手写而不是正则 ────────────────────────
+//
+// P0 没有正则引擎。而 URL 的结构足够简单（scheme://[user[:pwd]@]host
+// [:port][/db]），用 strFind 分段比引入一个正则实现更轻。
+fn myParseUrl(url: String) -> Array {
+    var rest = url
+    var scheme = "mysql"
+
+    let k = strFind(url, "://")
+    if (k >= 0) {
+        scheme = strSub(url, 0, k)
+        rest   = strSub(url, k + 3, len(url))
+    }
+
+    // 去掉 user:pwd@ 前缀
+    let at = strFind(rest, "@")
+    if (at >= 0) {
+        rest = strSub(rest, at + 1, len(rest))
+    }
+
+    var host = rest
+    var port = 3306
+    var db   = ""
+
+    let slash = strFind(rest, "/")
+    if (slash >= 0) {
+        host = strSub(rest, 0, slash)
+        db   = strSub(rest, slash + 1, len(rest))
+    }
+
+    let colon = strFind(host, ":")
+    if (colon >= 0) {
+        let ps = strSub(host, colon + 1, len(host))
+        port = strParseInt(ps)
+        host = strSub(host, 0, colon)
+    }
+    if (len(host) == 0) { host = "127.0.0.1" }
+
+    return [scheme, host, port, db]
+}

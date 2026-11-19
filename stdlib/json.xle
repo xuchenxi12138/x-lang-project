@@ -1,0 +1,621 @@
+// ============================================================
+// std.json —— JSON 解析与生成
+// ============================================================
+//
+// ── 为什么需要这一层，而不是直接映射到 X 的值 ──────────────
+//
+// X 只有 6 种值类型：Null/Int/Float/Bool/String/Array。JSON 有
+// object，而 X 没有 Map。三种做法各有代价：
+//
+//   a) object → 数组 [k1, v1, k2, v2, ...]（扁平键值对）
+//   b) object → 嵌套数组 [[k1,v1], [k2,v2], ...]
+//   c) object → 两个并行数组 (keys, values)
+//
+// 选 (a)。理由：
+//   · (b) 每取一项要两次下标，且打印出来 [[a,1]] 比 [a,1] 更难读；
+//   · (c) 要求调用方同时持有两数组，而 X 没有元组，返回两个值
+//     只能靠全局变量（语言没有）或打包成数组 —— 又绕回 (a)/(b)。
+//   · (a) 的奇数长度天然表示「键值对序列」，重复键也能保留
+//     （JSON 允许重复键，最后一个是权威值，但保留全部更利于诊断）。
+//
+// 代价是：解析结果不是「自然」的 X 数据，取字段必须用 jsonGet。
+// 这是语言缺 Map 的直接后果，不是设计偏好。等语言加了 Map，
+// 这层可以换成真映射而保持 API 不变。
+//
+// ── 类型判别 ────────────────────────────────────────────────
+//
+// 解析后的 object 是一个 Array，元素交替为 String(键) 与任意值。
+// 于是「一个值是不是 object」无法只看类型（Array 也可能是数组），
+// 所以用 jsonIsObject 做启发式判断：长度偶数、奇数位都是 String。
+// 这个判断在极少数情况下会误判（比如 [\"a\", 1] 这种恰好符合
+// 形状的普通数组），所以**生成 JSON 时**用另一个入口 jsonObject
+// 明确构造，不依赖启发式。解析侧的 jsonType 只用于「已经是解析
+// 结果」的数据，这是它的使用前提，注释里写清楚。
+
+// ---- 解析 ----
+//
+// 手写递归下降。不用正则（语言没有）、不用第三方（要求是标准库）。
+//
+// 两个必须小心的点：
+//   1. 深度。嵌套 10000 层的 `[[[[...]]]]` 会打爆调用栈。给一个
+//      上限（默认 256），超了报错而不是崩 —— 崩掉的进程没法给出
+//      任何可读信息。
+//   2. 数字。JSON 的 number 包含整数、小数、指数。整数走 Int
+//      （避免 1 变成 1.0 让用户奇怪），带小数点或指数走 Float。
+
+// 解析入口。成功返回解析结果，失败直接 fail（带位置）。
+//
+// 返回类型恒为 Array：
+//   · 顶层是 object → 扁平键值数组
+//   · 顶层是 array  → 该数组
+//   · 顶层是标量    → 单元素数组 [值]
+//
+// 这样调用方拿到的永远是数组，不用先判断「是不是数组」。
+// 三者都能用 len / [i] 处理，而标量包一层是唯一能让返回类型
+// 统一的做法（语言没有联合类型）。
+fn jsonParse(src: String) -> Array {
+    let st = array(3, 0)
+    st[0] = 0          // 当前**码点**下标
+    st[1] = src        // 源串
+    st[2] = 0          // 当前嵌套深度
+    jsonSkipWs(st)
+    // jsonParseValue 恒返回包装 [值]，这里解一层。
+    let v = jsonParseValue(st)[0]
+    jsonSkipWs(st)
+    if (jsonInt(st, 0) < len(src)) {
+        jsonFail(st, "有多余内容（值已解析完但还有剩余字符）")
+    }
+    if (typeOf(v) == "Array") { return v }
+    return array(1, v)
+}
+
+// 顶层是单个标量时，用这个入口取回它。
+fn jsonParseScalar(src: String) -> String {
+    let v = jsonParse(src)
+    if (len(v) == 1) {
+        return jsonStringify(v[0])
+    }
+    return jsonStringify(v)
+}
+
+fn jsonInt(st: Array, i: Int) -> Int {
+    return toInt(st[i])
+}
+
+fn jsonSetInt(st: Array, i: Int, v: Int) -> Void {
+    st[i] = v
+}
+
+// 当前字符。越界返回空串，调用方统一按「空串 = 结束」处理，
+// 省掉每处的边界判断。
+fn jsonCur(st: Array) -> String {
+    let src = st[1]
+    let i = jsonInt(st, 0)
+    if (i >= len(src)) { return "" }
+    return strAt(src, i)
+}
+
+fn jsonSkipWs(st: Array) -> Void {
+    while (true) {
+        let c = jsonCur(st)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        } else {
+            return
+        }
+    }
+}
+
+fn jsonFail(st: Array, msg: String) -> Void {
+    let at = jsonInt(st, 0)
+    fail("jsonParse: 第 " + toString(at) + " 个字符处 " + msg)
+}
+
+// 解析一个值，**永远返回单元素包装数组 [值]**。
+//
+// ── 为什么必须统一包装（这条踩过一次） ──────────────────
+//
+// 最初的写法是「标量返回 [v]，数组/对象返回原值」，看起来省一层。
+// 但调用方一律按 v[0] 解包，于是数组被多解了一层：
+//   [[1,2],[3,4]]  →  内层数组当包装，取出的是它自己的第 0 个元素
+//   →  结果变成 [1, 3]，两个内层数组的第一个元素。
+//
+// 而且这个错在单层数组上完全看不出来（[1,2] 解包后仍是 [1,2] 的
+// 第 0 个元素 = 1？不，单层时返回原值 [1,2]，v[0] 是 1，凑巧
+// 「看起来像」JSON 的第一个元素）。只有嵌套结构才暴露。
+//
+// 接口一致的代价是每个值多一次数组分配，收益是调用方不需要
+// 判断「这次拿到的是包装还是原值」—— 后者迟早会漏一处。
+fn jsonParseValue(st: Array) -> Array {
+    let d = jsonInt(st, 2)
+    if (d > 256) {
+        jsonFail(st, "嵌套层数超过 256 —— 输入可能是恶意的深层嵌套")
+    }
+    jsonSetInt(st, 2, d + 1)
+
+    let c = jsonCur(st)
+    var out = array(1, 0)
+
+    if (c == "{") {
+        out = array(1, jsonParseObject(st))
+    } else if (c == "[") {
+        out = array(1, jsonParseArray(st))
+    } else if (c == "\"") {
+        out = array(1, jsonParseString(st))
+    } else if (c == "t") {
+        jsonExpect(st, "true")
+        out = array(1, true)
+    } else if (c == "f") {
+        jsonExpect(st, "false")
+        out = array(1, false)
+    } else if (c == "n") {
+        jsonExpect(st, "null")
+        // null 必须用真正的 Null 值，不能用 0 占位：0 是 Int，
+        // jsonStringify 会把 null 输出成 0，而且 jsonTypeOf 会
+        // 把它报成 "number" —— 往返一轮数据就变了。
+        //
+        // X 没有 null 字面量，唯一能产出 Null 的途径是
+        // arrPop(空数组)。这看起来绕，但它是语言当前唯一
+        // 可靠的 null 来源，注释说明以免将来被「优化」掉。
+        out = array(1, jsonNullValue())
+    } else if (c == "" ) {
+        jsonFail(st, "意外结束：期望一个值")
+    } else {
+        out = jsonParseNumber(st)
+    }
+
+    jsonSetInt(st, 2, jsonInt(st, 2) - 1)
+    return out
+}
+
+fn jsonExpect(st: Array, lit: String) -> Void {
+    var i = 0
+    while (i < len(lit)) {
+        let c = jsonCur(st)
+        if (c != strAt(lit, i)) {
+            jsonFail(st, "期望字面量 `" + lit + "`")
+        }
+        jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        i = i + 1
+    }
+}
+
+// 数字。整数返回 Int（不走 Float，否则 1 会变成 1.0），
+// 带 '.' 或 'e'/'E' 的返回 Float。
+fn jsonParseNumber(st: Array) -> Array {
+    let start = jsonInt(st, 0)
+    var isFloat = false
+
+    let c0 = jsonCur(st)
+    if (c0 == "-") { jsonSetInt(st, 0, jsonInt(st, 0) + 1) }
+
+    while (true) {
+        let c = jsonCur(st)
+        if (c == "" ) { break }
+        if (c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
+            c == "5" || c == "6" || c == "7" || c == "8" || c == "9") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        } else if (c == ".") {
+            isFloat = true
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        } else if (c == "e" || c == "E") {
+            isFloat = true
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+            let s = jsonCur(st)
+            if (s == "+" || s == "-") { jsonSetInt(st, 0, jsonInt(st, 0) + 1) }
+        } else {
+            break
+        }
+    }
+
+    let end = jsonInt(st, 0)
+    if (end == start) {
+        jsonFail(st, "期望一个数字")
+    }
+    let text = strSub(st[1], start, end)
+    let out = array(1, 0)
+    if (isFloat) {
+        out[0] = strParseFloat(text)
+    } else {
+        out[0] = strParseInt(text)
+    }
+    return out
+}
+
+// 字符串。处理全部 JSON 转义，包括 \uXXXX（含代理对）。
+fn jsonParseString(st: Array) -> String {
+    let c = jsonCur(st)
+    if (c != "\"") {
+        jsonFail(st, "期望一个字符串")
+    }
+    jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+
+    var out = ""
+    while (true) {
+        let ch = jsonCur(st)
+        if (ch == "") {
+            jsonFail(st, "字符串没有闭合的引号")
+        }
+        if (ch == "\"") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+            return out
+        }
+        if (ch == "\\") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+            out = out + jsonParseEscape(st)
+        } else {
+            out = out + ch
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        }
+    }
+}
+
+fn jsonParseEscape(st: Array) -> String {
+    let c = jsonCur(st)
+    jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+    if (c == "\"") { return "\"" }
+    if (c == "\\") { return "\\" }
+    if (c == "/")  { return "/" }
+    if (c == "b")  { return "\u{8}" }
+    if (c == "f")  { return "\u{c}" }
+    if (c == "n")  { return "\n" }
+    if (c == "r")  { return "\r" }
+    if (c == "t")  { return "\t" }
+    if (c == "u") {
+        let hi = jsonHex4(st)
+        // 代理对：D800-DBFF 是高位，后跟 \uDC00-\uDFFF
+        if (hi >= 55296 && hi <= 56319) {
+            let save = jsonInt(st, 0)
+            let bs = jsonCur(st)
+            if (bs == "\\") {
+                jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+                let u2 = jsonCur(st)
+                if (u2 == "u") {
+                    jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+                    let lo = jsonHex4(st)
+                    if (lo >= 56320 && lo <= 57343) {
+                        let cp = 65536 + (hi - 55296) * 1024 + (lo - 56320)
+                        return strFromCode(cp)
+                    }
+                }
+            }
+            // 不是配对的后半，回退并按单码点处理
+            jsonSetInt(st, 0, save)
+        }
+        return strFromCode(hi)
+    }
+    jsonFail(st, "无法识别的转义序列 `\\" + c + "`")
+    return ""
+}
+
+fn jsonHex4(st: Array) -> Int {
+    var v = 0
+    var i = 0
+    while (i < 4) {
+        let c = jsonCur(st)
+        if (c == "") { jsonFail(st, "\\u 转义不完整") }
+        var d = -1
+        if (c == "0") { d = 0 }
+        else if (c == "1") { d = 1 }
+        else if (c == "2") { d = 2 }
+        else if (c == "3") { d = 3 }
+        else if (c == "4") { d = 4 }
+        else if (c == "5") { d = 5 }
+        else if (c == "6") { d = 6 }
+        else if (c == "7") { d = 7 }
+        else if (c == "8") { d = 8 }
+        else if (c == "9") { d = 9 }
+        else if (c == "a" || c == "A") { d = 10 }
+        else if (c == "b" || c == "B") { d = 11 }
+        else if (c == "c" || c == "C") { d = 12 }
+        else if (c == "d" || c == "D") { d = 13 }
+        else if (c == "e" || c == "E") { d = 14 }
+        else if (c == "f" || c == "F") { d = 15 }
+        if (d < 0) {
+            jsonFail(st, "\\u 后面需要 4 位十六进制")
+        }
+        v = v * 16 + d
+        jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        i = i + 1
+    }
+    return v
+}
+
+// JSON 数组 → X 数组。每个元素都是一层包装数组，所以取 [0] 解包。
+fn jsonParseArray(st: Array) -> Array {
+    jsonSetInt(st, 0, jsonInt(st, 0) + 1)   // 吃掉 '['
+    let out = array(0, 0)
+    jsonSkipWs(st)
+    if (jsonCur(st) == "]") {
+        jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        return out
+    }
+    while (true) {
+        jsonSkipWs(st)
+        let v = jsonParseValue(st)
+        arrPush(out, v[0])
+        jsonSkipWs(st)
+        let c = jsonCur(st)
+        if (c == ",") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        } else if (c == "]") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+            return out
+        } else {
+            jsonFail(st, "数组里期望 `,` 或 `]`")
+        }
+    }
+    return out
+}
+
+// JSON object → 扁平键值数组 [k1, v1, k2, v2, ...]
+fn jsonParseObject(st: Array) -> Array {
+    jsonSetInt(st, 0, jsonInt(st, 0) + 1)   // 吃掉 '{'
+    let out = array(0, 0)
+    jsonSkipWs(st)
+    if (jsonCur(st) == "}") {
+        jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        return out
+    }
+    while (true) {
+        jsonSkipWs(st)
+        let k = jsonParseString(st)
+        jsonSkipWs(st)
+        if (jsonCur(st) != ":") {
+            jsonFail(st, "键名后期望 `:`")
+        }
+        jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        jsonSkipWs(st)
+        let v = jsonParseValue(st)
+        arrPush(out, k)
+        arrPush(out, v[0])
+        jsonSkipWs(st)
+        let c = jsonCur(st)
+        if (c == ",") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+        } else if (c == "}") {
+            jsonSetInt(st, 0, jsonInt(st, 0) + 1)
+            return out
+        } else {
+            jsonFail(st, "object 里期望 `,` 或 `}`")
+        }
+    }
+    return out
+}
+
+// ---- 取字段 ----
+
+// 判断一个值是不是「解析出来的 object」：长度偶数，奇数位都是 String。
+//
+// 这是启发式，会误判形状恰好的普通数组。所以生成 JSON 时不要用它 ——
+// 用 jsonObject 明确构造。它只在「处理 jsonParse 的结果」时可靠。
+fn jsonIsObject(v: Array) -> Bool {
+    let n = len(v)
+    if (n == 0) { return false }   // 空数组无法区分，按数组处理
+    if (n % 2 != 0) { return false }
+    var i = 0
+    while (i < n) {
+        let e = v[i]
+        if (typeOf(e) != "String") { return false }
+        i = i + 2
+    }
+    return true
+}
+
+// 值的运行时类型名。直接转小写，让调用方写 "string" 而不是 "String"，
+// 与 JSON 的类型叫法对齐（JSON 的六种：object/array/string/number/
+// boolean/null）。
+fn jsonTypeOf(x) -> String {
+    let t = typeOf(x)
+    if (t == "String") { return "string" }
+    if (t == "Int") { return "number" }
+    if (t == "Float") { return "number" }
+    if (t == "Bool") { return "boolean" }
+    if (t == "Null") { return "null" }
+    if (t == "Array") {
+        // 空数组按数组处理（与 jsonIsObject 一致）
+        return "array"
+    }
+    return "unknown"
+}
+
+fn jsonGet(o: Array, key: String) -> Array {
+    let n = len(o)
+    if (n % 2 != 0) {
+        fail("jsonGet: 传入的不是 object（长度为奇数 " + toString(n) + "）")
+    }
+    var i = 0
+    while (i < n) {
+        if (o[i] == key) {
+            return array(1, o[i + 1])
+        }
+        i = i + 2
+    }
+    fail("jsonGet: 没有键 `" + key + "`")
+    return array(1, 0)
+}
+
+// 带默认值的取字段：键不存在时返回默认值，不报错。
+// 这是读配置文件最常用的形态 —— 配置项缺失应该是正常路径。
+fn jsonGetOr(o: Array, key: String, def: Int) -> Int {
+    let n = len(o)
+    if (n % 2 != 0) { return def }
+    var i = 0
+    while (i < n) {
+        if (o[i] == key) {
+            return toInt(o[i + 1])
+        }
+        i = i + 2
+    }
+    return def
+}
+
+fn jsonHas(o: Array, key: String) -> Bool {
+    let n = len(o)
+    if (n % 2 != 0) { return false }
+    var i = 0
+    while (i < n) {
+        if (o[i] == key) { return true }
+        i = i + 2
+    }
+    return false
+}
+
+// 键列表 / 值列表，便于遍历
+fn jsonKeys(o: Array) -> Array {
+    let out = array(0, "")
+    var i = 0
+    while (i < len(o)) {
+        arrPush(out, o[i])
+        i = i + 2
+    }
+    return out
+}
+
+fn jsonValues(o: Array) -> Array {
+    let out = array(0, 0)
+    var i = 1
+    while (i < len(o)) {
+        arrPush(out, o[i])
+        i = i + 2
+    }
+    return out
+}
+
+// ---- 生成 ----
+
+// 把任意值转成 JSON 文本。
+//
+// 用 typeOf 判别类型 —— 这是唯一可靠的办法。之前设想的
+// 「toString 后能否无损转回」在字符串内容恰好是 "123" 时
+// 会把字符串输出成数字（丢引号），是完全错误的。
+fn jsonStringify(v) -> String {
+    let t = typeOf(v)
+    if (t == "String") {
+        return jsonQuote(toString(v))
+    }
+    if (t == "Bool") {
+        // toString(true) 给出 "true"，与 JSON 的字面量一致
+        return toString(v)
+    }
+    if (t == "Null") {
+        return "null"
+    }
+    if (t == "Array") {
+        return jsonArrayAny(v)
+    }
+    // Int / Float：toString 已经给出合法的 JSON 数字
+    // （Float 的 3.0 也是合法 JSON，虽然严格说 JSON 允许 3）
+    return toString(v)
+}
+
+// 任意数组 → JSON 数组。逐个元素递归 jsonStringify。
+fn jsonArrayAny(xs: Array) -> String {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) { out = out + "," }
+        out = out + jsonStringify(xs[i])
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// 字符串 → 带引号的 JSON 字面量，转义所有必须转义的字符。
+fn jsonQuote(s: String) -> String {
+    var out = "\""
+    var i = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == "\"") {
+            out = out + "\\\""
+        } else if (c == "\\") {
+            out = out + "\\\\"
+        } else if (c == "\n") {
+            out = out + "\\n"
+        } else if (c == "\r") {
+            out = out + "\\r"
+        } else if (c == "\t") {
+            out = out + "\\t"
+        } else if (strCode(c) < 32) {
+            out = out + "\\u{" + jsonHex(strCode(c)) + "}"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn jsonHex(n: Int) -> String {
+    let digits = "0123456789abcdef"
+    if (n == 0) { return "0" }
+    var out = ""
+    var v = n
+    while (v > 0) {
+        let d = v % 16
+        out = strAt(digits, d) + out
+        v = v / 16
+    }
+    return out
+}
+
+fn jsonNull() -> String {
+    return "null"
+}
+
+// 真正的 Null 值。
+//
+// X 没有 null 字面量，也没有 null 常量 —— 唯一能产出 Null 的操作是
+// 从空数组里弹一个元素。这不是巧合，而是「弹空数组返回 null」这条
+// 语义的副产品，而它恰好是当前语言里唯一可靠的 null 来源。
+//
+// 一旦语言加上 null 字面量（或 Nothing 之类），这个函数应该改成
+// 直接返回那个字面量，而所有调用点不用动 —— 这正是把它包成函数的
+// 理由，而不是在每个需要 null 的地方写 arrPop(array(0,0))。
+fn jsonNullValue() {
+    let empty = array(0, 0)
+    return arrPop(empty)
+}
+
+fn jsonBool(b: Bool) -> String {
+    if (b) { return "true" }
+    return "false"
+}
+
+fn jsonNumber(x: Float) -> String {
+    return toString(x)
+}
+
+fn jsonIntLit(x: Int) -> String {
+    return toString(x)
+}
+
+// 字符串数组 → JSON 数组
+fn jsonArrayOfStrings(xs: Array) -> String {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) { out = out + "," }
+        out = out + jsonQuote(toString(xs[i]))
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// 键值对数组 → JSON object。keys 与 vals 必须等长。
+fn jsonObject(keys: Array, vals: Array) -> String {
+    if (len(keys) != len(vals)) {
+        fail("jsonObject: keys 与 vals 长度不同（" + toString(len(keys)) +
+             " vs " + toString(len(vals)) + "）")
+    }
+    var out = "{"
+    var i = 0
+    while (i < len(keys)) {
+        if (i > 0) { out = out + "," }
+        out = out + jsonQuote(toString(keys[i])) + ":"
+        out = out + jsonStringify(toInt(vals[i]))
+        i = i + 1
+    }
+    return out + "}"
+}

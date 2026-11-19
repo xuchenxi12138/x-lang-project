@@ -1,0 +1,18 @@
+5
+drawn
+true
+true
+true
+false
+true
+false
+Rect { x: 24, y: 24, w: 360, h: 240 }
+Rect { x: 36, y: 64, w: 336, h: 188 }
+false
+false
+true
+Rect { x: 50, y: 80, w: 300, h: 20 }
+1.0
+0.0
+b
+ui class ok

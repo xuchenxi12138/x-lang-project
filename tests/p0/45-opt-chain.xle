@@ -1,0 +1,67 @@
+// 45-opt-chain.xle — 可选链 `?.` / `?[`
+//
+// 语义：`a?.b` 等价于 `a == null ? null : a.b`，且 a **只求值一次**。
+//
+// ── 为什么不能只写「a == null ? null : a.b」────
+//
+// a 若是函数调用，那个写法会调用两次。所以实现上先算 a、DUP 留底、
+// 判非 null，再把栈顶那份交给正常的成员访问逻辑。
+//
+// ── 复用成员访问逻辑的办法 ──────────────────────
+//
+// 成员访问的第一步是「编译对象表达式」。把那个子节点临时换成
+// EX_STACK_REF（编译它不发射任何指令），就正好复用 —— 栈顶已经是
+// 我们 DUP 出来的值。这样字段偏移、类/结构体分支、可见性检查全都不必
+// 为可选链再抄一遍。
+//
+// ── 宿主类型名必须显式带过去 ────────────────────
+//
+// 编译期栈里没有静态类型，而 expr_struct_name() 是把 `.b` 解析成
+// 字段偏移的先决条件。漏了这条的症状是「无法确定 .b 的宿主类型」，
+// 把可选链判成不可用 —— 报错指向成员访问，不指向可选链实现。
+
+struct Inner { v: Int, tag: String }
+struct Outer { a: Inner, n: Int }
+
+fn main() -> Int {
+    // ---- 1. 非 null：正常走通 ----
+    let o = Outer { a: Inner { v: 7, tag: "ok" }, n: 1 }
+    println(o?.n)                 // 1
+    println(o.a?.v)               // 7
+    println(o.a.tag)              // ok
+
+    // ---- 2. 宿主静态是 null：整串恒为 null ----
+    // `let p = null` 的 p 没有结构体类型，普通成员访问会报
+    // 「无法确定 .n 的宿主类型」。但 `p?.n` 的意义恰恰是
+    // 「p 可能是 null，不必给它类型」—— 所以这里必须折叠成 null，
+    // 否则这个写法根本不能用。
+    let p = null
+    println(p?.n)                 // null
+    println(p?.a?.v)              // null
+
+    // ---- 3. 嵌套可选链 ----
+    let i = Outer { a: Inner { v: 42, tag: "x" }, n: 2 }
+    println(i.a?.tag)             // x
+    println(i?.a?.v)              // 42
+
+    // ---- 4. 与 ?? 组合：null 时给默认值 ----
+    let q = null
+    println(q?.n ?? 99)           // 99
+    println(i?.n ?? 99)           // 2
+
+    // ---- 5. 与三元组合 ----
+    println(q?.n == null ? "空" : "有")   // 空
+    println(i?.n == null ? "空" : "有")   // 有
+
+    // ---- 6. 可选链的结果可以再参与运算 ----
+    let v = q?.n
+    println(v == null)            // true
+    let w = i?.n
+    println(w == null)            // false
+
+    // ---- 7. 深层链：全 null 短路 ----
+    let r = null
+    println(r?.a?.v ?? -1)        // -1
+
+    return 0
+}

@@ -1,0 +1,19 @@
+# tools/ 只在开发时用：跑真实 LSP 协议验证、从 C 源码生成补全词表。
+# 它不进扩展包 —— 装了扩展的人不需要 node，也用不到这些东西。
+tools/**
+node_modules/**
+
+# 开发期杂项
+.vscodeignore
+.gitignore
+
+# 打包产物自己不能进包。
+#
+# 注意 `*.vsix` 匹配不到 `x-lang-0.2.0.vsix.bak.1020` —— 后缀不是
+# .vsix。而 tools/package.sh 在覆盖旧产物时会生成这种备份名，于是
+# 上一个 26 KB 的包被打进了新包，体积直接翻倍。用 `*.vsix*` 覆盖。
+*.vsix*
+x-lang-*.vsix*
+
+# 打包脚本的临时日志
+.pk-*.log

@@ -1,0 +1,450 @@
+// board.xle — 扫雷的棋盘核心逻辑
+//
+// 这个文件**完全不接触窗口**：不画一个像素、不读一次鼠标。
+// 它能被 `println` 驱动，所以逻辑正确性可以用文本测试来验证
+// ——这是把游戏拆成两半最重要的理由。
+//
+// ── 数据结构 ────────────────────────────────────────────────
+//
+// 语言现在没有结构体，所以一个格子用**两个平行数组**表示：
+//
+//   mine[i]  这个格子有雷吗（0/1）
+//   open[i]  翻开状态（0 = 未翻开，1 = 已翻开）
+//   flag[i]  插旗状态（0 = 无，1 = 有旗）
+//   num[i]   周围雷数（0..8），布雷后预计算
+//
+// 为什么不把三者打包进一个数组（比如 0..9 表示数字、10 表示旗）：
+// 打包省内存但让每个读写点都要解包，而且「有旗且已翻开」这种
+// 非法组合无法表达。三个平行数组各自语义单一，出错时一眼能看出
+// 是哪个字段错了。
+//
+// ── 索引方式 ────────────────────────────────────────────────
+//
+// 二维用一维表示：idx = y * w + x。理由见 tests/p0/16-array.xle。
+
+// ---- 常量 ----
+//
+// 为什么难度参数集中在这里：调数值试手感时只改一处，
+// 不会出现「棋盘 16×16 但布雷按 9×9 算」这种不一致。
+
+const DIFF_BEGINNER_W = 9
+const DIFF_BEGINNER_H = 9
+const DIFF_BEGINNER_M = 10
+
+const DIFF_INTER_W    = 16
+const DIFF_INTER_H    = 16
+const DIFF_INTER_M    = 40
+
+const DIFF_EXPERT_W   = 30
+const DIFF_EXPERT_H   = 16
+const DIFF_EXPERT_M   = 99
+
+// ============================================================
+// 伪随机数
+// ============================================================
+//
+// ── 为什么不用语言内置的随机 ----
+//
+// 语言现在还没有 rand()。而扫雷只需要「看起来没规律」的雷位分布，
+// 不需要密码学强度。xorshift32 是 8 行代码、三条移位异或，
+// 周期 2^32-1，足够把一个 30×16 棋盘铺得看不出规律。
+//
+// ── 为什么状态要放在外面传进来 ----
+//
+// 不能用全局变量（语言没有 static/global），只能用「调用方持有状态」
+// 的形式：state 是一个长度为 1 的数组，函数通过 rng_next(state)
+// 读写它。这是没有结构体时唯一可行的做法 —— 数组是引用类型，
+// 传进函数之后写它，调用方能看到变化。
+//
+// 为什么状态只用一个元素：拿来当可变容器用，长度本身不重要。
+
+fn rng_seed(s: Int) -> Array {
+    let st = array(1, 0)
+    // 0 是 xorshift 的退化点（永远出 0），所以避开它
+    if s == 0 {
+        st[0] = 0x9E3779B9
+    } else {
+        st[0] = s
+    }
+    return st
+}
+
+fn rng_next(st: Array) -> Int {
+    // xorshift32：三步「左移异或、右移异或、左移异或」。
+    // 三步都是双射，所以不会丢失状态信息，周期达到 2^32-1。
+    //
+    // ── 为什么每一步都要 & 0xFFFFFFFF ──────────────────────
+    //
+    // Int 是 64 位有符号数，左移 13 位后高位会溢到第 32 位以上，
+    // 不掩的话状态会跑到 2^64 附近，下一步乘法/加法直接溢出 trap
+    // （01 §5.4 规定溢出必须 trap）。
+    //
+    // 掩成 32 位之后，状态严格保持在 [0, 2^32)，这也是 xorshift32
+    // 的定义域 —— 掩码不是权宜之计，而是算法的一部分。
+    var x = st[0]
+    x = (x ^ (x << 13)) & 0xFFFFFFFF
+    x = (x ^ (x >> 17)) & 0xFFFFFFFF
+    x = (x ^ (x << 5))  & 0xFFFFFFFF
+    st[0] = x
+    return x
+}
+
+// 取 [0, n) 的随机整数
+fn rng_below(st: Array, n: Int) -> Int {
+    if n <= 1 {
+        return 0
+    }
+    return rng_next(st) % n
+}
+
+// ============================================================
+// 棋盘构建
+// ============================================================
+
+// 建一个空棋盘。返回 [w, h, mines, mine, open, flag, num, state]
+//
+// ── 为什么把一堆数组塞进一个 Array 返回 ----
+//
+// 没有结构体，函数只能返回一个值。把 7 个数组装进外层数组
+// 是唯一的选择。代价是每次访问都要 board[4] 这样的下标，
+// 可读性靠下面这批存取函数补回来（bmine/ bopen / ...）。
+//
+// 顺序就是这里的赋值顺序，改的话记得同步改下面的索引常量。
+fn board_new(w: Int, h: Int, mines: Int) -> Array {
+    // 9 元组。这里用字面量下标而不是 B_* 常量，是因为常量声明在下面 ——
+    // const 是编译期字面量展开，声明顺序其实无关（引用点才解析），
+    // 但写在前面读起来和「字段表」的顺序一致，更不容易对错位。
+    let b = array(9, 0)
+    b[0] = w
+    b[1] = h
+    b[2] = mines
+    b[3] = array(w * h, 0)   // mine
+    b[4] = array(w * h, 0)   // open
+    b[5] = array(w * h, 0)   // flag
+    b[6] = array(w * h, 0)   // num
+    b[7] = array(1, 1)       // 游戏状态：1=进行中 2=胜利 3=失败
+    b[8] = array(1, -1)      // 踩中的雷下标，-1 = 没踩
+    return b
+}
+
+// 字段索引常量
+const B_W     = 0
+const B_H     = 1
+const B_MINES = 2
+const B_MINE  = 3
+const B_OPEN  = 4
+const B_FLAG  = 5
+const B_NUM   = 6
+const B_STATE = 7
+
+// 踩中的那颗雷的下标（-1 = 没踩）。
+//
+// 为什么要单独记：输了之后所有雷都要显示出来，但玩家最想看到的是
+// 「我踩的是哪一颗」。没有这个字段就只能靠「哪一格既是雷又被翻开」
+// 反推 —— 逻辑上等价，但那一格在棋盘数组里没有任何标记能区分
+// 「被点开的雷」和「连锁展开时连带显示的雷」（后者根本没被翻开）。
+// 实测就是这么暴露出问题的：输了之后满屏雷，踩中的那颗和其他雷
+// 长得一模一样，玩家看不出自己错在哪。
+//
+// 用下标而不是 (x,y)：绘制侧本来就按 idx 走，省一次乘加。
+const B_DEAD  = 8
+
+const ST_PLAY = 1
+const ST_WIN  = 2
+const ST_LOSE = 3
+
+fn b_idx(b: Array, x: Int, y: Int) -> Int {
+    return y * b[B_W] + x
+}
+
+fn b_mine(b: Array, x: Int, y: Int) -> Int   { return b[B_MINE][b_idx(b, x, y)] }
+fn b_open(b: Array, x: Int, y: Int) -> Int   { return b[B_OPEN][b_idx(b, x, y)] }
+fn b_flag(b: Array, x: Int, y: Int) -> Int   { return b[B_FLAG][b_idx(b, x, y)] }
+fn b_num(b: Array, x: Int, y: Int) -> Int    { return b[B_NUM][b_idx(b, x, y)] }
+
+fn b_set_mine(b: Array, x: Int, y: Int, v: Int) { b[B_MINE][b_idx(b, x, y)] = v }
+fn b_set_open(b: Array, x: Int, y: Int, v: Int) { b[B_OPEN][b_idx(b, x, y)] = v }
+fn b_set_flag(b: Array, x: Int, y: Int, v: Int) { b[B_FLAG][b_idx(b, x, y)] = v }
+
+// 踩中的雷的下标（-1 = 没踩）。
+// 不提供 (x,y) 版本：绘制侧遍历时本来就拿着 x/y，比较 idx 更直接。
+fn b_dead(b: Array) -> Int { return b[B_DEAD][0] }
+
+// 坐标是否在棋盘内
+fn b_inside(b: Array, x: Int, y: Int) -> Bool {
+    return x >= 0 && x < b[B_W] && y >= 0 && y < b[B_H]
+}
+
+// ============================================================
+// 布雷
+// ============================================================
+//
+// ── 首点必空 ────────────────────────────────────────────────
+//
+// 标准扫雷规则：第一次点击的位置及其邻域一定没有雷。不做这件事
+// 的话，有可能第一下就踩雷 —— 那不是难度，是设计缺陷。
+//
+// 实现方式：把 (sx, sy) 及其 8 邻域列进「禁放区」，只在其余格子
+// 里随机挑。用「候选列表 + 洗牌」而不是「反复随机直到不撞」：
+//   · 后者在高级难度（99 雷 / 480 格）下期望重试次数不小
+//   · 而且理论上可能无限循环，虽然概率极低
+//
+// 洗牌只洗前 mines 个位置（部分洗牌），O(mines) 而不是 O(n)。
+
+fn board_place_mines(b: Array, sx: Int, sy: Int, seed: Int) -> Int {
+    let w = b[B_W]
+    let h = b[B_H]
+    let mines = b[B_MINES]
+
+    // 候选列表：所有不在禁放区的格子
+    let cand = array(w * h, 0)
+    var n = 0
+    for y in 0..h {
+        for x in 0..w {
+            var banned = false
+            if x >= sx - 1 && x <= sx + 1 && y >= sy - 1 && y <= sy + 1 {
+                banned = true
+            }
+            if !banned {
+                cand[n] = y * w + x
+                n += 1
+            }
+        }
+    }
+
+    // 棋盘太小时禁放区可能吃掉所有格子：这时放宽到只禁首点本身。
+    // 再不济就连首点也允许 —— 总比布雷失败好。
+    if n < mines {
+        n = 0
+        for y in 0..h {
+            for x in 0..w {
+                if !(x == sx && y == sy) {
+                    cand[n] = y * w + x
+                    n += 1
+                }
+            }
+        }
+    }
+    if n < mines {
+        n = 0
+        for y in 0..h {
+            for x in 0..w {
+                cand[n] = y * w + x
+                n += 1
+            }
+        }
+    }
+
+    // 部分洗牌：只要前 mines 个位置，所以只洗 mines 轮
+    let st = rng_seed(seed)
+    var i = 0
+    while i < mines {
+        let j = i + rng_below(st, n - i)
+        let t = cand[i]
+        cand[i] = cand[j]
+        cand[j] = t
+        b[B_MINE][cand[i]] = 1
+        i += 1
+    }
+
+    return 0
+}
+
+// 预计算每格的周围雷数。布雷之后调用一次，之后读 b_num 就是 O(1)。
+fn board_count(b: Array) -> Int {
+    let w = b[B_W]
+    let h = b[B_H]
+    for y in 0..h {
+        for x in 0..w {
+            if b_mine(b, x, y) == 1 {
+                b[B_NUM][b_idx(b, x, y)] = -1   // 有雷的格子标记成 -1
+            } else {
+                var c = 0
+                for dy in 0..3 {
+                    for dx in 0..3 {
+                        let nx = x + dx - 1
+                        let ny = y + dy - 1
+                        if b_inside(b, nx, ny) {
+                            c += b_mine(b, nx, ny)
+                        }
+                    }
+                }
+                b[B_NUM][b_idx(b, x, y)] = c
+            }
+        }
+    }
+    return 0
+}
+
+// ============================================================
+// 翻开
+// ============================================================
+//
+// ── 为什么用显式栈而不是递归 ----
+//
+// 空白区域的连锁展开最深可能是整盘（9×9 全空），递归深度 81。
+// 换成高级 30×16 就是 480 层。解释器的帧上限是 4096，580 层不会
+// 溢出，但每次点击都建 480 个栈帧是浪费；更重要的是 AOT 版
+// 没有尾调用优化，深递归会真的吃掉栈。
+//
+// 显式栈还有一个好处：展开顺序可控，画动画时能逐个显现。
+//
+// 数组当栈用：写上界指针 sp，push 就是 a[sp] = v; sp += 1。
+
+fn board_open(b: Array, sx: Int, sy: Int) -> Int {
+    if b[B_STATE][0] != ST_PLAY {
+        return 0
+    }
+    if !b_inside(b, sx, sy) {
+        return 0
+    }
+    // 已翻开、有旗都点不动。
+    // 有旗的格子不能直接翻开是标准规则 —— 否则旗就没意义了。
+    if b_open(b, sx, sy) == 1 || b_flag(b, sx, sy) == 1 {
+        return 0
+    }
+
+    let cap = b[B_W] * b[B_H]
+    let stack = array(cap, 0)
+    var sp = 0
+    stack[sp] = sy * b[B_W] + sx
+    sp += 1
+
+    while sp > 0 {
+        sp -= 1
+        let idx = stack[sp]
+        let x = idx % b[B_W]
+        let y = idx / b[B_W]
+
+        if b_open(b, x, y) == 1 || b_flag(b, x, y) == 1 {
+            continue
+        }
+
+        b_set_open(b, x, y, 1)
+
+        if b_mine(b, x, y) == 1 {
+            // 踩雷：只翻开这一格，不连锁
+            b[B_STATE][0] = ST_LOSE
+            // 记下踩中的是哪一格。只在**第一次**踩雷时写：
+            // 一个玩家只可能踩到一颗雷（踩到就结束了），
+            // 但连锁展开的栈里可能还有其他的雷待处理，
+            // 不判 ST_PLAY 的话最后一颗会把第一颗覆盖掉。
+            if b[B_DEAD][0] < 0 {
+                b[B_DEAD][0] = idx
+            }
+            continue
+        }
+
+        // 数字非 0 就停在这里（这是扫雷的核心规则：
+        // 只有空白格才向四周扩散）
+        if b_num(b, x, y) > 0 {
+            continue
+        }
+
+        for dy in 0..3 {
+            for dx in 0..3 {
+                let nx = x + dx - 1
+                let ny = y + dy - 1
+                if !b_inside(b, nx, ny) {
+                    continue
+                }
+                if nx == x && ny == y {
+                    continue
+                }
+                // 有旗的邻格不展开：玩家的旗是明确的「这里别动」意图
+                if b_open(b, nx, ny) == 1 || b_flag(b, nx, ny) == 1 {
+                    continue
+                }
+                if sp < cap {
+                    stack[sp] = ny * b[B_W] + nx
+                    sp += 1
+                }
+            }
+        }
+    }
+
+    return 0
+}
+
+// 注意：`continue` 在嵌套 for 里只跳最内层，上面那个
+// 「有旗不展开」的 continue 是想要的（跳过这一个邻格，
+// 继续看下一个）。而外层的 continue 用来跳过整个格子。
+
+// ============================================================
+// 插旗
+// ============================================================
+
+fn board_flag(b: Array, x: Int, y: Int) -> Int {
+    if b[B_STATE][0] != ST_PLAY {
+        return 0
+    }
+    if !b_inside(b, x, y) {
+        return 0
+    }
+    if b_open(b, x, y) == 1 {
+        return 0     // 已翻开的格子不能插旗
+    }
+    if b_flag(b, x, y) == 1 {
+        b_set_flag(b, x, y, 0)
+    } else {
+        b_set_flag(b, x, y, 1)
+    }
+    return 0
+}
+
+// ============================================================
+// 胜负判定
+// ============================================================
+//
+// 胜利条件：所有**非雷**格子都翻开了。等价于「已翻开数 == 总格数 - 雷数」。
+//
+// 不用「剩余格子数 == 雷数」是因为玩家可能插错旗：
+// 那种情况下剩下的格子数正好等于雷数，但其实还有非雷格没翻开。
+// 按「已翻开数」判定就不会被旗误导。
+
+fn board_check_win(b: Array) -> Bool {
+    if b[B_STATE][0] != ST_PLAY {
+        return b[B_STATE][0] == ST_WIN
+    }
+
+    let total = b[B_W] * b[B_H]
+    var opened = 0
+    var i = 0
+    while i < total {
+        opened += b[B_OPEN][i]
+        i += 1
+    }
+
+    if opened == total - b[B_MINES] {
+        b[B_STATE][0] = ST_WIN
+        return true
+    }
+    return false
+}
+
+// 剩余可插旗数 = 总雷数 - 已插旗数（可能是负数，说明插多了）
+fn board_flags_left(b: Array) -> Int {
+    let total = b[B_W] * b[B_H]
+    var f = 0
+    var i = 0
+    while i < total {
+        f += b[B_FLAG][i]
+        i += 1
+    }
+    return b[B_MINES] - f
+}
+
+fn board_opened_count(b: Array) -> Int {
+    let total = b[B_W] * b[B_H]
+    var c = 0
+    var i = 0
+    while i < total {
+        c += b[B_OPEN][i]
+        i += 1
+    }
+    return c
+}
+
+fn board_state(b: Array) -> Int {
+    return b[B_STATE][0]
+}

@@ -1,0 +1,134 @@
+// ui/display/menubar.xle — 菜单栏（横向一排顶级项）
+//
+// ── 为什么不让 MenuBar 自己画下拉 ────────────────
+//
+// 因为下拉必须画在所有其它东西之上。如果 MenuBar 在自己的 draw
+// 里画下拉，那么后面绘制的控件会盖住它 —— 而「被遮住」的症状
+// 是菜单闪一下就没了，很难联想到绘制顺序。
+//
+// 所以职责切开：
+//
+//   MenuBar —— 一排标题，记录哪个是打开的
+//   Menu    —— 弹出层，调用方在**所有控件之后**调 menu.draw()
+//
+// 这也是 dropdown.xle 里 drawPopup 的同一个约定。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+from "menuitem.xle" import menuIsSep, menuIsDisabled, menuLabel, menuShortcut
+
+// 菜单栏高度。
+const MENUBAR_H = 32
+
+// 一级菜单的左右内边距。
+const MENU_ITEM_PAD = 14
+
+
+class MenuBar extends Widget {
+    items: Array,
+    openIndex: Int,
+    hoverIndex: Int,
+
+    constructor(r: Rect, items: Array) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.items     = items
+        self.openIndex = 0 - 1
+        self.hoverIndex = 0 - 1
+        self.style     = Style.plain()
+    }
+
+    static fn of(r: Rect, items: Array) -> MenuBar {
+        let m = new MenuBar(r, items)
+        return m
+    }
+
+    // 第 i 项的矩形。
+    fn itemRect(i: Int) -> Rect {
+        var x = self.r.x
+        var k = 0
+        while k < i {
+            x = x + self.itemWidth(k)
+            k = k + 1
+        }
+        return rectOf(x, self.r.y, self.itemWidth(i), self.r.h)
+    }
+
+    fn itemWidth(i: Int) -> Int {
+        if (i < 0 || i >= len(self.items)) { return 0 }
+        return winTextWidth(toString(self.items[i])) + MENU_ITEM_PAD * 2
+    }
+
+    fn indexAt(mx: Int, my: Int) -> Int {
+        if (!self.vis || !self.enabled) { return 0 - 1 }
+        if (!self.r.contains(mx, my)) { return 0 - 1 }
+        var i = 0
+        while i < len(self.items) {
+            let ir: Rect = self.itemRect(i)
+            if (ir.contains(mx, my)) { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // 点击。返回被点中的项下标（用于展开/收起）。
+    fn click(mx: Int, my: Int) -> Int {
+        let i = self.indexAt(mx, my)
+        if (i < 0) {
+            // 点别处：收起。
+            self.openIndex = 0 - 1
+            return 0 - 1
+        }
+        if (i == self.openIndex) {
+            self.openIndex = 0 - 1
+            return 0 - 1
+        }
+        self.openIndex = i
+        return i
+    }
+
+    // 悬停切换：展开某个菜单时，鼠标移到别的顶级项应该直接切换
+    // 到那一个（这是所有桌面应用的预期行为）。
+    fn updateHover(mx: Int, my: Int) {
+        let i = self.indexAt(mx, my)
+        self.hoverIndex = i
+        if (self.openIndex >= 0 && i >= 0 && i != self.openIndex) {
+            self.openIndex = i
+        }
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 底色。
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.bg)
+        winFillRect(self.r.x, self.r.y + self.r.h - 1, self.r.w, 1, th.border)
+
+        var i = 0
+        while i < len(self.items) {
+            let ir: Rect = self.itemRect(i)
+            let isOpen = i == self.openIndex
+            let isHover = i == self.hoverIndex
+
+            if (isOpen) {
+                winFillRect(ir.x, ir.y, ir.w, ir.h, th.surfaceActive)
+            } else if (isHover) {
+                winFillRect(ir.x, ir.y, ir.w, ir.h, th.surfaceHover)
+            }
+
+            var c = th.text
+            if (isOpen) { c = th.accent }
+            uiTextInRect(ir, toString(self.items[i]), c)
+
+            i = i + 1
+        }
+    }
+}

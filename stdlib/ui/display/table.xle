@@ -1,0 +1,224 @@
+// ui/display/table.xle — 表格
+//
+// 一行拆成多列，每列有宽度和对齐。表头固定在顶部不随内容滚动
+// （覆写了 viewport）。
+//
+// ── 列宽怎么定 ─────────────────────────────────
+//
+// 传给构造函数的 widths 是「权重」而不是像素。所有列按权重分
+// 可用宽度，最后一列吸收舍入误差（否则宽度总和会比容器少 1~2px，
+// 右侧留一条缝）。
+//
+// 这个选择和 layoutSplit 一致 —— 表格和手工布局用同一套分配规则，
+// 才不会「表格列宽看起来和旁边的分栏对不齐」。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../control/label.xle" import Label, TEXT_CENTER, TEXT_LEFT, TEXT_RIGHT
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+from "listbase.xle" import ListBase, LIST_ROW_H
+
+// 由调用方显式给。不像 HTML 表格那样自动测量内容宽度。
+//
+// 理由：自动列宽需要先测全部行（O(行数×列数) 次文字度量），而
+// 表格的核心价值是「大数据量下还能流畅」。显式列宽让绘制复杂度
+// 降到 O(可见行数×列数)，这是唯一能让万行表格跑起来的做法。
+//
+// 代价是调用方要自己想列宽。但列宽本来就是设计决策（哪一列该宽
+// 是业务判断），交给人决定比让算法猜更合理。
+class Table extends ListBase {
+    // 表头文字数组。
+    headers: Array,
+
+    // 列宽数组（像素）。总和可以小于控件宽（右侧留白），
+    // 也可以大于（会被裁剪）。
+    widths: Array,
+
+    // 数据：二维数组，每行是一个数组。
+    rows: Array,
+
+    // 是否显示表头。显示时表头占 LIST_ROW_H 高度，行从下面开始。
+    showHeader: Bool,
+
+    // 列对齐方式数组，取值 TEXT_LEFT / TEXT_CENTER / TEXT_RIGHT。
+    aligns: Array,
+
+    constructor(r: Rect, headers: Array, widths: Array, rows: Array) {
+        self.r          = r
+        self.vis        = true
+        self.enabled    = true
+        self.focused    = false
+        self.hovered    = false
+        self.rowCount   = len(rows)
+        self.selected   = 0 - 1
+        self.offset     = 0
+        self.rowH       = LIST_ROW_H
+        self.selectable = true
+        self.headers    = headers
+        self.widths     = widths
+        self.rows       = rows
+        self.showHeader = true
+        self.aligns     = []
+        self.style      = Style.plain()
+    }
+
+    static fn of(r: Rect, headers: Array, widths: Array, rows: Array) -> Table {
+        let t = new Table(r, headers, widths, rows)
+        return t
+    }
+
+    // 表头高度。
+    fn headerH() -> Int {
+        if (!self.showHeader) { return 0 }
+        return self.rowH
+    }
+
+    // 数据区（表头下方）。滚动只作用于这里。
+    //
+    // ── 为什么表头不随内容滚动 ────────────────────
+    //
+    // 因为列宽固定，表头滚走之后用户就不知道哪列是哪列了。
+    // 「固定表头」是表格的基本要求，不是可选优化。
+    fn viewport() -> Rect {
+        let inner = Rect.inset(self.r, 1)
+        return rectOf(inner.x, inner.y + self.headerH(),
+                      inner.w, inner.h - self.headerH())
+    }
+
+    fn setRows(arr: Array) -> Table {
+        self.rows = arr
+        self.rowCount = len(arr)
+        if (self.selected >= self.rowCount) {
+            self.selected = self.rowCount - 1
+        }
+        self.clampOffset()
+        return self
+    }
+
+    // 第 c 列的 x 坐标（相对表格左边）。
+    fn colX(c: Int) -> Int {
+        var x = 1        // 跳过 1px 边框
+        var i = 0
+        while i < c && i < len(self.widths) {
+            x = x + toInt(self.widths[i])
+            i = i + 1
+        }
+        return x
+    }
+
+    fn colW(c: Int) -> Int {
+        if (c < 0 || c >= len(self.widths)) { return 0 }
+        return toInt(self.widths[c])
+    }
+
+    fn cellAlign(c: Int) -> Int {
+        if (c < 0 || c >= len(self.aligns)) { return TEXT_LEFT }
+        return toInt(self.aligns[c])
+    }
+
+    fn drawRowContent(th: Theme, i: Int, r: Rect) {
+        let rowData = self.rows[i]
+        // 类型不能直接追踪，取长度用 len 而不是 .length。
+        var n = len(rowData)
+
+        var c = 0
+        while c < n && c < len(self.widths) {
+            let cx = r.x + self.colX(c)
+            let cw = self.colW(c)
+            if (cw <= 0) { c = c + 1; continue }
+
+            let cr = rectOf(cx, r.y, cw, r.h)
+            let s = toString(rowData[c])
+            // 单元格内左右各留 6px，避免文字贴住列边界。
+            let pad = 6
+            let avail = cw - pad * 2
+            var shown = s
+            if (avail > 0 && winTextWidth(shown) > avail) {
+                shown = uiEllipsize(shown, avail)
+            }
+
+            var tc = th.text
+            if (i == self.selected) { tc = th.accent }
+            if (!self.enabled) { tc = th.disabled }
+
+            let al = self.cellAlign(c)
+            if (al == TEXT_RIGHT) {
+                uiTextRight(cr, shown, pad, tc)
+            } else if (al == TEXT_CENTER) {
+                uiTextInRect(cr, shown, tc)
+            } else {
+                uiTextLeft(cr, shown, pad, tc)
+            }
+
+            c = c + 1
+        }
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.surface)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, th.border)
+
+        // ── 表头 ──
+        if (self.showHeader) {
+            let inner = Rect.inset(self.r, 1)
+            let hr = rectOf(inner.x, inner.y, inner.w, self.rowH)
+            winFillRect(hr.x, hr.y, hr.w, hr.h, th.bg)
+
+            var c = 0
+            while c < len(self.headers) && c < len(self.widths) {
+                let cx = hr.x + self.colX(c)
+                let cw = self.colW(c)
+                if (cw > 0) {
+                    let cr = rectOf(cx, hr.y, cw, hr.h)
+                    let s = toString(self.headers[c])
+                    let al = self.cellAlign(c)
+                    let pad = 6
+                    var avail = cw - pad * 2
+                    var shown = s
+                    if (avail > 0 && winTextWidth(shown) > avail) {
+                        shown = uiTruncate(shown, avail)
+                    }
+                    if (al == TEXT_RIGHT) {
+                        uiTextRight(cr, shown, pad, th.textDim)
+                    } else if (al == TEXT_CENTER) {
+                        uiTextInRect(cr, shown, th.textDim)
+                    } else {
+                        uiTextLeft(cr, shown, pad, th.textDim)
+                    }
+                }
+                c = c + 1
+            }
+
+            // 表头底部分隔线。
+            winFillRect(hr.x, hr.y + hr.h - 1, hr.w, 1, th.border)
+        }
+
+        if (self.rowCount == 0) {
+            self.drawEmpty(th)
+            return
+        }
+
+        let vp = self.viewport()
+        winClip(vp.x, vp.y, vp.w, vp.h)
+
+        let first = self.offset / self.rowH
+        let last = first + self.visibleRows() + 1
+        var i = first
+        while i < last && i < self.rowCount {
+            let rr: Rect = self.rowRect(i)
+            self.drawRowBg(th, i, rr)
+            self.drawRowContent(th, i, rr)
+            // 行分隔线：只在行底画一条极淡的线，帮助横向对齐。
+            winFillRect(rr.x, rr.y + rr.h - 1, rr.w, 1, th.border)
+            i = i + 1
+        }
+
+        winUnclip()
+    }
+}

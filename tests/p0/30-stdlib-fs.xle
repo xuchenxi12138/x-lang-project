@@ -1,0 +1,197 @@
+// ============================================================
+// std.fs —— 路径处理、按行读写、目录遍历
+// ============================================================
+//
+// 内建那 11 个原子操作的测试在 29-fs。这里测的是**组合层**：
+// 路径规范化、按行读写、递归遍历、键值配置。
+//
+// ── 路径测试为什么同时覆盖两种分隔符 ────────────────────────
+//
+// fsNormalize 要把 "a\\b" 与 "a/b" 归一成同一种形式。只在
+// Linux 上测（那里根本没有反斜杠）或者只用正斜杠测，都会让
+// 「用户从 Windows 资源管理器复制了一条路径」这个最常见的
+// 场景漏掉。
+
+from std.fs import fsJoin, fsJoinAll, fsBaseName, fsDirName, fsExtName, fsIsAbsolute, fsNormalize, fsReadLines, fsSplitLines, fsWriteLines, fsAppendLine, fsReadText, fsWriteDeep, fsEnsureDir, fsListFiles, fsListDirs, fsListByExt, fsWalk, fsDirStats, fsTouch, fsWriteIfChanged, fsFindLine, fsParseKV, fsKVGet, fsCopy, fsTempPath
+
+fn p(name: String) -> String {
+    return "C:/xtmp/xtest/fs2/" + name
+}
+
+fn main() -> Void {
+    println("---- 路径拼接 ----")
+    println(fsJoin("a", "b"))            // a/b
+    println(fsJoin("a/", "b"))           // a/b（不产生双斜杠）
+    println(fsJoin("", "b"))             // b
+    println(fsJoin("a", ""))             // a
+    println(fsJoin("/", "a"))            // /a
+    let seg = array(3, "")
+    seg[0] = "a"
+    seg[1] = "b"
+    seg[2] = "c.txt"
+    println(fsJoinAll(seg))              // a/b/c.txt
+    println(fsJoinAll(array(0, "")))     // 空行
+
+    println("---- 取段 ----")
+    println(fsBaseName("/a/b/c.txt"))    // c.txt
+    println(fsBaseName("/a/b/"))         // b（末尾斜杠被忽略）
+    println("[" + fsBaseName("/") + "]") // []
+    println("[" + fsBaseName("") + "]")  // []
+    println(fsBaseName("c.txt"))         // c.txt
+    println(fsDirName("/a/b/c.txt"))     // /a/b
+    println(fsDirName("c.txt"))          // 空行
+    println(fsDirName("/c.txt"))         // /
+    println("[" + fsDirName("/") + "]")  // []（根本身没有父目录）
+
+    println("---- 扩展名 ----")
+    println(fsExtName("/a/B.TXT"))       // txt（小写）
+    println(fsExtName("a.tar.gz"))       // gz（取最后一段）
+    println("[" + fsExtName("noext") + "]")     // []
+    println("[" + fsExtName("a.b/c") + "]")     // []（点在前面的目录里，不算）
+
+    println("---- 绝对路径判定 ----")
+    println(fsIsAbsolute("/a/b"))        // true
+    println(fsIsAbsolute("C:/a/b"))      // true
+    println(fsIsAbsolute("a/b"))         // false
+    println(fsIsAbsolute("./a"))         // false
+    println(fsIsAbsolute(""))            // false
+
+    println("---- 规范化 ----")
+    // 反斜杠先归一
+    println(fsNormalize("a\\b\\c"))      // a/b/c
+    // 连续斜杠压掉
+    println(fsNormalize("a//b///c"))     // a/b/c
+    // 当前目录丢弃
+    println(fsNormalize("./a/./b"))      // a/b
+    // 上一级弹出
+    println(fsNormalize("a/b/../c"))     // a/c
+    println(fsNormalize("a/b/c/../../d"))// a/d
+    // 相对路径开头的 .. 保留 —— 丢掉会改变指向
+    println(fsNormalize("../a"))         // ../a
+    println(fsNormalize("a/../../b"))    // ../b
+    // 绝对路径的 .. 走到根停住
+    println(fsNormalize("/a/../b"))      // /b
+    println(fsNormalize("/../.."))       // /
+    println(fsNormalize(""))             // 空行
+    println(fsNormalize("."))            // .
+    // 综合：Windows 复制的路径
+    println(fsNormalize("C:\\Users\\x\\..\\y\\.\\z.txt"))   // C:/Users/y/z.txt
+
+    println("---- 建目录（递归） ----")
+    println(fsEnsureDir("C:/xtmp/xtest/fs2/a/b/c"))   // true
+    println(fsIsDir("C:/xtmp/xtest/fs2/a/b/c"))       // true
+    // 已存在仍返回 true（幂等）
+    println(fsEnsureDir("C:/xtmp/xtest/fs2/a/b/c"))   // true
+
+    println("---- 按行读写 ----")
+    let lines = array(3, "")
+    lines[0] = "第一行"
+    lines[1] = "second"
+    lines[2] = "third"
+    println(fsWriteLines(p("lines.txt"), lines))      // true
+    let back = fsReadLines(p("lines.txt"))
+    println(len(back))               // 3
+    println(back[0])                 // 第一行
+    println(back[2])                 // third
+    // 末尾换行不产生空行
+    println(len(fsReadLines(p("lines.txt"))))   // 3
+
+    // 读不存在的文件给空数组，不报错
+    println(len(fsReadLines(p("nofile.txt"))))  // 0
+
+    println("---- 切行细节 ----")
+    // 空行被跳过（配置文件的空行是排版不是数据）
+    println(len(fsSplitLines("a\n\n\nb")))      // 2
+    // \r\n 也认
+    println(len(fsSplitLines("a\r\nb")))        // 2
+    println(fsSplitLines("a\r\nb")[1])          // b
+    // 只有空白算空行
+    println(len(fsSplitLines("a\n   \n\t\nb")))  // 2
+
+    println("---- 追加行 ----")
+    fsWrite(p("log.txt"), "")
+    println(fsAppendLine(p("log.txt"), "启动"))     // true
+    println(fsAppendLine(p("log.txt"), "处理完成")) // true
+    println(fsRead(p("log.txt")))                   // 启动\n处理完成\n
+    println(len(fsReadLines(p("log.txt"))))         // 2
+
+    println("---- 深层写入 ----")
+    // 父目录不存在时自动建
+    println(fsWriteDeep("C:/xtmp/xtest/fs2/deep/x/y/z.txt", "深层"))  // true
+    println(fsRead("C:/xtmp/xtest/fs2/deep/x/y/z.txt"))               // 深层
+
+    println("---- 条件写 ----")
+    println(fsWriteIfChanged(p("cond.txt"), "v1"))   // true（不存在，写）
+    println(fsWriteIfChanged(p("cond.txt"), "v1"))   // false（内容相同，不写）
+    println(fsWriteIfChanged(p("cond.txt"), "v2"))   // true（内容变了）
+    println(fsRead(p("cond.txt")))                   // v2
+
+    println("---- touch ----")
+    println(fsTouch(p("t.txt")))        // true
+    println(fsExists(p("t.txt")))       // true
+    println(fsSize(p("t.txt")))         // 0
+    println(fsTouch(p("t.txt")))        // true（已存在，不截断）
+
+    println("---- 列目录（分文件/目录/按扩展名） ----")
+    fsEnsureDir("C:/xtmp/xtest/fs2/ls/sub1")
+    fsWrite(p("ls/a.txt"), "a")
+    fsWrite(p("ls/b.txt"), "b")
+    fsWrite(p("ls/c.log"), "c")
+
+    let files = fsListFiles("C:/xtmp/xtest/fs2/ls")
+    println(len(files))                       // 3（不含 sub1）
+    let dirs = fsListDirs("C:/xtmp/xtest/fs2/ls")
+    println(len(dirs))                        // 1
+    println(dirs[0])                          // sub1
+
+    let txt = fsListByExt("C:/xtmp/xtest/fs2/ls", "txt")
+    println(len(txt))                         // 2
+    println(len(fsListByExt("C:/xtmp/xtest/fs2/ls", "log")))   // 1
+    println(len(fsListByExt("C:/xtmp/xtest/fs2/ls", "md")))    // 0
+
+    println("---- 递归遍历 ----")
+    fsWrite(p("ls/sub1/deep.txt"), "d")
+    // depth=0 什么都不列
+    println(len(fsWalk("C:/xtmp/xtest/fs2/ls", 0)))   // 0
+    // depth=1 只列当前层的文件
+    println(len(fsWalk("C:/xtmp/xtest/fs2/ls", 1)))   // 3
+    // depth=2 连子目录里的也列出来
+    println(len(fsWalk("C:/xtmp/xtest/fs2/ls", 2)))   // 4
+
+    let stats = fsDirStats("C:/xtmp/xtest/fs2/ls")
+    println(toInt(stats[0]))          // 4
+    println(toInt(stats[1]))          // 4（四个文件各 1 字节）
+
+    println("---- 键值配置 ----")
+    fsWrite(p("app.conf"), "# 注释\nname = 张三\nport=8080\n\n空行上面\nk3 = v3  \n")
+    let kv = fsParseKV(p("app.conf"))
+    println(len(kv))                            // 6（3 对）
+    println(fsKVGet(kv, "name", "?"))           // 张三
+    println(fsKVGet(kv, "port", "?"))           // 8080
+    println(fsKVGet(kv, "k3", "?"))             // v3（两侧空白被去掉）
+    println(fsKVGet(kv, "missing", "默认"))     // 默认（找不到给默认值）
+
+    println(fsFindLine(p("app.conf"), "port", "无"))   // port=8080
+    println(fsFindLine(p("app.conf"), "zzz", "无"))    // 无
+
+    println("---- 复制 ----")
+    println(fsCopy(p("cond.txt"), p("copy.txt")))     // true
+    println(fsRead(p("copy.txt")))                    // v2
+    // 源不存在时返回 false，不崩
+    println(fsCopy(p("ghost.txt"), p("x.txt")))       // false
+
+    println("---- 清理 ----")
+    let junk = array(6, "")
+    junk[0] = "lines.txt"
+    junk[1] = "log.txt"
+    junk[2] = "cond.txt"
+    junk[3] = "t.txt"
+    junk[4] = "app.conf"
+    junk[5] = "copy.txt"
+    var i = 0
+    while (i < len(junk)) {
+        fsRemove(p(junk[i]))
+        i = i + 1
+    }
+    println("fs module ok")
+}

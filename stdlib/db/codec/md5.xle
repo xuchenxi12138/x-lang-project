@@ -1,0 +1,193 @@
+// db/codec/md5.xle — MD5 摘要
+//
+// ── 为什么一个不含密码学的项目要实现 MD5 ──────────────
+//
+// 因为 PostgreSQL 的 `md5` 认证方式（PG 9 及以前默认，至今仍有大量
+// 遗留部署在用）需要它。没有 MD5 就无法连这些库。
+//
+// ── 安全声明 ───────────────────────────────────
+//
+// MD5 早已被证明可以构造碰撞，**绝不能用于任何安全用途**（新系统
+// 的口令存储、签名、证书）。这里实现它只有一个理由：兼容 PG 的
+// md5 认证协议 —— 那是服务端规定的算法，改不了。
+//
+// 如果用户的 PG 是新部署，应该用 SCRAM-SHA-256（见 scram.xle），
+// 那条路径完全不经过 MD5。
+
+from "bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// MD5 每轮的左移表（RFC 1321）。
+//
+// ── 为什么这个表不能省 ──────────────────────────
+//
+// MD5 的扩散完全依赖这 64 个不同的移位量。写成公式（每轮 4 种
+// 循环）会让代码更短，但一旦某处顺序错一位，结果就是完全不同的
+// 摘要 —— 而摘要对了与否只能靠测试向量发现。硬编码表最不容易错。
+
+// MD5 的 4 轮共 64 个加法常量 K[i] = floor(2^32 * abs(sin(i+1))).
+//
+// ── 为什么用整数而不是算 sin ──────────────────────
+//
+// P0 的 math() 返回 Float，而 K 需要精确的 32 位整数。浮点算出来
+// 再截断在不同平台上可能有 1 的偏差（IEEE 754 的双精度足够，但
+// 没有理由冒这个险）。这些值是 RFC 1321 里的定值。
+fn md5K() -> Array {
+    return [
+        0xD76AA478, 0xE8C7B756, 0x242070DB, 0xC1BDCEEE,
+        0xF57C0FAF, 0x4787C62A, 0xA8304613, 0xFD469501,
+        0x698098D8, 0x8B44F7AF, 0xFFFF5BB1, 0x895CD7BE,
+        0x6B901122, 0xFD987193, 0xA679438E, 0x49B40821,
+        0xF61E2562, 0xC040B340, 0x265E5A51, 0xE9B6C7AA,
+        0xD62F105D, 0x02441453, 0xD8A1E681, 0xE7D3FBC8,
+        0x21E1CDE6, 0xC33707D6, 0xF4D50D87, 0x455A14ED,
+        0xA9E3E905, 0xFCEFA3F8, 0x676F02D9, 0x8D2A4C8A,
+        0xFFFA3942, 0x8771F681, 0x6D9D6122, 0xFDE5380C,
+        0xA4BEEA44, 0x4BDECFA9, 0xF6BB4B60, 0xBEBFBC70,
+        0x289B7EC6, 0xEAA127FA, 0xD4EF3085, 0x04881D05,
+        0xD9D4D039, 0xE6DB99E5, 0x1FA27CF8, 0xC4AC5665,
+        0xF4292244, 0x432AFF97, 0xAB9423A7, 0xFC93A039,
+        0x655B59C3, 0x8F0CCC92, 0xFFEFF47D, 0x85845DD1,
+        0x6FA87E4F, 0xFE2CE6E0, 0xA3014314, 0x4E0811A1,
+        0xF7537E82, 0xBD3AF235, 0x2AD7D2BB, 0xEB86D391
+    ]
+}
+
+fn md5S() -> Array {
+    return [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+    ]
+}
+
+const MD5_MASK32 = 0xFFFFFFFF
+
+class Md5 {
+    // 32 位循环左移。
+    static fn rotl(x: Int, n: Int) -> Int {
+        let v = x & MD5_MASK32
+        return ((v << n) | (v >> (32 - n))) & MD5_MASK32
+    }
+
+    // 填充：补 0x80，补 0 到 56 mod 64，末尾 8 字节小端比特长度。
+    //
+    // ── MD5 与 SHA 的填充差异 ───────────────────────
+    //
+    // 长度字段是**小端**（SHA 是大端）。这一处不同是手写 MD5 最常
+    // 犯的错，症状是「短输入对、长输入错」或「完全对不上」。
+    static fn padded(data: Array) -> Array {
+        let out = bbSlice(data, 0, len(data))
+        let bitLen = len(data) * 8
+        bbPut(out, 0x80)
+        while (len(out) % 64) != 56 {
+            bbPut(out, 0)
+        }
+        bbPutU32LE(out, bitLen & MD5_MASK32)
+        bbPutU32LE(out, (bitLen >> 32) & MD5_MASK32)
+        return out
+    }
+
+    static fn hash(data: Array) -> Array {
+        var a0 = 0x67452301
+        var b0 = 0xEFCDAB89
+        var c0 = 0x98BADCFE
+        var d0 = 0x10325476
+
+        let msg = Md5.padded(data)
+        let kk  = md5K()
+        let ss  = md5S()
+        let total = len(msg)
+        var off = 0
+
+        while off < total {
+            // 16 个 32 位**小端**字
+            let w = []
+            var t = 0
+            while t < 16 {
+                arrPush(w, bbU32LE(msg, off + t * 4) & MD5_MASK32)
+                t = t + 1
+            }
+
+            var a = a0
+            var b = b0
+            var c = c0
+            var d = d0
+
+            t = 0
+            while t < 64 {
+                var f = 0
+                var g = 0
+                if (t < 16) {
+                    // F(b,c,d) = (b & c) | (~b & d)
+                    f = (b & c) | ((~b & MD5_MASK32) & d)
+                    g = t
+                } else if (t < 32) {
+                    // G(b,c,d) = (b & d) | (c & ~d)
+                    f = (b & d) | (c & ((~d) & MD5_MASK32))
+                    g = (5 * t + 1) % 16
+                } else if (t < 48) {
+                    // H(b,c,d) = b ^ c ^ d
+                    f = b ^ c ^ d
+                    g = (3 * t + 5) % 16
+                } else {
+                    // I(b,c,d) = c ^ (b | ~d)
+                    f = c ^ (b | ((~d) & MD5_MASK32))
+                    g = (7 * t) % 16
+                }
+
+                let sum = (a + (f & MD5_MASK32) + toInt(kk[t]) + toInt(w[g])) & MD5_MASK32
+                let rotated = Md5.rotl(sum, toInt(ss[t]))
+                let newB = (b + rotated) & MD5_MASK32
+
+                a = d
+                d = c
+                c = b
+                b = newB
+                t = t + 1
+            }
+
+            a0 = (a0 + a) & MD5_MASK32
+            b0 = (b0 + b) & MD5_MASK32
+            c0 = (c0 + c) & MD5_MASK32
+            d0 = (d0 + d) & MD5_MASK32
+            off = off + 64
+        }
+
+        // 输出也是小端
+        let out = []
+        bbPutU32LE(out, a0)
+        bbPutU32LE(out, b0)
+        bbPutU32LE(out, c0)
+        bbPutU32LE(out, d0)
+        return out
+    }
+
+    static fn hashText(s: String) -> Array {
+        return Md5.hash(bbFromUtf8(s))
+    }
+
+    static fn hexOf(b: Array) -> String {
+        var out = ""
+        var i = 0
+        while i < len(b) {
+            let v = bbAt(b, i)
+            out = out + toHex(v >> 4) + toHex(v & 0x0F)
+            i = i + 1
+        }
+        return out
+    }
+
+    static fn hexText(s: String) -> String {
+        return Md5.hexOf(Md5.hashText(s))
+    }
+}
+
+// 顶层便捷函数（PG 驱动直接用这些名字）。
+fn md5HexOf(b: Array) -> String {
+    return Md5.hexOf(Md5.hash(b))
+}
+
+fn md5HexText(s: String) -> String {
+    return Md5.hexText(s)
+}

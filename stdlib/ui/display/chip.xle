@@ -1,0 +1,115 @@
+// ui/display/chip.xle — 可移除标记（Chip）
+//
+// Tag + 右侧的叉。用于「已选筛选项」这类需要能取消的场景。
+//
+// ── 为什么 chip 不继承 Tag ────────────────────
+//
+// 因为叉占的地方改变了布局：Tag 的宽度 = 文字 + 两个 padding，
+// 而 Chip 的宽度 = 文字 + 两个 padding + 叉宽。继承之后要么
+// measure 里判类型，要么让 Tag 留一个「预留额外宽度」的字段 ——
+// 两种都比多写 60 行复制代码更糟。
+//
+// 而且它们的**生命周期语义**不同：Tag 是只读展示，Chip 点叉会
+// 自己隐藏。语义不同就该是不同类。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+from "tag.xle" import tagBlend, Tag, TAG_H, TAG_PAD, TAG_NEUTRAL, TAG_ACCENT, TAG_OK, TAG_WARN, TAG_ERR, TAG_DIM
+
+// Tag + 右侧的叉。用于「已选筛选项」这类需要能取消的场景。
+class Chip extends Widget {
+    text: String,
+    kind: Int,
+
+    // 叉按钮的宽度。
+    closeW: Int,
+
+    constructor(r: Rect, text: String, kind: Int) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.text    = text
+        self.kind    = kind
+        self.closeW  = 18
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, s: String) -> Chip {
+        return new Chip(r, s, TAG_ACCENT)
+    }
+
+    fn accentColor(th: Theme) -> Int {
+        if (self.kind == TAG_OK)   { return th.ok }
+        if (self.kind == TAG_WARN) { return th.warn }
+        if (self.kind == TAG_ERR)  { return th.err }
+        return th.accent
+    }
+
+    // 宽度要含叉的位置。
+    fn measure() -> Rect {
+        let w = winTextWidth(self.text) + TAG_PAD * 2 + self.closeW
+        return rectOf(0, 0, w, TAG_H)
+    }
+
+    fn setTo(x: Int, y: Int) -> Chip {
+        let s = self.measure()
+        self.r = rectOf(x, y, s.w, s.h)
+        return self
+    }
+
+    // 叉按钮矩形。
+    fn closeRect() -> Rect {
+        return rectOf(self.r.x + self.r.w - self.closeW - 2,
+                      self.r.y, self.closeW, self.r.h)
+    }
+
+    // 点击叉。返回 true 表示要移除。
+    fn click(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+        if (self.closeRect().contains(mx, my)) {
+            self.vis = false
+            return true
+        }
+        return false
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        let ac = self.accentColor(th)
+        let rad = TAG_H / 2
+        let bg = tagBlend(th.surface, ac, 0.18)
+
+        winFillRound(self.r.x, self.r.y, self.r.w, self.r.h, rad, bg)
+
+        // 文字：左侧，留出叉的位置。
+        let tr = rectOf(self.r.x + TAG_PAD, self.r.y,
+                        self.r.w - TAG_PAD - self.closeW, self.r.h)
+        uiTextLeft(tr, self.text, 0, ac)
+
+        // 叉。
+        let cr = self.closeRect()
+        let cx = cr.x + cr.w / 2
+        let cy = cr.y + cr.h / 2
+        let mxx = winMouseX()
+        let myy = winMouseY()
+        var c = ac
+        if (cr.contains(mxx, myy)) {
+            // 悬停时叉加底并变红 —— 明确「点这里会删掉」。
+            winFillRound(cr.x + 2, cr.y + 4, cr.w - 4, cr.h - 8, 4, th.err)
+            c = th.onAccent
+        }
+        var i = 0 - 3
+        while i <= 3 {
+            winFillRect(cx + i, cy + i, 1, 1, c)
+            winFillRect(cx + i, cy - i, 1, 1, c)
+            i = i + 1
+        }
+    }
+}

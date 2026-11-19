@@ -1,0 +1,215 @@
+// ui/display/breadcrumb.xle — 面包屑导航
+//
+// ── 面包屑的价值是「我在哪，怎么回去」 ────────────────
+//
+// 所以它必须做到两件事：显示完整路径、每个祖先都可点回去。
+//
+// 难点是**路径太长**：`首页 / 项目 / x-lang / stdlib / ui / core / rect.xle`
+// 在窄窗口里放不下。三种处理方式：
+//
+//   1. 中间省略：首页 / ... / core / rect.xle
+//   2. 尾部省略：首页 / 项目 / x-lang ...
+//   3. 水平滚动
+//
+// 选 1。因为用户需要的是「起点」和「当前」，中间那些是可选的。
+// 而 2 会把「当前在哪」丢掉，那是面包屑最核心的信息。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 分隔符左右的间距。
+const BC_SEP_PAD = 8
+
+class Breadcrumb extends Widget {
+    // 各级名称，从根到当前。
+    items: Array,
+
+    // 当前鼠标悬停的项下标。-1 表示没有。
+    hoverIndex: Int,
+
+    // 最多显示几项。超过时中间省略。
+    //
+    // 0 表示不限（放不下时靠右截断）。
+    maxItems: Int,
+
+    constructor(r: Rect, items: Array) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.items     = items
+        self.hoverIndex = 0 - 1
+        self.maxItems  = 5
+        self.style     = Style.plain()
+    }
+
+    static fn of(r: Rect, items: Array) -> Breadcrumb {
+        let b = new Breadcrumb(r, items)
+        return b
+    }
+
+    fn setItems(arr: Array) -> Breadcrumb {
+        self.items = arr
+        return self
+    }
+
+    // ── 显示序列 ─────────────────────────────────
+    //
+    // 返回「要显示哪些原始下标」。超长时中间省略，用 -1 表示
+    // 省略号。
+    //
+    // 例：7 项、maxItems=5 → [0, -1, 4, 5, 6]
+    //     即「首页 / ... / ui / core / rect.xle」
+    fn displayIndices() -> Array {
+        let n = len(self.items)
+        let out = []
+        if (n == 0) { return out }
+
+        if (self.maxItems <= 0 || n <= self.maxItems) {
+            var i = 0
+            while i < n { arrPush(out, i); i = i + 1 }
+            return out
+        }
+
+        // 超长：保留首 1 项 + 末 (maxItems - 2) 项 + 一个省略号。
+        //
+        // 为什么保留首 1 而不是首 2：因为首项通常是「首页」，一个
+        // 词就能表达「回到起点」，而第二项的价值远低于末端的
+        // 「当前在哪」。把名额全给末端。
+        arrPush(out, 0)
+        arrPush(out, 0 - 1)
+
+        var keep = self.maxItems - 2
+        var start = n - keep
+        var i = start
+        while i < n { arrPush(out, i); i = i + 1 }
+        return out
+    }
+
+    // 分隔符占用的宽度。
+    fn sepWidth() -> Int {
+        return winTextWidth("/") + BC_SEP_PAD * 2
+    }
+
+    // 第 k 个显示项（k 是 displayIndices 的下标）的矩形。
+    fn cellRect(k: Int) -> Rect {
+        let idxs = self.displayIndices()
+        var x = self.r.x
+        var i = 0
+        while i < k && i < len(idxs) {
+            let orig = toInt(idxs[i])
+            var w = 0
+            if (orig < 0) {
+                w = winTextWidth("...")
+            } else {
+                w = winTextWidth(toString(self.items[orig]))
+            }
+            x = x + w + self.sepWidth()
+            i = i + 1
+        }
+
+        var w2 = 0
+        if (k >= 0 && k < len(idxs)) {
+            let orig = toInt(idxs[k])
+            if (orig < 0) {
+                w2 = winTextWidth("...")
+            } else {
+                w2 = winTextWidth(toString(self.items[orig]))
+            }
+        }
+        return rectOf(x, self.r.y, w2, self.r.h)
+    }
+
+    // 命中的显示下标。-1 表示没命中。
+    fn indexAt(mx: Int, my: Int) -> Int {
+        if (!self.vis || !self.enabled) { return 0 - 1 }
+        if (!self.r.contains(mx, my)) { return 0 - 1 }
+        let idxs = self.displayIndices()
+        var k = 0
+        while k < len(idxs) {
+            let cr: Rect = self.cellRect(k)
+            if (cr.contains(mx, my)) { return k }
+            k = k + 1
+        }
+        return 0 - 1
+    }
+
+    // 点击。返回被点中的**原始下标**（对应 items），-1 表示无。
+    //
+    // ── 为什么不返回显示下标 ────────────────────
+    //
+    // 因为调用方要知道「用户点了哪一级」，而那对应的是 items 里的
+    // 位置。显示下标是内部实现（省略号会改变映射），暴露出去
+    // 会让调用方困惑。
+    fn click(mx: Int, my: Int) -> Int {
+        let k = self.indexAt(mx, my)
+        if (k < 0) { return 0 - 1 }
+        let idxs = self.displayIndices()
+        if (k >= len(idxs)) { return 0 - 1 }
+        let orig = toInt(idxs[k])
+        if (orig < 0) { return 0 - 1 }   // 省略号不可点
+        // 最后一项是「当前页」，点它通常不做事。但这里不排除，
+        // 让调用方自己决定 —— 有些应用点当前项会刷新。
+        return orig
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        let idxs = self.displayIndices()
+        if (len(idxs) == 0) { return }
+
+        let mxx = winMouseX()
+        let myy = winMouseY()
+        let hovK = self.indexAt(mxx, myy)
+
+        var k = 0
+        while k < len(idxs) {
+            let orig = toInt(idxs[k])
+            let cr: Rect = self.cellRect(k)
+
+            if (orig < 0) {
+                // 省略号。
+                uiTextLeft(cr, "...", 0, th.textDim)
+            } else {
+                let s = toString(self.items[orig])
+                let isLast = orig == len(self.items) - 1
+                let isHover = k == hovK && !isLast
+
+                var c = th.textDim
+                if (isLast) {
+                    // 当前项：用正文色，因为它是「你在这里」。
+                    c = th.text
+                } else if (isHover) {
+                    // 可点的祖先：悬停时用主色 + 下划线。
+                    c = th.accent
+                }
+                if (!self.enabled) { c = th.disabled }
+
+                uiTextLeft(cr, s, 0, c)
+
+                // 悬停下划线：明确「这里能点」。
+                if (isHover) {
+                    let tw = winTextWidth(s)
+                    winFillRect(cr.x, cr.y + cr.h - 3, tw, 1, th.accent)
+                }
+            }
+
+            // 分隔符。「/」比「>」更中性，也不会在窄间距下看起来
+            // 像个按钮。
+            if (k < len(idxs) - 1) {
+                let sx = cr.x + cr.w + BC_SEP_PAD
+                let sy = cr.y + (cr.h - winTextHeight()) / 2
+                winText(sx, sy, "/", th.border)
+            }
+
+            k = k + 1
+        }
+    }
+}

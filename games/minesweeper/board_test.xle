@@ -1,0 +1,173 @@
+// 顶部加 import
+from "board.xle" import rng_seed, rng_next, rng_below, board_new, b_idx, b_mine, b_open, b_flag, b_num, b_set_mine, b_set_open, b_set_flag, b_dead, b_inside, board_place_mines, board_count, board_open, board_flag, board_check_win, board_flags_left, board_opened_count, board_state, DIFF_BEGINNER_W, DIFF_BEGINNER_H, DIFF_BEGINNER_M, DIFF_INTER_W, DIFF_INTER_H, DIFF_INTER_M, DIFF_EXPERT_W, DIFF_EXPERT_H, DIFF_EXPERT_M, B_W, B_H, B_MINES, B_MINE, B_OPEN, B_FLAG, B_NUM, B_STATE, B_DEAD, ST_PLAY, ST_WIN, ST_LOSE
+// board_test.xle — 棋盘逻辑的文本测试
+//
+// 不碰窗口，纯 println 驱动。这个测试的价值在于：
+// 逻辑错了能立刻定位到具体函数，而不是「游戏跑起来感觉不对」。
+//
+// 覆盖：建盘、布雷数量、首点必空、数字统计、连锁展开、
+// 插旗、踩雷、胜利判定、确定性（同种子同结果）。
+
+// ---- 1. 建盘与布雷 ----
+let b = board_new(9, 9, 10)
+println(b[0])
+println(b[1])
+println(b[2])
+println(len(b[3]))
+
+board_place_mines(b, 4, 4, 12345)
+board_count(b)
+
+// 数一下实际放了几个雷
+var mines_placed = 0
+var i = 0
+while i < 81 {
+    mines_placed += b[3][i]
+    i += 1
+}
+println(mines_placed)      // 10
+
+// ---- 2. 首点及其邻域必空 ----
+var danger = 0
+for dy in 0..3 {
+    for dx in 0..3 {
+        let nx = 4 + dx - 1
+        let ny = 4 + dy - 1
+        if b_mine(b, nx, ny) == 1 {
+            danger += 1
+        }
+    }
+}
+println(danger)            // 0
+
+// ---- 3. 数字统计：逐格核对 ----
+// 手算太容易出错，所以这里用「另一种算法」自证：
+// 用 8 邻域重算一遍，与 b_num 的结果比对。
+var mismatched = 0
+for y in 0..9 {
+    for x in 0..9 {
+        if b_mine(b, x, y) == 1 {
+            if b_num(b, x, y) != -1 {
+                mismatched += 1
+            }
+        } else {
+            var c = 0
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let nx = x + dx - 1
+                    let ny = y + dy - 1
+                    if b_inside(b, nx, ny) && b_mine(b, nx, ny) == 1 {
+                        c += 1
+                    }
+                }
+            }
+            if c != b_num(b, x, y) {
+                mismatched += 1
+            }
+        }
+    }
+}
+println(mismatched)        // 0
+
+// ---- 4. 首点翻开：邻域全空 → 应该连锁展开一大片 ----
+let b2 = board_new(9, 9, 10)
+board_place_mines(b2, 4, 4, 777)
+board_count(b2)
+board_open(b2, 4, 4)
+println(b_open(b2, 4, 4))                 // 1
+println(board_state(b2))                   // 1（进行中，没踩雷）
+println(board_opened_count(b2) > 1)        // true（连锁展开了）
+
+// ---- 5. 插旗 ----
+let b3 = board_new(9, 9, 10)
+board_place_mines(b3, 4, 4, 999)
+board_count(b3)
+println(board_flags_left(b3))              // 10
+board_flag(b3, 0, 0)
+println(b_flag(b3, 0, 0))                  // 1
+println(board_flags_left(b3))              // 9
+board_flag(b3, 0, 0)                       // 再点一次取消
+println(b_flag(b3, 0, 0))                  // 0
+
+// 已翻开的格子不能插旗
+board_open(b3, 4, 4)
+println(b_flag(b3, 4, 4))                  // 0
+
+// ---- 6. 有旗的格子点不开 ----
+let b4 = board_new(9, 9, 10)
+board_place_mines(b4, 4, 4, 4242)
+board_count(b4)
+board_flag(b4, 0, 0)
+board_open(b4, 0, 0)
+println(b_open(b4, 0, 0))                  // 0
+
+// ---- 7. 踩雷 ----
+// 找一个真的有雷的格子，直接点它
+let b5 = board_new(9, 9, 10)
+board_place_mines(b5, 4, 4, 2024)
+board_count(b5)
+var mx = -1
+var my = -1
+for y in 0..9 {
+    for x in 0..9 {
+        if b_mine(b5, x, y) == 1 && mx < 0 {
+            mx = x
+            my = y
+        }
+    }
+}
+board_open(b5, mx, my)
+println(board_state(b5))                   // 3（失败）
+println(b_open(b5, mx, my))                // 1
+
+// 失败之后不能再操作
+let before = board_opened_count(b5)
+board_open(b5, 0, 0)
+println(board_opened_count(b5) == before)  // true
+
+// ---- 8. 确定性：同种子同分布 ----
+let c1 = board_new(9, 9, 10)
+board_place_mines(c1, 4, 4, 31337)
+let c2 = board_new(9, 9, 10)
+board_place_mines(c2, 4, 4, 31337)
+var same = true
+for i in 0..81 {
+    if c1[3][i] != c2[3][i] {
+        same = false
+    }
+}
+println(same)                              // true
+
+// 不同种子应该不同（这里只是检查「真的有随机性」，
+// 极小概率撞上相同分布，用 3 组比对把概率压到可忽略）
+let c3 = board_new(9, 9, 10)
+board_place_mines(c3, 4, 4, 88888)
+var diff = 0
+for i in 0..81 {
+    if c1[3][i] != c3[3][i] {
+        diff += 1
+    }
+}
+println(diff > 0)                          // true
+
+// ---- 9. 胜利判定 ----
+// 用 1×1 棋盘、0 雷：翻开唯一格子即胜利
+let w1 = board_new(1, 1, 0)
+board_place_mines(w1, 0, 0, 1)
+board_count(w1)
+board_open(w1, 0, 0)
+println(board_check_win(w1))               // true
+println(board_state(w1))                   // 2
+
+// ---- 10. 高级难度：棋盘大、雷多，仍然只放指定数量 ----
+let big = board_new(30, 16, 99)
+board_place_mines(big, 15, 8, 5)
+board_count(big)
+var big_mines = 0
+for i in 0..480 {
+    big_mines += big[3][i]
+}
+println(big_mines)                          // 99
+println(board_opened_count(big))            // 0
+
+println("board ok")

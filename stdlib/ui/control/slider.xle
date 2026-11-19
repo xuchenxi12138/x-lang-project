@@ -1,0 +1,279 @@
+// ui/control/slider.xle — 滑块
+//
+// ── 滑块与进度条的共同点与不同点 ────────────────────
+//
+// 两者共用「一条轨道 + 一段填充 + 一个比例」，所以轨道绘制
+// 抽成了独立的 Track 值对象（同文件下方）。
+//
+// 不同点在交互：进度条只读，滑块要处理拖动。而拖动的难点不是
+// 「把鼠标位置换成值」—— 那是两行算术 —— 而是**拖出边界**：
+//
+//   · 在轨道上按下，拖到面板外，再拖回来：值应该跟着走
+//   · 按下后不松手，值必须在每一帧更新（即时模式下没有「移动事件」）
+//
+// 所以滑块的拖动状态必须跨帧保存（dragging 字段），而按下判定
+// 每帧从输入层读。这是即时 UI 里少数**必须**有状态的控件。
+//
+// ── 为什么值域用 Int 而不是 Float ────────────────────
+//
+// 滑块的用途绝大多数是「音量 0~100」「字号 8~72」，整数就够。
+// 而浮点滑块要做「步长吸附」和「显示格式」两套额外逻辑，收益
+// 不明显。需要小数时用 lo/hi 缩放（比如 0~1000 表示 0~10.0）。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+// 轨道高度。6px 是「能看清又不是一条粗线」的平衡点。
+const SL_TRACK_H = 6
+
+// 把手尺寸。宽度比高度小一点显得纵向修长；高度覆盖轨道大半，
+// 便于鼠标抓住。
+const SL_KNOB_W = 14
+const SL_KNOB_H = 20
+
+class Slider extends Widget {
+    lo: Int,
+    hi: Int,
+    value: Int,
+
+    // 拖动中。跨帧保存 —— 这是即时 UI 里少数需要可变状态的控件。
+    dragging: Bool,
+
+    // 步长。0 表示连续。设为 1 时值总是整数（本来就是），
+    // 设为 5 时吸附到 5 的倍数。
+    step: Int,
+
+    // 是否显示读数（右侧的数字）。
+    showReadout: Bool,
+
+    // 读数后缀，如 "%"、"px"。
+    suffix: String,
+
+    constructor(r: Rect, lo: Int, hi: Int) {
+        self.r           = r
+        self.vis         = true
+        self.enabled     = true
+        self.focused     = false
+        self.hovered     = false
+        self.lo          = lo
+        self.hi          = hi
+        self.value       = lo
+        self.dragging    = false
+        self.step        = 0
+        self.showReadout = false
+        self.suffix      = ""
+        self.style       = Style.plain()
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    static fn of(r: Rect, lo: Int, hi: Int, v: Int) -> Slider {
+        let s = new Slider(r, lo, hi)
+        s.setValue(v)
+        return s
+    }
+
+    static fn percent(r: Rect, v: Int) -> Slider {
+        let s = new Slider(r, 0, 100)
+        s.setValue(v)
+        s.suffix = "%"
+        s.showReadout = true
+        return s
+    }
+
+    // ── 值 ──────────────────────────────────────
+
+    // 设值。夹紧到值域，并按 step 吸附。
+    //
+    // 吸附用「四舍五入到最近的倍数」而不是「向下取整」—— 向下
+    // 取整会让鼠标在 9 的位置停住但值显示 5，用户感觉「拖不动」。
+    fn setValue(v: Int) -> Slider {
+        var x = v
+        if (x < self.lo) { x = self.lo }
+        if (x > self.hi) { x = self.hi }
+
+        if (self.step > 0) {
+            let n = x - self.lo
+            let k = (n + self.step / 2) / self.step
+            x = self.lo + k * self.step
+            if (x > self.hi) {
+                // 吸附后越界，回退一格。否则「hi 不是 step 的整数倍」
+                // 时永远取不到 hi。
+                x = x - self.step
+            }
+        }
+        self.value = x
+        return self
+    }
+
+    fn setStep(n: Int) -> Slider {
+        self.step = n
+        return self
+    }
+
+    fn get() -> Int {
+        return self.value
+    }
+
+    // 值占值域的比例 0.0~1.0。
+    fn ratio() -> Float {
+        if (self.hi <= self.lo) { return 0.0 }
+        var t = toFloat(self.value - self.lo) / toFloat(self.hi - self.lo)
+        if (t < 0.0) { t = 0.0 }
+        if (t > 1.0) { t = 1.0 }
+        return t
+    }
+
+    // 鼠标横坐标 → 值。
+    //
+    // 分母用 (w - knobbW) 而不是 w：把手的可移动范围是轨道宽度
+    // 减去把手宽度，用 w 会让把手在最右端时值还差一点到 hi。
+    fn valueAt(mx: Int) -> Int {
+        let span = self.r.w - SL_KNOB_W
+        if (span <= 0) { return self.lo }
+        var t = toFloat(mx - self.r.x - SL_KNOB_W / 2) / toFloat(span)
+        if (t < 0.0) { t = 0.0 }
+        if (t > 1.0) { t = 1.0 }
+        return self.lo + toInt(t * toFloat(self.hi - self.lo) + 0.5)
+    }
+
+    // ── 轨迹与把手几何 ──────────────────────────────
+    //
+    // 抽成函数是因为 draw 里要用三次（轨道、填充段、把手），
+    // 三处手算容易不一致。
+
+    fn trackRect() -> Rect {
+        let cy = self.r.y + (self.r.h - SL_TRACK_H) / 2
+        return rectOf(self.r.x, cy, self.r.w, SL_TRACK_H)
+    }
+
+    fn knobX() -> Int {
+        let span = self.r.w - SL_KNOB_W
+        if (span < 0) { return self.r.x }
+        return self.r.x + toInt(self.ratio() * toFloat(span) + 0.5)
+    }
+
+    fn knobRect() -> Rect {
+        let ky = self.r.y + (self.r.h - SL_KNOB_H) / 2
+        return rectOf(self.knobX(), ky, SL_KNOB_W, SL_KNOB_H)
+    }
+
+    // ── 交互 ────────────────────────────────────
+    //
+    // 拖动判定必须比轨道高：轨道只有 6px，鼠标在轨道上下 4px
+    // 内都应该算「在滑条上」。所以用一个膨胀过的矩形。
+    fn hitArea() -> Rect {
+        return Rect.inset(self.r, 0 - 6)
+    }
+
+    // 这一帧的交互处理。
+    //
+    // pressedNow 是「鼠标此刻按着左键」，由输入层给。返回值是
+    // 值是否发生了变化 —— 调用方据此决定要不要触发「值改变」
+    // 回调（而不是每帧都触发）。
+    //
+    // ── 为什么是 pressedNow 而不是 clicked ────────────
+    //
+    // 拖动期间鼠标一直按着，没有「点击事件」。如果等 clicked，
+    // 拖动过程完全不响应。所以这里要的是「按下状态」而不是
+    // 「点击事件」，这是滑块与按钮在输入模型上的根本区别。
+    fn update(mx: Int, my: Int, pressedNow: Bool) -> Bool {
+        if (!self.vis || !self.enabled) {
+            self.dragging = false
+            return false
+        }
+
+        let inArea = self.hitArea().contains(mx, my)
+
+        // 开始拖动：在区域内按下且原本没在拖。
+        if (pressedNow && inArea && !self.dragging) {
+            self.dragging = true
+            let old = self.value
+            self.setValue(self.valueAt(mx))
+            return self.value != old
+        }
+
+        // 拖动中：不管鼠标在哪（可能已经拖出边界），都跟到底。
+        //
+        // 这是「拖出边界再拖回来」能正常工作的关键。如果这里加
+        // inArea 判断，鼠标一出去值就冻住了，回到边界内也不会
+        // 恢复 —— 用户会觉得滑条「卡住」。
+        if (pressedNow && self.dragging) {
+            let old = self.value
+            self.setValue(self.valueAt(mx))
+            return self.value != old
+        }
+
+        // 松开。
+        self.dragging = false
+        return false
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // ── 1. 轨道 ──
+        //
+        // 胶囊形（半径 = 高度/2）。直角细条看起来像一段遮罩，
+        // 圆头才像轨道。
+        let tr = self.trackRect()
+        winFillRound(tr.x, tr.y, tr.w, tr.h, SL_TRACK_H / 2, th.track)
+
+        // ── 2. 已填充段 ──
+        //
+        // 宽度从轨道左边到把手中心。半径比轨道小 1 —— 否则填充段
+        // 的方头会盖住轨道的半圆，右端看起来是直的。
+        let kx = self.knobX()
+        let filledW = kx - tr.x + SL_KNOB_W / 2
+        if (filledW > 0) {
+            var accent = th.accent
+            if (!self.enabled) { accent = th.disabled }
+            let fw = filledW
+            if (fw > tr.w) { fw = tr.w }
+            let fr = SL_TRACK_H - 2
+            if (fr < 0) { fr = 0 }
+            winFillRound(tr.x, tr.y, fw, tr.h, fr, accent)
+        }
+
+        // ── 3. 把手 ──
+        //
+        // 胶囊形 + 描边。按下/悬停时描边变主色 —— 这是唯一的
+        // 视觉反馈，不能省，否则用户不知道有没有抓住。
+        let kr = self.knobRect()
+        var edge = th.textDim
+        if (self.dragging || self.hovered) { edge = th.accent }
+        if (!self.enabled) { edge = th.disabled }
+
+        winFillRound(kr.x, kr.y, kr.w, kr.h, SL_KNOB_W / 2, th.surface)
+        winBorderRound(kr.x, kr.y, kr.w, kr.h, SL_KNOB_W / 2, 1, edge)
+
+        // 拖动中加一道阴影，做出「被拎起来」的感觉。
+        if (self.dragging) {
+            winFillRound(kr.x, kr.y + 2, kr.w, kr.h, SL_KNOB_W / 2, th.scrim)
+        }
+
+        // ── 4. 读数 ──
+        //
+        // 画在滑条右侧。**必须**给读数预留宽度：如果滑条自己
+        // 占满整行，读数就会画到面板边框外。这是示例程序里踩过
+        // 的坑 —— slider.x + slider.w + 6 看着没问题，但 slider.w
+        // 等于内容区宽，加 6 已经出界。
+        if (self.showReadout) {
+            let s = toString(self.value) + self.suffix
+            winText(self.r.x + self.r.w + 10,
+                    self.r.y + (self.r.h - winTextHeight()) / 2,
+                    s, th.textDim)
+        }
+
+        if (self.focused) {
+            self.drawFocusRing(th)
+        }
+    }
+}

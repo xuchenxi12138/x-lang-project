@@ -1,0 +1,136 @@
+// db/codec/hmac.xle — HMAC 与 PBKDF2
+//
+// ── 为什么需要这两个 ──────────────────────────────
+//
+// PostgreSQL 10+ 的默认认证是 SCRAM-SHA-256，它的每条消息都要用
+// HMAC-SHA256 签名，而口令派生出密钥用的是 PBKDF2-HMAC-SHA256。
+// 没有这两个原语就一个字节都算不出来。
+//
+// ── HMAC 的定义 ──────────────────────────────────
+//
+//   HMAC(K, m) = H((K' ⊕ opad) ++ H((K' ⊕ ipad) ++ m))
+//
+//   K' = K 若 |K| == 块长（64 字节），否则 K 补零到块长；
+//        若 |K| > 块长则先取 H(K)
+//   ipad = 0x36 重复块长次
+//   opad = 0x5C 重复块长次
+//
+// ── 为什么 K' 的超长分支必须实现 ────────────────────
+//
+// 因为 PBKDF2 会把上一轮的输出（32 字节）当盐继续用，而如果某条
+// 调用链把长口令直接当 key（>64 字节），不先摘要就会越界读。这个
+// 分支在测试里很容易漏掉 —— 但中文口令 UTF-8 后经常超过 64 字节。
+
+from "bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "sha256.xle" import Sha256, SHA256_H0, SHA256_H1, SHA256_H2, SHA256_H3, SHA256_H4, SHA256_H5, SHA256_H6, SHA256_H7, SHA256_MASK32
+
+// SHA-256 的块长（字节）。HMAC 的 ipad/opad 填充长度就是它。
+const HMAC_BLOCK = 64
+
+// SHA-256 的摘要长度（字节）。
+const HMAC_DIGEST = 32
+
+// 把任意长度的 key 规整成块长。
+//
+// ── 为什么超过块长要先摘要 ────────────────────────
+//
+// 见文件头。一句话：HMAC 的数学定义要求 K' 长度等于块长，而
+// H(K) 是唯一能把任意长度压到摘要长度的做法。
+fn hmacNormKey(key: Array) -> Array {
+    let out = []
+    if (len(key) > HMAC_BLOCK) {
+        // K' = H(K)，然后补零到块长
+        bbPutBytes(out, Sha256.hash(key))
+    } else {
+        bbPutBytes(out, key)
+    }
+    while len(out) < HMAC_BLOCK {
+        bbPut(out, 0)
+    }
+    return out
+}
+
+// HMAC-SHA256。返回 32 字节。
+fn hmacSha256(key: Array, msg: Array) -> Array {
+    let k = hmacNormKey(key)
+
+    // inner = H((K' ⊕ ipad) ++ msg)
+    let inner = []
+    var i = 0
+    while i < HMAC_BLOCK {
+        arrPush(inner, bbAt(k, i) ^ 0x36)
+        i = i + 1
+    }
+    bbPutBytes(inner, msg)
+    let innerHash = Sha256.hash(inner)
+
+    // outer = H((K' ⊕ opad) ++ inner)
+    let outer = []
+    i = 0
+    while i < HMAC_BLOCK {
+        arrPush(outer, bbAt(k, i) ^ 0x5C)
+        i = i + 1
+    }
+    bbPutBytes(outer, innerHash)
+    return Sha256.hash(outer)
+}
+
+// HMAC-SHA256 的十六进制形式（调试用）。
+fn hmacSha256Hex(key: Array, msg: Array) -> String {
+    return Sha256.hexOf(hmacSha256(key, msg))
+}
+
+// ── PBKDF2-HMAC-SHA256 ──────────────────────────
+//
+//   DK = T1 ++ T2 ++ ... ++ Tn
+//   Ti = F(P, S, c, i)
+//   F  = U1 ⊕ U2 ⊕ ... ⊕ Uc
+//   U1 = HMAC(P, S ++ INT(i))
+//   Uj = HMAC(P, U(j-1))
+//
+// ── 为什么 SCRAM 用的是这个而不是直接 HMAC ──────────
+//
+// 因为口令的熵太低。单次 HMAC 让攻击者可以每秒试几十亿次，而
+// PBKDF2 的迭代次数（PostgreSQL 默认 4096）把每次尝试的成本放大
+// 4096 倍。这是「故意算得慢」的设计。
+//
+// ── 为什么迭代次数要参数化 ────────────────────────
+//
+// 因为服务端在 SCRAM 的 server-first-message 里用 `i=` 声明它要求
+// 的迭代数。客户端必须用同样的值，写死 4096 会在服务端改配置时
+// 认证失败。
+fn pbkdf2Sha256(password: Array, salt: Array, iterations: Int, outLen: Int) -> Array {
+    let out = []
+    // 语言没有无符号整数，而 PBKDF2 的块索引是 32 位大端。这里只
+    // 支持 1 个块（32 字节），因为 SCRAM-SHA-256 只需要 32 字节密钥。
+    //
+    // ── 为什么只实现一个块还留着循环 ────────────────
+    //
+    // 调用方明确要 32 字节（SCRAM 的规范值）。但为了将来需要更长
+    // 密钥时不必重写，循环结构保留。
+    var block = 1
+    while len(out) < outLen {
+        // U1 = HMAC(P, S ++ INT32BE(block))
+        let seed = bbSlice(salt, 0, len(salt))
+        bbPutU32BE(seed, block)
+        var u = hmacSha256(password, seed)
+        let acc = bbSlice(u, 0, len(u))
+
+        var c = 1
+        while c < iterations {
+            u = hmacSha256(password, u)
+            var j = 0
+            while j < len(acc) {
+                acc[j] = bbAt(acc, j) ^ bbAt(u, j)
+                j = j + 1
+            }
+            c = c + 1
+        }
+        bbPutBytes(out, acc)
+        block = block + 1
+    }
+    if (len(out) > outLen) {
+        return bbSlice(out, 0, outLen)
+    }
+    return out
+}

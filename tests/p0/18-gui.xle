@@ -1,0 +1,78 @@
+// 18-gui.xla — 窗口运行时的冒烟测试
+//
+// 这个测试不能像其他测试那样比对 stdout，因为窗口是图形。
+// 它的验证方式是：
+//   1. 开窗、画东西、截图、关窗，全程不崩
+//   2. 用 winText / winFillRect 的返回值与 winTime 断言运行时是活的
+//   3. 把截图存到 build/gui-smoke.bmp，人眼（或回归基线）能看
+//
+// 在无图形环境里 winOpen 会直接给出错误并退出 70，
+// 所以这个测试要求有桌面会话 —— run_tests.sh 里按需跳过。
+
+let W = 320
+let H = 200
+
+let ok = winOpen("X GUI 冒烟测试", W, H)
+println(ok)                       // true
+
+// 几帧绘制。不跑无限循环：测试必须在有限时间内结束。
+// 帧数取 3 —— 足够覆盖「第一帧」「重复帧」「最后一帧」，
+// 又不至于让 CI 里多等几秒。
+let f = 0
+while f < 3 {
+    winBeginFrame()
+
+    // 背景
+    winFillRect(0, 0, W, H, 0x1E1E24)
+
+    // 标题栏区
+    winFillRect(0, 0, W, 36, 0x2A2A33)
+    winText(12, 10, "X GUI smoke test", 0xE0E0E8)
+
+    // 一列色块，验证 fillRect 的颜色通道顺序
+    winFillRect(20, 56, 40, 40, 0xE05555)
+    winFillRect(70, 56, 40, 40, 0x55E055)
+    winFillRect(120, 56, 40, 40, 0x5555E0)
+
+    // 边框
+    winBorderRect(20, 110, 140, 60, 2, 0x606070)
+
+    // 中文（验证 UTF-8 → UTF-16 转换）
+    winText(26, 124, "中文渲染测试", 0xD0D0E0)
+
+    // 文字度量
+    let tw = winTextWidth("ABC")
+    let th = winTextHeight()
+    if f == 0 {
+        println(tw > 0)           // true
+        println(th > 0)           // true
+    }
+
+    // 鼠标查询（无输入时应当有值且不崩）
+    let mx = winMouseX()
+    let my = winMouseY()
+    if f == 0 {
+        println(mx >= 0)          // true
+        println(my >= 0)          // true
+    }
+
+    winEndFrame()
+
+    // 让窗口有时间响应消息。不休眠的话这三帧会在
+    // 同一个消息泵周期内画完，屏幕上看不到任何东西。
+    winSleep(30)
+    f = f + 1
+}
+
+// 时间应当是个正常的正数
+let t = winTime()
+println(t > 0.0)                  // true
+
+// 截图
+println(winScreenshot("build/gui-smoke.bmp"))   // true
+
+// 用户没有真的点叉，窗口应该还开着
+println(winShouldClose())         // false
+
+winClose()
+println("gui ok")

@@ -1,0 +1,309 @@
+// service/lifecycle.xle — 服务的生命周期
+//
+// ── 为什么需要这个（而不是直接 while 循环）─────────
+//
+// 一个能上线的服务和一个「能跑」的服务，差别全在生命周期的管理上：
+//
+//   · 收到停止信号 → 不能立刻死，要把处理中的请求做完
+//   · 启动阶段失败 → 要能回滚已经启动的部分（关掉监听）
+//   · 启动顺序   → 数据库要先连上，HTTP 才能开始接流量
+//   · 关停顺序   → HTTP 先停接流量，再关数据库（反了会让正在处理
+//                  的请求去访问已关闭的连接）
+//
+// 这些东西如果让每个服务自己写 while 循环处理，写法一定各不相同，
+// 而且一定会漏掉「回滚」和「顺序」这两项 —— 因为它们在本地开发时
+// 完全看不出问题，只在生产的事故里显现。
+//
+// ── 状态机 ─────────────────────────────────────
+//
+//   INIT ──start()──> STARTING ──全部成功──> RUNNING
+//     │                  │                    │
+//     │                  └──任一步失败──> FAILED
+//     │                                       │
+//     └────────────── stop() ─────────> STOPPING ──> STOPPED
+//
+// 关键点是：**FAILED 也要走一遍 stop**，把已经启动成功的部分关掉。
+// 不这样做的话，失败重启几次之后端口就被自己占满了（每个失败的
+// 实例都留着一个没关的监听 socket）。
+
+// 生命周期状态。
+//
+// ── 为什么用 Int 而不是 Int 常量更好 ──────────────
+//
+// 因为语言顶层 const 只接受标量字面量，所以这里用函数返回名字，
+// 状态本身用 Int（0..4）。这样判断用 Int 比较（快），打印用名字
+// （可读）。
+fn lcStateName(s: Int) -> String {
+    if (s == 0) { return "INIT" }
+    if (s == 1) { return "STARTING" }
+    if (s == 2) { return "RUNNING" }
+    if (s == 3) { return "STOPPING" }
+    if (s == 4) { return "STOPPED" }
+    if (s == 5) { return "FAILED" }
+    return "UNKNOWN(" + toString(s) + ")"
+}
+
+fn lcStateInit() -> Int     { return 0 }
+fn lcStateStarting() -> Int { return 1 }
+fn lcStateRunning() -> Int  { return 2 }
+fn lcStateStopping() -> Int { return 3 }
+fn lcStateStopped() -> Int  { return 4 }
+fn lcStateFailed() -> Int   { return 5 }
+
+// 一个可启动的组件。
+//
+// ── 为什么用「名字 + 阶段」而不是函数指针 ────────────
+//
+// 见 server.xle 的同类说明：语言不能传函数。所以组件用名字标识，
+// 真正的启停动作由调用方在一个 dispatch 里按名字执行。
+//
+// 这个约束带来一个额外的好处：组件的启停顺序可以**从配置读**，
+// 而不用改代码 —— 因为「名字 → 动作」的映射是静态的，而顺序是
+// 运行时数据。
+class Component {
+    // 组件名（用于日志和按名查找）。
+    name: String
+
+    // 启动阶段（数值小的先启动、后关闭）。
+    //
+    // ── 为什么阶段可以让顺序自动正确 ──────────────
+    //
+    // 假设阶段是：10 = 数据库，20 = 缓存，30 = HTTP。
+    // 启动时按阶段升序：数据库 → 缓存 → HTTP（对：HTTP 开始接流量
+    // 前依赖必须就绪）。关停时按阶段**降序**：HTTP → 缓存 → 数据库
+    // （也对：先停接流量，再关依赖）。
+    //
+    // 用一个数字就同时解决了两个方向，不需要维护两份顺序表 ——
+    // 而两份列表一定会有一天只改了一份。
+    phase: Int
+
+    // 是否已成功启动。
+    started: Bool
+
+    // 启动/停止失败时的原因。
+    lastError: String
+
+    constructor(name: String, phase: Int) {
+        self.name      = name
+        self.phase     = phase
+        self.started   = false
+        self.lastError = ""
+    }
+
+    fn describe() -> String {
+        var s = "down"
+        if (self.started) { s = "up" }
+        return self.name + "[phase=" + toString(self.phase) + "," + s + "]"
+    }
+}
+
+// 生命周期管理器。
+class Lifecycle {
+    // 所有组件（按注册顺序保存）。
+    components: Array
+
+    // 当前状态。
+    state: Int
+
+    // 日志回调开关。
+    verbose: Bool
+
+    // 启动耗时（毫秒）。语言没有高精度计时器，这里用「轮询次数」
+    // 无法换算，所以只记录「是否测过」和值，由调用方填。
+    startupMs: Int
+
+    constructor() {
+        self.components = []
+        self.state      = lcStateInit()
+        self.verbose    = true
+        self.startupMs  = 0
+    }
+
+    // ── 注册 ──────────────────────────────────────
+
+    fn add(name: String, phase: Int) -> Component {
+        // ── 重名检查 ──────────────────────────
+        //
+        // 因为 dispatch 是按名字找动作的。重名的两个组件会共用同一个
+        // 动作 —— 于是「两个都要启动」变成「第一个启动两次，第二个
+        // 从来没启动」，而日志上看不出异常（都打印了 up）。
+        var i = 0
+        while i < len(self.components) {
+            let c: Component = self.components[i]
+            if (c.name == name) {
+                // 重名：返回一个标记为失败的对象，不加入列表。
+                let dup = new Component(name, phase)
+                dup.lastError = "组件名 `" + name + "` 已存在，注册被拒绝"
+                return dup
+            }
+            i = i + 1
+        }
+        let c = new Component(name, phase)
+        arrPush(self.components, c)
+        return c
+    }
+
+    fn find(name: String) -> Component {
+        var i = 0
+        while i < len(self.components) {
+            let c: Component = self.components[i]
+            if (c.name == name) { return c }
+            i = i + 1
+        }
+        // 找不到时返回一个空对象（不是 null，语言没有可空类型）。
+        // 调用方用 name 是否为空判断。
+        return new Component("", 0 - 1)
+    }
+
+    fn count() -> Int {
+        return len(self.components)
+    }
+
+    // ── 启动顺序计算 ───────────────────────────────
+
+    // 返回按 phase 升序排列的组件下标数组。
+    //
+    // ── 为什么用「稳定插入排序」而不是 arrSort ────────
+    //
+    // 因为 arrSort 只排数值。这里要按组件的 phase 排下标，还要保证
+    // **同 phase 的保持注册顺序**（相同阶段内的顺序应可预期）。
+    // 插入排序天然稳定，而且组件数量是个位数，O(n²) 无所谓。
+    fn startOrder() -> Array {
+        let out = []
+        var i = 0
+        while i < len(self.components) {
+            let cur: Component = self.components[i]
+            // 找到第一个 phase 大于 cur 的位置，插在它前面。
+            var at = len(out)
+            var j = 0
+            while j < len(out) {
+                let idx: Int = out[j]
+                let other: Component = self.components[idx]
+                if (other.phase > cur.phase) {
+                    at = j
+                    j = len(out)          // 提前退出
+                    continue
+                }
+                j = j + 1
+            }
+            // 插到 at 位置
+            arrPush(out, 0)               // 先占位
+            var k = len(out) - 1
+            while k > at {
+                out[k] = out[k - 1]
+                k = k - 1
+            }
+            out[at] = i
+            i = i + 1
+        }
+        return out
+    }
+
+    // 关停顺序：phase 降序（startOrder 的逆序）。
+    //
+    // ── 为什么正好是逆序就对了 ────────────────────
+    //
+    // 见 Component.phase 的说明。启动时「依赖先起」，关停时
+    // 「依赖先停」就是启动顺序的严格反转 —— 因为启动依赖图是一个
+    // DAG，逆序保证「没有任何组件在其依赖还活着时被关掉」。
+    fn stopOrder() -> Array {
+        let asc = self.startOrder()
+        let out = []
+        var i = len(asc) - 1
+        while i >= 0 {
+            arrPush(out, asc[i])
+            i = i - 1
+        }
+        return out
+    }
+
+    // ── 状态迁移 ──────────────────────────────────
+
+    fn isRunning() -> Bool {
+        return self.state == lcStateRunning()
+    }
+
+    fn isFailed() -> Bool {
+        return self.state == lcStateFailed()
+    }
+
+    // 进入 STARTING。
+    //
+    // ── 为什么状态迁移要单独一个方法而不是直接赋值 ──────
+    //
+    // 因为非法迁移必须被拦住。「RUNNING → STARTING」（重复启动）在
+    // 真实代码里一定会发生（配置文件热加载、管理端点被连点两次），
+    // 而重复启动的后果是端口被占、组件被初始化两次（数据库连接池
+    // 泄漏）。拦在这里比在每个调用点判状态可靠。
+    fn beginStart() -> Array {
+        if (self.state == lcStateRunning()) {
+            return [false, "服务已在运行，不能重复启动"]
+        }
+        if (self.state == lcStateStarting()) {
+            return [false, "服务正在启动中"]
+        }
+        self.state = lcStateStarting()
+        return [true, ""]
+    }
+
+    fn markRunning() {
+        self.state = lcStateRunning()
+    }
+
+    fn markFailed(why: String) {
+        self.state = lcStateFailed()
+        let c = new Component("__failed__", 0)
+        c.lastError = why
+    }
+
+    fn beginStop() -> Array {
+        if (self.state == lcStateStopped()) {
+            return [false, "服务已停止"]
+        }
+        if (self.state == lcStateStopping()) {
+            return [false, "服务正在停止中"]
+        }
+        self.state = lcStateStopping()
+        return [true, ""]
+    }
+
+    fn markStopped() {
+        self.state = lcStateStopped()
+    }
+
+    // ── 报告 ─────────────────────────────────────
+
+    // 健康报告：所有组件是否都起来了。
+    //
+    // ── 为什么「有一个组件 down 就是 unhealthy」───────
+    //
+    // 因为对负载均衡/编排系统来说，unhealthy 意味着「把流量摘走」。
+    // 一个 HTTP 服务活着但数据库连不上，接流量只会给用户返回 500 ——
+    // 不如让流量去别的实例。所以这里要求全绿。
+    fn healthReport() -> Array {
+        let down = []
+        var i = 0
+        while i < len(self.components) {
+            let c: Component = self.components[i]
+            if (!c.started) { arrPush(down, c.name) }
+            i = i + 1
+        }
+        let healthy = len(down) == 0 && self.state == lcStateRunning()
+        return [healthy, down]
+    }
+
+    fn describe() -> String {
+        var out = "Lifecycle[" + lcStateName(self.state) + "] " +
+                  toString(len(self.components)) + " 组件"
+        let asc = self.startOrder()
+        out = out + "\n  启动顺序（phase 升序 / 关停逆序）："
+        var i = 0
+        while i < len(asc) {
+            let idx: Int = asc[i]
+            let c: Component = self.components[idx]
+            out = out + "\n    " + padZero(i + 1, 2) + ". " + c.describe()
+            i = i + 1
+        }
+        return out
+    }
+}

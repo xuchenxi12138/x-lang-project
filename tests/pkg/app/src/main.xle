@@ -1,0 +1,30 @@
+// tests/pkg/app/src/main.xle — 包管理的端到端验证
+//
+// 这个程序本身很简单，它存在的意义是证明一条链路：
+//
+//     x.toml 里声明 mathutil
+//        ↓
+//     import @mathutil 在源码里引用
+//        ↓
+//     编译时按清单解析到 ../mathutil/src/lib.xle
+//        ↓
+//     那个文件里的 fn 与本文件合并，可以正常调用
+//
+// 任何一个环节断了，这个程序都跑不起来 —— 而且报的错会指向
+// 具体是哪一环（见 tools/run_tests.sh 里对错误信息的断言）。
+
+from @mathutil import square, cube, PKG_VERSION
+
+println(square(7))       // 49
+println(cube(3))         // 27
+println(PKG_VERSION)     // 1.0.0
+
+// 包里的函数可以互相调用，也可以在本文件里继续组合 ——
+// 文本合并之后它们就是同一编译单元的普通函数。
+fn sum_squares(a: Int, b: Int) -> Int {
+    return square(a) + square(b)
+}
+
+println(sum_squares(3, 4))   // 9 + 16 = 25
+
+println("pkg ok")

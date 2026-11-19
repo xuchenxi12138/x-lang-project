@@ -1,0 +1,247 @@
+// ui/control/switch.xle — 开关（Toggle Switch）
+//
+// ── 开关与复选框的分工 ─────────────────────────────
+//
+// 两者都是布尔输入，但语义不同，而这个区别在真实产品里是真有
+// 后果的：
+//
+//   复选框 —— 「这组选项里选哪些」，通常需要点「保存」才生效
+//   开关   —— 「立即生效的开关」，拨动即生效，不需要确认
+//
+// 所以开关在视觉上必须给人「这是立即的」的感觉：滑块式的运动、
+// 明确的轨道变色的对比。用复选框去做「立即生效」的事会让人
+// 犹豫「要不要保存」，反之用开关做「表单里的多选」会让人误以为
+// 已经生效了。
+//
+// ── 动画 ──────────────────────────────────────
+//
+// 开关是少数值得做动画的控件：把手的滑动方向直接告诉用户
+// 「现在变成什么了」，而瞬时跳变会让人有一瞬间的困惑。
+//
+// 但动画不能依赖外部时钟 —— 这个类持有一个 Anim 值，调用方
+// 每帧 tick(dt) 推进。没有动画时（第一次绘制、或 dt 为 0）
+// 直接取终态。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 开关的尺寸。宽高比约 1.8:1 —— 低于 1.5 看起来像方块，
+// 高于 2.2 看起来像进度条。
+const SW_W = 40
+const SW_H = 22
+
+class Switch extends Widget {
+    on: Bool,
+    label: String,
+
+    // 过渡进度 0.0（关）~ 1.0（开）。
+    //
+    // ── 为什么不直接用 on 当进度 ──────────────────
+    //
+    // 因为 on 是布尔的，没有中间态。而动画需要「从 0 滑到 1」
+    // 的连续值。用两个字段而不是一个浮点数是刻意的：
+    // on 是**语义**（用户想要的状态），pos 是**视觉**（此刻画
+    // 在哪）。把两者混成一个浮点会让「on 到底是真还是假」
+    // 变成一个阈值判断，而阈值判断在边界上必然有歧义。
+    pos: Float,
+
+    // 过渡速度（每秒推进多少）。0 表示不做动画，瞬时切换。
+    speed: Float,
+
+    constructor(r: Rect, label: String, on: Bool) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.label   = label
+        self.on      = on
+        self.speed   = 8.0
+        if (on) { self.pos = 1.0 } else { self.pos = 0.0 }
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, label: String, on: Bool) -> Switch {
+        return new Switch(r, label, on)
+    }
+
+    // ── 状态 ────────────────────────────────────
+
+    fn toggle() -> Switch {
+        self.on = !self.on
+        return self
+    }
+
+    fn setOn(v: Bool) -> Switch {
+        self.on = v
+        return self
+    }
+
+    fn isOn() -> Bool {
+        return self.on
+    }
+
+    // 推进动画。每帧调一次，dt 是秒。
+    //
+    // 用「朝目标逼近固定步长」而不是「插值到目标」：插值
+    // (pos += (target - pos) * k) 永远到不了目标（只是无限接近），
+    // 而固定步长能真正到位并把 pos 钉在 0/1 上。
+    //
+    // 到达后精确赋值而不是留着 0.9999 —— 否则「是否到位」要
+    // 用浮点比较，而浮点比较在边界上不可靠。
+    fn tick(dt: Float) -> Switch {
+        if (self.speed <= 0.0) {
+            if (self.on) { self.pos = 1.0 } else { self.pos = 0.0 }
+            return self
+        }
+        var target = 0.0
+        if (self.on) { target = 1.0 }
+
+        let d = self.speed * dt
+        if (self.pos < target) {
+            self.pos = self.pos + d
+            if (self.pos > target) { self.pos = target }
+        } else if (self.pos > target) {
+            self.pos = self.pos - d
+            if (self.pos < target) { self.pos = target }
+        }
+        return self
+    }
+
+    fn animating() -> Bool {
+        var target = 0.0
+        if (self.on) { target = 1.0 }
+        return self.pos != target
+    }
+
+    // ── 命中 ────────────────────────────────────
+    //
+    // 开关本体的 r 是调用方给的整行矩形（含文字）。真正可点的
+    // 是左边的胶囊 + 文字，两者都算。这与复选框一致：点文字也
+    // 应该切换。
+
+    fn switchRect() -> Rect {
+        let by = self.r.y + (self.r.h - SW_H) / 2
+        return rectOf(self.r.x, by, SW_W, SW_H)
+    }
+
+    fn labelRect() -> Rect {
+        let lx = self.r.x + SW_W + 10
+        var lw = self.r.w - SW_W - 10
+        if (lw < 0) { lw = 0 }
+        return rectOf(lx, self.r.y, lw, self.r.h)
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        let sr = self.switchRect()
+        let rad = SW_H / 2
+
+        // ── 1. 轨道 ──
+        //
+        // 颜色在「关」和「开」之间插值。用 pos 而不是 on 做插值，
+        // 动画才有中间色。
+        let offC = th.surfaceActive
+        let onC = th.accent
+        var track = lerpColor(offC, onC, self.pos)
+
+        if (!self.enabled) {
+            track = th.surface
+        } else if (self.hovered) {
+            // 悬停时提亮一档。用一个固定的偏移量而不是再插值一次，
+            // 因为悬停反馈要「立刻」，不该跟着动画速度走。
+            if (self.on) {
+                track = th.accentDark
+            } else {
+                track = th.surfaceHover
+            }
+        }
+
+        winFillRound(sr.x, sr.y, sr.w, sr.h, rad, track)
+
+        // 禁用态加一道描边，让「灰条」看起来是「不可用」而不是
+        // 「关着的开关」。
+        if (!self.enabled) {
+            winBorderRound(sr.x, sr.y, sr.w, sr.h, rad, 1, th.border)
+        }
+
+        // ── 2. 把手 ──
+        //
+        // 位置由 pos 决定。留 2px 的内边距，让把手不要贴边。
+        let pad = 2
+        let kd = SW_H - pad * 2
+        let travel = sr.w - kd - pad * 2
+        let kx = sr.x + pad + toInt(self.pos * toFloat(travel))
+
+        var knobC = th.surface
+        if (!self.enabled) { knobC = th.bg }
+        winFillRound(kx, sr.y + pad, kd, kd, kd / 2, knobC)
+
+        // ── 3. 文字 ──
+        let lr = self.labelRect()
+        if (len(self.label) > 0 && lr.w > 0) {
+            var s = self.label
+            if (winTextWidth(s) > lr.w) { s = uiEllipsize(s, lr.w) }
+            var tc = th.text
+            if (!self.enabled) { tc = th.disabled }
+            uiTextLeft(lr, s, 0, tc)
+        }
+
+        if (self.focused) {
+            let fr = Rect.inset(sr, 0 - 2)
+            winBorderRound(fr.x, fr.y, fr.w, fr.h, rad + 2, 1, th.focus)
+        }
+    }
+}
+
+// ── 颜色线性插值 ──────────────────────────────────
+//
+// 把两个 0xRRGGBB 按 t 混合。t 会被夹紧到 [0,1]。
+//
+// ── 为什么逐通道插值而不是「取更亮的那个」 ────────
+//
+// 取亮值在两端是正确的，但中间态是跳变的（在某一帧突然从 A
+// 变成 B）。逐通道插值是连续的，动画才平滑。
+//
+// ── 为什么在 sRGB 空间插值（而不是线性光空间）──────
+//
+// 严格说线性光空间更"正确"，但那需要 gamma 转换（pow(x, 2.2)
+// 和 pow(x, 1/2.2)），每次插值两次开方量级的运算。而 UI 动画
+// 的时间尺度极短（200ms），两种空间的视觉差别几乎不可见。
+// 这里选性能。
+fn lerpColor(a: Int, b: Int, t: Float) -> Int {
+    if (t <= 0.0) { return a }
+    if (t >= 1.0) { return b }
+
+    let ar = (a >> 16) & 0xFF
+    let ag = (a >> 8) & 0xFF
+    let ab = a & 0xFF
+    let br = (b >> 16) & 0xFF
+    let bg = (b >> 8) & 0xFF
+    let bb = b & 0xFF
+
+    let r = toInt(toFloat(ar) + (toFloat(br) - toFloat(ar)) * t + 0.5)
+    let g = toInt(toFloat(ag) + (toFloat(bg) - toFloat(ag)) * t + 0.5)
+    let bl = toInt(toFloat(ab) + (toFloat(bb) - toFloat(ab)) * t + 0.5)
+
+    // 夹紧每个通道：浮点舍入可能让结果偏移 1，而 0x100 会溢出
+    // 到相邻通道上，把红色变成绿色。
+    var rr = r
+    var gg = g
+    var bbb = bl
+    if (rr < 0) { rr = 0 }
+    if (rr > 255) { rr = 255 }
+    if (gg < 0) { gg = 0 }
+    if (gg > 255) { gg = 255 }
+    if (bbb < 0) { bbb = 0 }
+    if (bbb > 255) { bbb = 255 }
+
+    return (rr << 16) | (gg << 8) | bbb
+}

@@ -1,0 +1,195 @@
+// net/core/tcp_listener.xle — TCP 监听器
+//
+// ── 为什么要把裸 Int 句柄包一层 ───────────────────
+//
+// netListen / netAccept 的句柄在语言层都是 Int。这意味着
+//
+//     let l = netListen("0.0.0.0", 8080)
+//     let c = netAccept(l)
+//     netRecv(l)            // ← 把监听器传给 recv，编译器不拦
+//
+// 最后一行在类型上完全合法，运行时行为是「读到一堆莫名其妙的数据」
+// 或直接挂死 —— 因为监听器 socket 上没有数据流。
+//
+// 包成 TcpListener 和 TcpStream 两个类之后，同样的错误写法是
+//
+//     let l = TcpListener.onPort(8080)
+//     let c = l.accept()
+//     l.recv()              // ← 编译错误：TcpListener 没有 recv
+//
+// 句柄还是 Int，但宿主类型挡住了一整类误用。
+
+// 本文件用到了 tcp_stream.xle 里的 TcpStream。
+from "tcp_stream.xle" import TcpStream, TS_POLL_MS, TS_DEFAULT_WAIT_MS
+
+// 见 tcp_stream.xle 的 TS_POLL_MS 说明。
+const TL_POLL_MS = 5
+
+// 默认 accept 等待预算（毫秒）。
+//
+// 服务主循环通常愿意无限等（没有连接就什么也不做），所以默认值给
+// 0 表示「只探一次不等待」。要阻塞式等待必须显式传预算 —— 逼调用
+// 方想清楚「等不到连接时我要做什么」，这比默认无限等更安全。
+const TL_DEFAULT_WAIT_MS = 0
+
+class TcpListener {
+    // 底层句柄。-1 表示已关闭。
+    fd: Int,
+
+    // 绑定的地址。
+    bind: String,
+
+    // 请求的端口。传 0 时这里仍是 0 —— 真实端口看 boundPort。
+    port: Int,
+
+    // 实际监听的端口。传 0 让系统分配时必须读这个。
+    //
+    // ── 为什么不在构造时就覆盖 port ────────────────
+    //
+    // 因为「我请求的」和「我实际拿到的」是两回事。混在一起的话，
+    // 日志里写 `listening on 0.0.0.0:0` 会让人以为监听失败（端口 0
+    // 不是合法服务端口）。分开之后诊断信息一目了然。
+    boundPort: Int,
+
+    // 最近一次错误。
+    lastError: String,
+
+    constructor(bind: String, port: Int) {
+        self.bind      = bind
+        self.port      = port
+        self.boundPort = 0
+        self.lastError = ""
+
+        // ── netListen 失败会 exit(70)，不会返回 -1 ─────────
+        //
+        // 这是内建的硬行为（interp.c 的 XBI_NET_LISTEN 分支）：
+        // 端口占用、权限不足、地址非法都直接 rt_error + exit(70)。
+        // 所以这里的 fd < 0 判断实际走不到 —— 但保留它，因为：
+        //   1. 万一以后内建改成返回 -1，这里不会崩
+        //   2. 空 bind 传空串时平台层会退化成 INADDR_ANY，不报错，
+        //      那种情况需要自己发现
+        // 也正因为这个行为，下面用「端口是否真的绑上了」来判断成败。
+        let fd = netListen(bind, port)
+        if (fd < 0) {
+            self.fd        = 0 - 1
+            self.lastError = "监听 " + bind + ":" + toString(port) + " 失败" +
+                             "（端口被占用？权限不足？地址不合法？）"
+            return
+        }
+        self.fd = fd
+
+        // 用 netPort 读回实际端口。这是「传 0 让系统分配」唯一能拿到
+        // 真实端口的方式，也是验证「真的绑上了」的唯一手段。
+        let realPort = netPort(fd)
+        if (realPort <= 0) {
+            self.fd        = 0 - 1
+            self.lastError = "监听句柄创建了但读不到端口号，句柄可能已失效"
+            netClose(fd)
+            return
+        }
+        self.boundPort = realPort
+    }
+
+    // 便捷构造：监听所有网卡。
+    //
+    // ── 为什么默认是 0.0.0.0 而不是 127.0.0.1 ────────
+    //
+    // 服务端程序的意义就是被别的机器访问。默认只听 localhost 会
+    // 让人「本地测通了，一上服务器就连不上」，而那种问题排查起来
+    // 极费时间（防火墙、绑定地址、容器网络三层都要查）。
+    //
+    // 需要只听本地时显式写 TcpListener.on("127.0.0.1", port)。
+    static fn onPort(port: Int) -> TcpListener {
+        return new TcpListener("0.0.0.0", port)
+    }
+
+    // 便捷构造：监听指定地址。
+    static fn on(bind: String, port: Int) -> TcpListener {
+        return new TcpListener(bind, port)
+    }
+
+    // 只监听本地回环。测试用。
+    static fn localOnly(port: Int) -> TcpListener {
+        return new TcpListener("127.0.0.1", port)
+    }
+
+    fn isOpen() -> Bool {
+        return self.fd >= 0
+    }
+
+    // 接受一个连接。返回 [ok, TcpStream, error]。
+    //
+    // 默认不等待（waitMs = 0）：探一次，没有就返回 false。
+    fn accept() -> Array {
+        return self.acceptWithin(TL_DEFAULT_WAIT_MS)
+    }
+
+    // 在 waitMs 预算内等一个连接。返回 [ok, TcpStream, error]。
+    //
+    // ── 为什么用轮询而不是阻塞 accept ──────────────────
+    //
+    // 因为监听 socket 本身也是非阻塞的（platform.c 的 set_nonblock
+    // 对 listen 也做了）。netAccept 立即返回 -1 表示「当前没有待处理
+    // 连接」，而不是「出错」。所以「等连接」只能靠 sleep + 重试。
+    //
+    // ── 失败时返回的占位 stream ────────────────────
+    //
+    // fd = -1，且 isOpen() = false。调用方即使漏看 ok，后续操作也会
+    // 立即失败而不是读到脏数据。
+    fn acceptWithin(waitMs: Int) -> Array {
+        if (self.fd < 0) {
+            let msg = "监听器已关闭，无法 accept"
+            self.lastError = msg
+            return [false, new TcpStream(0 - 1, ""), msg]
+        }
+        var spent = 0
+        while true {
+            let c = netAccept(self.fd)
+            if (c >= 0) {
+                // netPeer 读回真实对端地址。比让调用方猜有用得多 ——
+                // 服务端的访问日志、限流、白名单都要这个。
+                let perr = netPeer(c)
+                return [true, new TcpStream(c, perr), ""]
+            }
+            // 没有待处理连接（不是错误）。
+            if (waitMs <= 0) {
+                self.lastError = ""
+                return [false, new TcpStream(0 - 1, ""), ""]
+            }
+            if (spent >= waitMs) {
+                let msg = "accept 超时：等待 " + toString(waitMs) +
+                          "ms 内没有新连接"
+                self.lastError = msg
+                return [false, new TcpStream(0 - 1, ""), msg]
+            }
+            sleep(TL_POLL_MS)
+            spent = spent + TL_POLL_MS
+        }
+        return [false, new TcpStream(0 - 1, ""), "不可达"]
+    }
+
+    // 阻塞式接受一个连接，直到拿到或超时。
+    //
+    // 成功返回 TcpStream，失败返回 fd = -1 的占位对象 —— 用 isOpen()
+    // 判断。这是给人写主循环时用的糖，语义比解元组直观。
+    fn acceptBlocking(waitMs: Int) -> TcpStream {
+        let r = self.acceptWithin(waitMs)
+        let s: TcpStream = r[1]
+        return s
+    }
+
+    fn close() {
+        if (self.fd >= 0) {
+            netClose(self.fd)
+            self.fd = 0 - 1
+        }
+    }
+
+    fn describe() -> String {
+        var s = "closed"
+        if (self.isOpen()) { s = "listening" }
+        var p = toString(self.port)
+        if (self.boundPort > 0) { p = toString(self.boundPort) }
+        return "TcpListener " + self.bind + ":" + p + " [" + s + "]"
+    }
+}

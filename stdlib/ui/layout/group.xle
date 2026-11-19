@@ -1,0 +1,59 @@
+// ui/layout/group.xle — 分组框（只有边框，无底色）
+//
+// 视觉上「把几个相关的东西圈在一起」，但不像 Panel 那样切出一块
+// 新区域 —— 它不填充底色，所以背景透出来，视觉重量更轻。
+//
+// 标题画在边框线上（「打断」上边框），这是分组框的经典样式，
+// 也是它和 Panel 最容易分辨的地方。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+class Group extends Widget {
+    title: String,
+    pad: Int,
+
+    constructor(r: Rect, title: String) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.title   = title
+        self.pad     = 12
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, title: String) -> Group {
+        return new Group(r, title)
+    }
+
+    fn content() -> Rect {
+        return Rect.inset(self.r, self.pad)
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 边框。
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, th.border)
+
+        if (len(self.title) == 0) { return }
+
+        // 标题：先用底色的填充盖住上边框的一段，再把文字画上去。
+        //
+        // ── 为什么用「盖」而不是「擦」 ──────────────
+        //
+        // 没有「擦除」原语，而「用底色填一小块」在视觉上等价 ——
+        // 前提是分组框下面没有别的图案。分组框的惯例就是放在
+        // 纯色背景上，所以这个前提是成立的。
+        let lx = self.r.x + 10
+        let tw = winTextWidth(self.title) + 8
+        winFillRect(lx - 4, self.r.y, tw, 2, th.bg)
+        uiTextLeft(rectOf(lx, self.r.y - 8, tw, 16), self.title, 0, th.textDim)
+    }
+}

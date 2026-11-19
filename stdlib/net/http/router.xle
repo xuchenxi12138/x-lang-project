@@ -1,0 +1,360 @@
+from "../../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+// net/http/router.xle — 路径路由
+//
+// ── 路由的三层需求 ────────────────────────────────
+//
+// 【1】静态路径匹配：`/about` → handler
+// 【2】参数路径：`/user/:id/post/:pid` → handler，取出 id 和 pid
+// 【3】方法区分：`GET /user` 和 `POST /user` 是不同 handler
+//
+// 本实现把这三层分开：
+//   Route     一条规则（方法 + 模式 + handler 名字）
+//   Router    规则的集合，负责匹配
+//   Match     匹配结果（命中的规则 + 取出的参数）
+//
+// ── 为什么 handler 存「名字 + 参数数组」而不是匿名函数 ──
+//
+// 因为本语言没有闭包/一等函数（P0 约束）。所以 handler 的注册方式
+// 是「注册一个函数名字符串 + 一组固定参数」，由 server 层按名字
+// 调用。这看起来不如闭包灵活，但换来一个实际的好处：路由表可以被
+// 完整打印出来（`dumpRoutes()`），而闭包形式的路由表只能看到
+// 「某个函数指针」，无法自省。
+//
+// 对一个需要运维和排障的服务端来说，可自省比灵活更有价值。
+
+from "uri.xle" import uriIsUnreserved, uriPctEncodeByte, uriEncode, uriEncodePath, uriEncodeQueryValue, uriDecode, uriHexVal, uriFindSchemeColon, uriSplitAuthority, strLastFind, uriDirOf, uriNormalizePath, Uri
+
+// 一条路由规则。
+class Route {
+    method: String       // "GET" / "POST" / "*"（任意）
+    pattern: String      // "/user/:id" 形式
+    handlerName: String  // 处理函数名
+    handlerArgs: Array   // 额外参数
+
+    constructor(method: String, pattern: String, handlerName: String) {
+        self.method      = strUpper(method)
+        self.pattern     = rnNormalizePattern(pattern)
+        self.handlerName = handlerName
+        self.handlerArgs = []
+    }
+
+    fn describe() -> String {
+        return self.method + " " + self.pattern + "  ->  " + self.handlerName
+    }
+}
+
+// 匹配结果。
+class Match {
+    // 是否命中。
+    matched: Bool
+
+    // 命中的路由下标。-1 表示没命中。
+    routeIndex: Int
+
+    // 路径参数的值（与模式里的 :name 顺序一致）。
+    paramNames: Array
+    paramValues: Array
+
+    // 命中的路由（方便直接用）。
+    route: Route
+
+    constructor() {
+        self.matched     = false
+        self.routeIndex  = 0 - 1
+        self.paramNames  = []
+        self.paramValues = []
+    }
+
+    fn paramOf(name: String, def: String) -> String {
+        var i = 0
+        while i < len(self.paramNames) {
+            let n: String = self.paramNames[i]
+            if (n == name) {
+                let v: String = self.paramValues[i]
+                return v
+            }
+            i = i + 1
+        }
+        return def
+    }
+}
+
+class Router {
+    routes: Array
+
+    constructor() {
+        self.routes = []
+    }
+
+    // ── 注册 ──────────────────────────────────────
+
+    fn add(method: String, pattern: String, handlerName: String) -> Route {
+        let r = new Route(method, pattern, handlerName)
+        arrPush(self.routes, r)
+        return r
+    }
+
+    fn get(pattern: String, handlerName: String) -> Route {
+        return self.add("GET", pattern, handlerName)
+    }
+
+    fn post(pattern: String, handlerName: String) -> Route {
+        return self.add("POST", pattern, handlerName)
+    }
+
+    fn put(pattern: String, handlerName: String) -> Route {
+        return self.add("PUT", pattern, handlerName)
+    }
+
+    fn del(pattern: String, handlerName: String) -> Route {
+        return self.add("DELETE", pattern, handlerName)
+    }
+
+    fn any(pattern: String, handlerName: String) -> Route {
+        return self.add("*", pattern, handlerName)
+    }
+
+    fn count() -> Int {
+        return len(self.routes)
+    }
+
+    // ── 匹配 ──────────────────────────────────────
+
+    // 匹配一个请求。
+    //
+    // ── 匹配优先级为什么是「注册顺序」而不是「静态优于动态」──
+    //
+    // 主流的框架（Express、Gin）都用「注册顺序」。理由是它**可预测**：
+    // 开发者能通过阅读注册代码确定谁先命中。而「静态优于动态」需要
+    // 记住一套隐式规则，同一条路由在规则变化后可能变卦 —— 排查时
+    // 会非常困惑。
+    //
+    // 代价是：`/user/list` 必须在 `/user/:id` 之前注册。这个约束
+    // 写在这里，而它的正确性由开发者负责 —— 所以 dumpRoutes() 的
+    // 输出顺序很重要，它让人一眼看出优先级。
+    // 注意方法名不能叫 `match` —— 它是语言关键字（模式匹配语法）。
+    // 症状是「`.` 之后期望一个成员名，实际读到 match」，看起来像
+    // 语法错误而不像命名冲突。命名为 route 也更贴合语义。
+    fn route(method: String, path: String) -> Match {
+        let m = new Match()
+        let upper = strUpper(method)
+        var i = 0
+        while i < len(self.routes) {
+            let r: Route = self.routes[i]
+            // 方法检查。"*" 匹配任意方法。
+            //
+            // ── HEAD 自动复用 GET ────────────────────
+            //
+            // RFC 9110 §9.3.2 强制要求：HEAD 与 GET 完全一致，只是
+            // 响应不带 body。所以「注册了 GET 但没注册 HEAD」时，
+            // HEAD 必须命中那个 GET —— 不这样做会让 `curl -I /`
+            // 返回 405，而所有监控探活、CDN 回源检查都用 HEAD。
+            //
+            // 显式注册的 HEAD 优先（走正常的 r.method == upper 分支），
+            // 这里只是兜底。
+            var methodOk = false
+            if (r.method == upper || r.method == "*") {
+                methodOk = true
+            } else if (upper == "HEAD" && r.method == "GET") {
+                methodOk = true
+            }
+            if (methodOk) {
+                let got = rnMatchPattern(r.pattern, path)
+                if (got[0] == true) {
+                    m.matched    = true
+                    m.routeIndex = i
+                    m.route      = r
+                    m.paramNames  = got[1]
+                    m.paramValues = got[2]
+                    return m
+                }
+            }
+            i = i + 1
+        }
+        return m
+    }
+
+    // 路径是否存在但方法不对（用于区分 404 与 405）。
+    //
+    // ── 为什么这个区分很重要 ─────────────────────
+    //
+    // RFC 7231 §6.5.5：405 必须带 Allow 头列出支持的方法。客户端
+    // 靠它判断「是我用错了方法，还是这个接口根本不存在」。
+    //
+    // 全返回 404 会让人把「方法写错」误判成「路由没注册」，排查
+    // 方向直接跑偏。而全返回 405 更糟：会对不存在的路径泄露出
+    // 「这里有个路由，只是方法不对」—— 那是一条信息泄露。
+    fn allowedMethods(path: String) -> Array {
+        let out = []
+        var i = 0
+        while i < len(self.routes) {
+            let r: Route = self.routes[i]
+            let got = rnMatchPattern(r.pattern, path)
+            if (got[0] == true) {
+                let m: String = r.method
+                if (!arrHas(out, m)) { arrPush(out, m) }
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // 打印路由表（按注册顺序 = 匹配优先级）。
+    fn dumpRoutes() -> String {
+        var out = "Router (" + toString(self.count()) + " 条，按匹配优先级排列)"
+        var i = 0
+        while i < len(self.routes) {
+            let r: Route = self.routes[i]
+            out = out + "\n  " + padZero(i + 1, 2) + ". " + r.describe()
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// 归一化模式：去掉末尾的 `/`（除了根路径）。
+//
+// ── 为什么末尾斜杠要归一化 ─────────────────────
+//
+// 因为 `/user` 和 `/user/` 在 HTTP 里是不同的 URL，但人几乎总是
+// 想表达同一个意思。不归一化会让「注册了 /user 但客户端请求
+// /user/」变成 404 —— 而这种错在调试时看起来像「路由没生效」。
+//
+// 代价是失去「严格区分」的能力。要严格区分的情况很少（静态文件
+// 目录），而且那种场景通常不用路由表。
+fn rnNormalizePattern(p: String) -> String {
+    var out = p
+    if (len(out) == 0) { out = "/" }
+    if (!strStarts(out, "/")) { out = "/" + out }
+    while (len(out) > 1 && strEnds(out, "/")) {
+        out = strSub(out, 0, len(out) - 1)
+    }
+    return out
+}
+
+// 把模式与路径做匹配。
+//
+// 返回 [matched, paramNames, paramValues]。
+//
+// ── 匹配算法 ────────────────────────────────────
+//
+// 按 `/` 切段，逐段比：
+//   · 模式段以 `:` 开头 → 捕获（非空才算）
+//   · 模式段以 `*` 开头 → 通配剩余全部（必须是最后一段）
+//   · 其他 → 字面量相等
+//
+// 段数不等则直接不匹配（除非有 `*`）。
+//
+// ── 为什么不用正则 ─────────────────────────────
+//
+// 因为本语言没有正则。而且路径匹配的正则几乎总是同一种形状
+// （`^/user/([^/]+)/post$`），用通用正则引擎去处理它的成本
+// （编译模式、回溯、性能不可预测）远超收益。手写段匹配还能给出
+// 「哪一段不匹配」这种精确诊断。
+fn rnMatchPattern(pattern: String, path: String) -> Array {
+    let empty = []
+    let pSegs = rnSplitSegs(pattern)
+    let aSegs = rnSplitSegs(path)
+
+    let names  = []
+    let values = []
+
+    var i = 0
+    while i < len(pSegs) {
+        let ps: String = pSegs[i]
+
+        // 通配：吃掉剩余全部
+        if (strStarts(ps, "*")) {
+            // `*` 必须是最后一段。不在最后时按「吃掉剩余」处理并把
+            // 后面的段忽略 —— 但这是配置错误，所以这里的行为应该是
+            // 「也算匹配成功」而不是静默失败。
+            arrPush(names, strSub(ps, 1, len(ps)))
+            var rest = ""
+            var k = i
+            while k < len(aSegs) {
+                if (k > i) { rest = rest + "/" }
+                rest = rest + toString(aSegs[k])
+                k = k + 1
+            }
+            arrPush(values, rest)
+            return [true, names, values]
+        }
+
+        // 段数不够
+        if (i >= len(aSegs)) { return [false, empty, empty] }
+
+        // 变量名不能用 `as` —— 它是类型转换关键字。
+        let seg: String = aSegs[i]
+
+        // 参数段
+        if (strStarts(ps, ":")) {
+            // ── 空段不捕获 ──────────────────────
+            //
+            // `/user//post` 里 id 是空串。捕获成空串会让 handler 收到
+            // 一个无意义的 id，然后在数据库查询里变成 `WHERE id=''`。
+            // 判为不匹配更安全。
+            if (len(seg) == 0) { return [false, empty, empty] }
+            arrPush(names, strSub(ps, 1, len(ps)))
+            arrPush(values, uriDecode(seg))
+            i = i + 1
+            continue
+        }
+
+        // 字面量段
+        //
+        // ── 为什么两边都要解码 ────────────────
+        //
+        // 因为路径可能带百分号编码（`/a%20b`）。模式是人写的（`/a b`
+        // 或者干脆写 `/a%20b`），路径是客户端发的。两边都解一次
+        // 才能对上。只解一边会让「客户端编码了但服务端没解」变成 404。
+        if (uriDecode(ps) != uriDecode(seg)) {
+            return [false, empty, empty]
+        }
+        i = i + 1
+    }
+
+    // 模式段用完了，路径还有剩余 → 不匹配
+    if (len(aSegs) != len(pSegs)) { return [false, empty, empty] }
+    return [true, names, values]
+}
+
+// 按 `/` 切段，去掉空段。
+//
+// ── 为什么去掉空段 ─────────────────────────────
+//
+// 因为 `/a//b` 里的空段没有语义。保留它会让 `/a/b` 和 `/a//b`
+// 变成不同的路径，于是「客户端多打了个斜杠」变成 404 —— 而这种
+// 差异对使用者毫无意义。
+//
+// 副作用是：`/` 切成 0 段。所以根路径要特判（见 rnMatchPattern
+// 的段数比较：0 == 0 成立，匹配）。
+fn rnSplitSegs(p: String) -> Array {
+    let parts = strSplit(p, "/")
+    let out = []
+    var i = 0
+    while i < len(parts) {
+        let s: String = parts[i]
+        if (len(s) > 0) { arrPush(out, s) }
+        i = i + 1
+    }
+    return out
+}
+
+// 数组是否含某个字符串。
+//
+// ── 为什么不用内建 arrContains ───────────────────
+//
+// 内建的 arrContains 是为数值数组设计的（比较用 == on Int）。
+// 虽然对 String 也能工作，但语义上不明确。这里自己写一个让类型
+// 意图清晰。
+fn arrHas(xs: Array, v: String) -> Bool {
+    var i = 0
+    while i < len(xs) {
+        let x: String = xs[i]
+        if (x == v) { return true }
+        i = i + 1
+    }
+    return false
+}

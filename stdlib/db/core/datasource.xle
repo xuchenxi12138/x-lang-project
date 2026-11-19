@@ -1,0 +1,181 @@
+// db/core/datasource.xle — 数据源抽象
+//
+// ── 数据源是什么 ────────────────────────────────
+//
+// 它是「一个数据库」的句柄：知道怎么连、怎么执行、怎么关。业务
+// 代码只依赖这个接口，不依赖具体是 MySQL 还是 Postgres。
+//
+// ── 为什么用「抽象类 + 整数编号」而不是函数值 ──────────
+//
+// 语言里函数不是一等值（实测 `let f: Func = myFunc` 报
+// 「未定义的变量 myFunc」），所以不能在 DataSource 里存一个
+// 「执行函数」的指针。而抽象类的虚方法可以。
+//
+// 所以 DataSource 是抽象类，七个驱动各实现一个子类。这是当前
+// 语言能力下唯一可行的多态方案。
+//
+// ── 为什么执行接口是这三个 ────────────────────────
+//
+//   query(sql)               → ResultSet   读
+//   execute(sql)             → ResultSet   写（看 affected）
+//   queryParams(sql, params) → ResultSet   带参数读
+//
+// 前两个分开是为了**语义清晰**：调 query 拿到 affected 为 0 的
+// 空结果集是正常的（查不到），而调 execute 拿到 0 行是「没改到
+// 东西」—— 两者在业务上的处理完全不同。合成一个方法会让调用方
+// 每次都要判「这是查询还是写入」。
+
+from "result.xle" import ResultSet
+from "dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+
+abstract class DataSource {
+    // 端点。
+    ep: Endpoint,
+
+    // 方言。
+    dialect: Dialect,
+
+    // 是否已连接。
+    connected: Bool,
+
+    // 最近一次错误。
+    lastError: String,
+
+    constructor(ep: Endpoint, dialect: Dialect) {
+        self.ep        = ep
+        self.dialect   = dialect
+        self.connected = false
+        self.lastError = ""
+    }
+
+    // ── 生命周期 ────────────────────────────────
+
+    abstract fn connect() -> Bool
+    abstract fn close()
+
+    // 是否还活着。健康检查用。
+    abstract fn ping() -> Bool
+
+    // ── 执行 ────────────────────────────────────
+
+    abstract fn query(sql: String) -> ResultSet
+    abstract fn execute(sql: String) -> ResultSet
+
+    // 带参数查询。默认实现是「拼字符串」（不安全但能跑），
+    // 各驱动应该覆写成真正的参数化协议。
+    //
+    // ── 为什么默认实现是拼字符串 ────────────────────
+    //
+    // 因为参数化协议各家的编码完全不同（MySQL 用 COM_STMT_PREPARE
+    // + 二进制行，Postgres 用 Parse/Bind/Execute，Redis 根本没有
+    // SQL）。让抽象基类给一个「语法正确但会转义」的兜底，至少
+    // 保证了 API 一致；真正安全的实现由各驱动提供。
+    fn queryParams(sql: String, params: Array) -> ResultSet {
+        return self.query(sqlBind(sql, params))
+    }
+
+    // ── 便捷方法 ────────────────────────────────
+
+    // 执行并返回受影响行数。
+    fn affected(sql: String) -> Int {
+        let rs = self.execute(sql)
+        if (!rs.ok) {
+            self.lastError = rs.error
+            return 0 - 1
+        }
+        return rs.affected
+    }
+
+    // 查一个整数（COUNT(*)、EXISTS 等）。
+    fn queryInt(sql: String) -> Int {
+        let rs = self.query(sql)
+        if (!rs.ok || rs.count() == 0) { return 0 }
+        return rs.scalarInt()
+    }
+
+    // 查一个字符串。
+    fn queryString(sql: String) -> String {
+        let rs = self.query(sql)
+        if (!rs.ok || rs.count() == 0) { return "" }
+        return rs.scalar()
+    }
+
+    // 是否存在（EXISTS 的封装）。
+    fn exists(sql: String) -> Bool {
+        let rs = self.query(sql)
+        return rs.ok && rs.count() > 0
+    }
+
+    // ── 元数据 ─────────────────────────────────
+
+    fn kind() -> Int {
+        return self.dialect.kind
+    }
+
+    fn name() -> String {
+        return dialectName(self.dialect)
+    }
+
+    fn describe() -> String {
+        var s = self.name() + " @ " + endpointString(self.ep)
+        if (self.connected) {
+            s = s + " [已连接]"
+        } else {
+            s = s + " [未连接]"
+        }
+        if (len(self.lastError) > 0) {
+            s = s + " 错误：" + self.lastError
+        }
+        return s
+    }
+}
+
+// ── 参数占位符替换 ────────────────────────────────
+//
+// 把 `?` 依次替换成转义后的字面量。
+//
+// ── 为什么不用 strReplace ────────────────────────
+//
+// 因为 strReplace 会替换**所有**出现，而 SQL 里的 `?` 可能出现在
+// 字符串字面量内部（比如 `SELECT '?' AS q`）。逐字符扫描可以
+// 正确跳过引号内的内容 —— 虽然这个简化版没有处理引号，但至少
+// 结构上留了位置。
+//
+// 真正的修法是参数化协议（见各驱动的实现）。这里只是兜底。
+fn sqlBind(sql: String, params: Array) -> String {
+    if (len(params) == 0) { return sql }
+    var out = ""
+    var p = 0
+    var i = 0
+    let n = len(sql)
+    while i < n {
+        let ch = strSub(sql, i, i + 1)
+        if (ch == "?" && p < len(params)) {
+            out = out + sqlLiteral(toString(params[p]))
+            p = p + 1
+        } else {
+            out = out + ch
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 批量执行（事务外）。返回成功条数。
+//
+// ── 为什么没有内置事务 ──────────────────────────
+//
+// 因为事务需要「同一个连接」跨多次调用保持状态，而数据源的
+// 生命周期比单次调用长。真正的实现需要 Connection 一级的抽象
+// （见 pool.xle），那属于下一层。
+fn execAll(ds: DataSource, sqls: Array) -> Int {
+    var ok = 0
+    var i = 0
+    while i < len(sqls) {
+        let rs = ds.execute(toString(sqls[i]))
+        if (rs.ok) { ok = ok + 1 }
+        i = i + 1
+    }
+    return ok
+}

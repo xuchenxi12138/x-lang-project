@@ -1,0 +1,8 @@
+// main.xlc —— 正常启动入口
+// 在 x-lang 根目录执行：.\build\x.exe run examples\x-editor\src\main.xlc
+//
+// 应用本体在 app.xlc（类 + 运行编辑器函数）。这里只负责按正常模式
+// 打开窗口：不截图、不自动退出。
+从 "app.xlc" 引入 运行编辑器
+
+令 退出码 = 运行编辑器("", 0)

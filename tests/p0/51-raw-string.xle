@@ -1,0 +1,69 @@
+// 51-raw-string.xle — 原始字符串 r"..."
+//
+// `r"..."` 内既不做转义，也不做插值。两个都不做，是因为它们服务
+// 同一类场景：**字符串内容属于另一个语言**。
+//
+// ── 为什么这是插值的必要配套 ────────────────────────
+//
+// 「编译期插值」和「运行时模板」写法完全一样、时机完全不同：
+//
+//   编译期插值   "你好，{name}"             编译器在生成字节码前替换
+//   运行时模板   r"name={name}"             strTemplate 在运行时替换
+//
+// 没有 r"" 时，后者会被编译期插值抢先求值，报「未定义的变量 name」。
+// 而 `{{` 转义也救不了：模板常常由变量拼出来，那里面根本无法转义。
+
+fn main() -> Int {
+    // ---- 1. 反斜杠原样保留 ----
+    println(r"a\nb")              // a\nb   —— 不是换行
+    println(len(r"a\nb"))         // 4      —— 反斜杠是普通字符
+    println(r"C:\path\to\file")   // C:\path\to\file
+
+    // ---- 2. 花括号原样保留，不插值 ----
+    let name = "不该出现"
+    println(r"name={name}")       // name={name}
+    println(r"{}")                // {}
+    // 原始字符串不能含 `"`（没有转义就没有办法表达）——
+    // 下面这行若去掉注释会报「原始字符串没有闭合」
+    // println(r"a"b")
+
+    // ---- 3. 与普通字符串对比 ----
+    println("a\tb")               // a	b   —— 制表符
+    println(r"a\tb")              // a\tb
+
+    // ---- 4. 运行时模板的正确用法 ----
+    // 这一行是 r"" 存在的首要理由。去掉 r 就会报「未定义的变量 key」。
+    let keys = ["key"]
+    let vals = ["值"]
+    println(strTemplate(r"<{key}>", keys, vals))   // <值>
+
+    // ---- 5. 原始字符串可以正常参与运算 ----
+    let a = r"x\y"
+    let b = r"z\w"
+    println(a + b)                // x\yz\w
+    println(len(a))               // 3
+
+    // ---- 6. TODO 注释里的反斜杠不用双写 ----
+    let path = r"D:\项目\x-lang"
+    println(path)                 // D:\项目\x-lang
+
+    return 0
+}
+
+// strTemplate 从 stdlib 引入太啰嗦，这里内联一个最小版本，
+// 只按 key 替换 —— 够验证「模板字面量原样传进去」这件事。
+fn strTemplate(tpl: String, keys: Array, vals: Array) -> String {
+    var out = tpl
+    var i = 0
+    while i < len(keys) {
+        out = strReplace(out, "{" + keys[i] + "}", vals[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn strReplace(s: String, pat: String, to: String) -> String {
+    let at = strFind(s, pat)
+    if at < 0 { return s }
+    return strSub(s, 0, at) + to + strSub(s, at + len(pat), len(s))
+}

@@ -1,0 +1,717 @@
+{
+  "$comment": [
+    "X 语言 TextMate 语法（P0 实现，v0.16）。",
+    "",
+    "═══ 总原则：高亮必须与编译器实际能力严格对齐 ═══",
+    "",
+    "本文件的每一条规则都要能通过 build/x.exe check 的实测。理由很直白：",
+    "高亮一个编译器不认的语法，用户会照着颜色写、然后编译失败 —— 这比没有",
+    "高亮更糟，因为它主动误导。所以下面凡是涉及「这个词能不能用」的判断，",
+    "都在注释里写明是用什么用例测出来的。",
+    "",
+    "配套工具：",
+    "  tools/probe-dead-keywords.sh   逐词实测关键字可用性，并与补全黑名单对账",
+    "  tools/gen-completions.js       从 lexer.c / bytecode.c / compile.c 生成补全表",
+    "  tools/verify-scopes.js         用真引擎（vscode-textmate）验证本文件的 scope",
+    "",
+    "═══ 一个必须写在最前面的坑：\\b 对中文无效 ═══",
+    "",
+    "第一版所有关键字规则都写成 \\b(fn|函)\\b，结果 .xle 文件高亮正常，",
+    "而 .xlc 文件里 函 / 令 / 如果 / 返回 全部没有颜色。原因很隐蔽：",
+    "",
+    "  \\b 是 **ASCII 单词边界**。它的定义是「\\\\w 与 \\\\w 之间的位置」。",
+    "  而 JS / Oniguruma 的 \\\\w 只包含 [A-Za-z0-9_]，不含 CJK。",
+    "  汉字既不是 \\\\w 也不是非 \\\\w 的「边界另一侧」，两头都落在非单词",
+    "  字符上 —— 于是 \\b 这个断言在汉字两侧**永远不成立**。",
+    "",
+    "  实测：'函 square'.match(/\\b(函)\\s+/) 返回 null，",
+    "        而 /(函)\\s+/.test('函 square') 返回 true。",
+    "",
+    "这个 bug 最坏的地方是它**只在中文文件里出现**。如果开发者平时读英文",
+    "源码，永远发现不了；而中文编程是这个语言的一等能力。",
+    "",
+    "所以全文件的边界判断统一用显式字符类断言，不用 \\b：",
+    "",
+    "  WORD_B = (?<![\\\\w\\u0080-\\uFFFF])   前一个字符不是单词/汉字",
+    "  WORD_A = (?![\\\\w\\u0080-\\uFFFF])    后一个字符不是单词/汉字",
+    "",
+    "\\u0080-\\uFFFF 覆盖 BMP 内的全部汉字（函 U+51FD、令 U+4EE4 都在其中）。",
+    "后行断言 (?<!...) 在 Oniguruma（VSCode 用的引擎）与 JS 里都支持。",
+    "",
+    "═══ 规则顺序有语义 ═══",
+    "",
+    "TextMate 从上到下匹配，第一条命中即停。所以：",
+    "  注释与字符串最前   否则字符串里的 // 会被当注释，注释里的 \" 会被当字符串",
+    "  数字在标识符之前   否则 0xFF 的 x 会被吞进标识符",
+    "  声明在关键字之前   否则 fn 后面那个函数名的正则会先把 fn 自己吃掉",
+    "",
+    "顺序错了不报错，只是「某些颜色莫名其妙不对」—— 极难查。",
+    "",
+    "═══ 曾经吞掉整个文件的一个 bug ═══",
+    "",
+    "本文件的 #declarations 里，函数签名用 begin/end 包成 meta.function.x 区域，",
+    "end 是 (?=\\{) —— 「看到左大括号就收工」。这对有函数体的函数是对的，",
+    "但接口方法和抽象方法**没有函数体**：",
+    "",
+    "    interface Named {",
+    "        fn name() -> String      // 行尾没有 {",
+    "    }",
+    "",
+    "end 永远等不到那个 {，区域于是继续往后吞，把该行之后的整个文件都染成",
+    "meta.function.x。实测症状：interface 之后的 class / abstract / @注解 全部",
+    "没有颜色，且它们各自的规则根本没机会跑。",
+    "",
+    "修法不是改 end（改成 $ 会让跨行签名在第一行就断掉），而是**在 #declarations",
+    "里加一条排在前面的 #fnDeclNoBody**：用单条 match 吃掉「整行 fn 签名且行尾",
+    "没有左大括号」的形态。它既覆盖接口方法，也覆盖 abstract 方法，而跨行签名的",
+    "首行是 `fn foo(`（不以 ) 结尾），不会误命中。"
+  ],
+  "name": "X",
+  "scopeName": "source.x",
+  "fileTypes": [
+    "xle",
+    "xlc"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#attributes"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#chars"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#identifiers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "comment": "文档注释必须排在普通行注释之前，否则 /// 的末尾两个斜杠会被 // 吃掉。这是 TextMate 最经典的顺序坑。",
+          "name": "comment.line.documentation.triple-slash.x",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.documentation.bang.x",
+          "match": "//!.*$"
+        },
+        {
+          "name": "comment.line.double-slash.x",
+          "match": "//.*$"
+        },
+        {
+          "comment": "块注释。词法器是按计数器实现的可嵌套版本，不是简单找 */。\nTextMate 没有真递归，这里用一层嵌套模拟：外层内部再匹配一个 /* ... */。\n更深层的嵌套会被当普通文本，但颜色仍在外层注释 scope 内，视觉正确。",
+          "name": "comment.block.x",
+          "begin": "/\\*",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.begin.x"
+            }
+          },
+          "end": "\\*/",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.comment.end.x"
+            }
+          },
+          "patterns": [
+            {
+              "name": "comment.block.nested.x",
+              "begin": "/\\*",
+              "beginCaptures": {
+                "0": {
+                  "name": "punctuation.definition.comment.begin.x"
+                }
+              },
+              "end": "\\*/",
+              "endCaptures": {
+                "0": {
+                  "name": "punctuation.definition.comment.end.x"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "attributes": {
+      "comment": "`@` 在 v0.16 有两个真实用途，没有第三个：\n\n  1. 注解        @Table(\"users\")  @Deprecated\n  2. 包引用      import @mathutil\n\n（v0.15 之前这里的注释写着「没有任何注解语法」—— 那时候是对的，\n  parser.c 的 parse_annotations 还不存在。v0.16 实现了注解，这段\n  注释必须跟着改，否则它会误导下一个读这个文件的人。）\n\n规则顺序：包引用在前。两条规则都以 @ 开头，靠 `import` / `引入`\n前缀区分 —— 包引用整段（含 import 关键字）先被吃掉，剩下的 @ 才\n是注解。反过来排的话，`import @mathutil` 里的 @mathutil 会被注解\n规则标成注解名，语义就错了。",
+      "patterns": [
+        {
+          "comment": "包引用：`import @mathutil` / `引入 @zh`。\n\n实测：单独写 `import @mathutil` 会报「需要 x.toml，但没找到」——\n那是**清单缺失**的错误（退出码 1），不是语法错误。语法本身是成立的：\nparser.c 的 parse_import 确实读 TK_AT + 包名。所以这条高亮是对的。\n\n── captures 编号按括号数，不按「想要的组」数 ──────────────\n\n第一版这里差了整整一位，症状是包名被标成标点（punctuation.definition.package），\n而 `@` 和 import 关键字同色。原因是我按「逻辑上有几段」数编号，\n而不是按正则里实际的捕获括号数：\n\n  (import|引入)  → 1\n  (\\\\s+)         → 2   << 这一组很容易忘，因为它在输出里不可见\n  (@)            → 3\n  ([A-Za-z_]...)  → 4\n\n所以名字是 4 不是 5，@ 是 3 不是 4。跑 tools/check-grammar.js 时\n断言「mathutil 应为 entity.name.namespace.x」立刻抓到了这个错位 ——\n纯靠看颜色是发现不了的，因为标点和命名空间名在多数主题里都偏灰。",
+          "name": "meta.package-reference.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(import|引入)(\\s+)(@)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.word.x"
+            },
+            "3": {
+              "name": "punctuation.definition.package.x"
+            },
+            "4": {
+              "name": "entity.name.namespace.x"
+            }
+          }
+        },
+        {
+          "comment": "带实参的注解：@Route(\"/api/users\", method = \"GET\")\n\n实测可编译。实参只收字面量（Int / Float / String / Bool / null），\n不能是表达式 —— 注解在编译期就变成元数据、还要能单独写进 .xbc，\n要支持 `@Size(n * 2)` 就得有编译期求值。\n\n这也是为什么实参区的 patterns 只 include 字面量和 `key =` 形态，\n不 include #identifiers：把标识符染成变量色会暗示「这里能写变量」。",
+          "name": "meta.annotation.x",
+          "begin": "(?<![\\w\\u0080-\\uFFFF])(@)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(\\()",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.definition.annotation.x"
+            },
+            "2": {
+              "name": "entity.name.annotation.x"
+            },
+            "4": {
+              "name": "punctuation.definition.annotation.arguments.begin.x"
+            }
+          },
+          "end": "\\)",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.annotation.arguments.end.x"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#strings"
+            },
+            {
+              "include": "#chars"
+            },
+            {
+              "include": "#numbers"
+            },
+            {
+              "comment": "具名实参的键：`method = \"GET\"` 里的 method。\n判据是「标识符后面紧跟 =」，与位置无关 —— 注解实参顺序自由。",
+              "name": "variable.parameter.annotation.x",
+              "match": "[A-Za-z_][A-Za-z0-9_]*(?=\\s*=(?!=))"
+            },
+            {
+              "name": "keyword.operator.assignment.x",
+              "match": "="
+            },
+            {
+              "name": "constant.language.boolean.x",
+              "match": "(?<![\\w\\u0080-\\uFFFF])(true|false)(?![\\w\\u0080-\\uFFFF])"
+            },
+            {
+              "name": "constant.language.null.x",
+              "match": "(?<![\\w\\u0080-\\uFFFF])(null)(?![\\w\\u0080-\\uFFFF])"
+            }
+          ]
+        },
+        {
+          "comment": "无实参的注解：@Deprecated / @Indexed。\n\n必须排除紧跟左括号的情形，否则带参注解的 @Name 会被这条先吃掉，\nbegin 规则永远没机会跑（第一条命中即停）。",
+          "name": "meta.annotation.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(@)([A-Za-z_][A-Za-z0-9_]*)(?!\\s*\\()",
+          "captures": {
+            "1": {
+              "name": "punctuation.definition.annotation.x"
+            },
+            "2": {
+              "name": "entity.name.annotation.x"
+            }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "comment": "v0.17：原始串 r\"...\" 已实现，这里补上规则。\n三引号多行串仍**未实现**，所以仍不写 —— 高亮一个编译器不认的语法\n比没有高亮更糟：用户会写、会以为能用。\n\n原始串必须排在普通串**之前**：否则 `r\"abc\"` 里的 `r` 会先落进\n#identifiers 变成 variable.other，然后引号起一段普通字符串，\n视觉上像是「变量 r 接一个字符串」。\n\n原始串内部**不设任何 patterns** —— 它没有转义、没有插值，\n整段就是一个原子的 string scope。这正是它和普通串的区别，\n要在颜色上体现出来（不同 scope：string.quoted.raw.x）。",
+      "patterns": [
+        {
+          "name": "string.quoted.raw.x",
+          "begin": "(?<![\\w\\u0080-\\uFFFF])r\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.raw.x"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.raw.x"
+            }
+          }
+        },
+        {
+          "name": "string.quoted.double.x",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.x"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.x"
+            }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.x",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "chars": {
+      "comment": "字符字面量 'A'（词法器有 TK_CHAR，写死单字符 + 可选转义）。\n\n不用 begin/end 而用单条 match：单引号没有闭合时，begin/end 会一路吞到文件尾，\n整篇代码失去高亮；match 只影响那一处，坏得更局部。\n也和 Char 类型名区分：类型名是大写标识符，这里是单引号包一个字符。",
+      "patterns": [
+        {
+          "name": "constant.character.x",
+          "match": "'(\\\\.|[^'\\\\])'",
+          "captures": {
+            "1": {
+              "name": "constant.character.escape.x"
+            }
+          }
+        }
+      ]
+    },
+    "numbers": {
+      "comment": "词法器实际支持的进制：十进制 / 0x / 0b / 0o，下划线可插在任意位置。\n不写 i 后缀 —— 词法器没有复数后缀（设计文档里有 Complex 类型，但没有字面量后缀）。",
+      "patterns": [
+        {
+          "comment": "十六进制必须排在十进制之前，否则开头的 0 会被单独当十进制匹配掉。",
+          "name": "constant.numeric.hex.x",
+          "match": "0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*"
+        },
+        {
+          "name": "constant.numeric.binary.x",
+          "match": "0[bB][01](?:_?[01])*"
+        },
+        {
+          "name": "constant.numeric.octal.x",
+          "match": "0[oO][0-7](?:_?[0-7])*"
+        },
+        {
+          "comment": "浮点。负向后行断言排除「方法调用前的点」，即 a.0 这种不合法写法不用管，\n但要避免把 .. 区间误吃（0..5 里的 0 后面是点）。所以要求小数点后必须跟数字。",
+          "name": "constant.numeric.float.x",
+          "match": "[0-9](?:_?[0-9])*\\.(?=[0-9])(?:[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?"
+        },
+        {
+          "name": "constant.numeric.exponent.x",
+          "match": "[0-9](?:_?[0-9])*[eE][+-]?[0-9](?:_?[0-9])*"
+        },
+        {
+          "name": "constant.numeric.decimal.x",
+          "match": "[0-9](?:_?[0-9])*"
+        }
+      ]
+    },
+    "declarations": {
+      "comment": "声明语句：类 / 接口 / 结构体 / 函数 / 变量。\n\n「能不能区分函数 / 变量 / 类型」这个需求，就靠这里的 scope 划分：\n  entity.name.type.class      类 / 接口 / 结构体名\n  entity.name.function        函数（多数主题给黄/橙）\n  variable.other.declaration  变量声明处\n  variable.parameter          参数\n  storage.type.*              声明关键字\n\n── 这里能出现什么，只有一条判据：build/x.exe check ──────────\n\nv0.15 之前这里只有 fn 和 let。当时 struct / enum / trait / impl /\ntype / mod 全部实测失败（「期望一个表达式，实际读到 X」），所以删了。\n\nv0.16 重新实测（tools/probe-dead-keywords.sh），结论是：\n  活：class interface abstract final extends implements override\n      private protected public pub static self new struct\n  死：enum trait impl type mod match do catch spawn dyn where\n      unsafe comptime extern case yield mut ref par super\n\n死 token 的清单是**双重验证**过的：静态（grep -w TK_XXX src/*.c 只命中\nlexer.c 和 x.h）+ 实测（最小用例的退出码非 0）。其中 super 最容易误判：\nlexer 里有 super、中文表里有 父类、x.h 里有 TK_SUPER，三处都「写着存在」，\n但 parser.c 里 TK_SUPER 出现 0 次，super() 报「期望一个表达式」。\n词法登记 ≠ 语法实现，这两件事在 lexer.c 里挨着写。\n\n── 关于 struct ────────────────────────────────────────────\n\nstruct 是活的（实测 `struct P { x: Int, y: Int }` + `P { x: 1, y: 2 }`\n构造都能编过），但字段分隔用逗号、构造用 `P { ... }`，与类不同。\n这里只标声明头，不做区域 —— 理由见下。\n\n── 为什么不做「类体区域」────────────────────────────────\n\n曾想过用 begin/end 把类体包成 meta.class.x，这样字段声明能拿到\n member scope。但 TextMate 不支持括号计数，end 只能写 \\}，而类体里\n每个方法体的 } 都会让区域提前结束。要正确就得对每层嵌套单独建模，\n一旦漏一种嵌套，后果是「类体后半截掉色」这种极难定位的问题。\n\n收益（字段名换个 scope）远小于风险，所以只做声明头的词级/单行匹配。\n字段名落到 variable.other 是合理的 —— 它本来就是变量。", 
+      "patterns": [
+        {
+          "comment": "类 / 接口 / 结构体声明头。\n\n`abstract` / `final` 不在这里匹配，留给 #keywords 的 storage.modifier ——\n它们可以出现在 class 前面（`abstract class Foo`），也可以出现在类体里的\n方法前（`abstract fn area()`），词级规则一次覆盖两种位置。\n\n实测三种形态都能编过：\n  class Foo { }              interface I { fn f() }         struct P { x: Int }\n  abstract class A { }       final class B { }\n\n`new` 单独一条（#newExpr），因为它是表达式不是声明。",
+          "name": "meta.type-declaration.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(class|interface|struct|类|接口|结构)(\\s+)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.class.x"
+            },
+            "3": {
+              "name": "entity.name.type.class.x"
+            }
+          }
+        },
+        {
+          "comment": "new 表达式：new User(\"ann\") / 新建 甲(1)。\n\n必须排在 #functionCall 之前，否则 User 后面的左括号会先命中调用规则，\nUser 被标成 support.function.call —— 视觉上把一个**类型**画成了函数。\n构造调用点最该传达的信息是「这里建了个什么类型的对象」。\n\n`new` 是关键字（TK_NEW），`新建` 是它的中文别名。两者实测都能编过。",
+          "name": "meta.new.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(new|新建)(\\s+)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.new.x"
+            },
+            "3": {
+              "name": "entity.name.type.class.x"
+            }
+          }
+        },
+        {
+          "comment": "构造函数声明：constructor(n: String) { ... }\n\n注意 constructor **不是关键字** —— lexer.c 的 kKeywords 里没有它，\nparser.c 是拿 `t->kind == TK_IDENT && strcmp(t->s, \"constructor\")` 认的。\n所以它也没有中文别名：实测 `构造(n: 整数)` 报「类体里期望字段或方法」，\n而 `constructor(n: 整数)` 在 .xlc 里能编过。这条规则只此一份，不配中文。\n\n排在 #functionCall 之前，否则 constructor 会被当成普通函数调用。",
+          "name": "meta.constructor.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(constructor)(\\s*)(\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.constructor.x"
+            },
+            "3": {
+              "name": "punctuation.section.parameters.begin.x"
+            }
+          }
+        },
+        {
+          "comment": "═══ 没有函数体的函数签名（本文件修过的吞行 bug 就靠这条） ═══\n\n覆盖两种真实形态：\n  interface Named { fn name() -> String }        接口方法\n  abstract fn area() -> Int                      抽象方法\n\n判据是「整行以 fn 名(参数) [-> 类型] 结尾，行尾没有左大括号」。\n用单条 match 而不是 begin/end，因为它不需要区域 —— 它本来就只占一行。\n\n为什么不把 #fnDecl 的 end 改成 (?=\\{|$)：那样跨行签名会在首行就断掉。\n    fn foo(\n        a: Int,\n    ) -> Int {\n首行是 `fn foo(`，不以 ) 结尾，不会命中本规则 → 落到 #fnDecl → end 正常等 {。\n\n参数用 [^)]* 一口吃掉而不是 include #params：match 规则不能嵌套 patterns，\n而这里参数区的价值很低（`fn name() -> String` 里不该有需要着色的东西）。",
+          "name": "meta.function.declaration.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(fn|函)(\\s+)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)(\\s*)(\\([^)]*\\))(\\s*)(?:(->)(\\s*)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*))?(?=\\s*(?:[}]|$))",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.x"
+            },
+            "3": {
+              "name": "entity.name.function.x"
+            },
+            "5": {
+              "name": "meta.function.parameters.x"
+            },
+            "7": {
+              "name": "keyword.operator.arrow.x"
+            },
+            "9": {
+              "name": "entity.name.type.x"
+            }
+          }
+        },
+        {
+          "comment": "fn / 函 + 函数名。用 begin/end 包住整个签名，这样参数区与返回类型的\n子规则只在签名范围内生效，不会溢出到函数体里去误染。\n\nend 用 (?=\\{) 前瞻到大括号，不消费它 —— 让大括号落回顶层规则处理。\n不用 $ 是因为签名可以跨行（见上一条对跨行签名的说明）。\n\n返回箭头单独给 scope：它落在 meta.function.x 区域里，没自己的规则就成了\n「一层没意义的底色」，看起来像没上色。\n\n泛型参数不 include —— 实测 `fn h[T: Ord](a: T)` 报\n「期望 ( （函数参数列表），实际读到 [」，parser.c 的 parse_fn 根本没有\n处理 '[' 的分支。",
+          "name": "meta.function.x",
+          "begin": "(?<![\\w\\u0080-\\uFFFF])(fn|函)(?![\\w\\u0080-\\uFFFF])(\\s+)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.type.function.x"
+            },
+            "3": {
+              "name": "entity.name.function.x"
+            }
+          },
+          "end": "(?=\\{)",
+          "patterns": [
+            {
+              "comment": "返回箭头。必须单独给 scope，否则它会跟着外层的 meta.function.x 走，\n最终呈现为「一段继承来的背景色」——看起来像没上色，其实是被区域 scope 吞了。\n这也是 TextMate 里最容易被漏掉的一类 token：不报错、只是不发亮。",
+              "name": "keyword.operator.arrow.x",
+              "match": "->"
+            },
+            {
+              "include": "#params"
+            },
+            {
+              "include": "#typeRefs"
+            }
+          ]
+        },
+        {
+          "comment": "变量声明。名字给 variable.other.declaration（比普通 variable.other 更具体），\n这样主题作者可以给「声明处」单独配色，而普通引用仍用默认变量色。",
+          "name": "meta.variable.declaration.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(let|var|const|令|变|常)(?![\\w\\u0080-\\uFFFF])(\\s+)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.variable.x"
+            },
+            "3": {
+              "name": "variable.other.declaration.x"
+            }
+          }
+        },
+        {
+          "comment": "═══ 内建函数必须排在函数调用之前 ═══\n\n这里踩过一个「整块规则从未生效」的坑：原先 #builtins 只挂在 #identifiers 里，\n而 #identifiers 是**最后一个** include，函数调用规则（下面那条）在 #declarations\n里先跑。两条规则都对「名字 + 左括号」成立，第一条命中即停 —— 于是\nprintln / arrPush / className / annoHas 全部被标成 support.function.call，\n#builtins 那 96 个名字一条都没用上。\n\n症状极其隐蔽：颜色看起来「正常」（都是函数色），只是内建和用户函数\n同色。而内建与用户函数该不该区分，正是主题作者最需要的信息之一。\n\n所以把内建提到调用规则之前。这不是「更具体优先」的理论问题，\n是实测出来的顺序依赖。", 
+          "include": "#builtins"
+        },
+        {
+          "comment": "函数调用：名字 + 紧跟的左括号。给 support.function 而不是 entity.name.function ——\n调用点和定义点在语义上不同，主题常常分开配色（定义黄、调用蓝）。\n\n排在声明之后，所以 `fn foo(` 里的 foo 已被上面的 begin 捕获，不会落到这里。\n排在 #builtins 之后，所以内建函数不会落到这里。\n\n注意它只对「有括号」的情形生效，所以 `User` 这种类型名只有在\n `new User(` 里才会被误判 —— 那条已经由 #newExpr 抢在前面处理了。",
+          "name": "meta.function-call.x",
+          "match": "([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)(?=\\s*\\()",
+          "captures": {
+            "1": {
+              "name": "support.function.call.x"
+            }
+          }
+        }
+      ]
+    },
+    "params": {
+      "comment": "参数名：紧跟 ( 或 , 之后，后面跟 : 或 , 或 )。\n用后行断言 (?<=[,(]) 而不是把整个 (...) 当 begin/end ——\n后者会把 -> Int 里的返回类型漏在区间外，颜色断掉。",
+      "patterns": [
+        {
+          "comment": "带类型注解的参数：name: Type",
+          "name": "variable.parameter.x",
+          "match": "(?<=[,(])(\\s*)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)(?=\\s*:)",
+          "captures": {
+            "2": {
+              "name": "variable.parameter.x"
+            }
+          }
+        },
+        {
+          "comment": "不带注解的参数（P0 允许 fn add(a, b)）：后面直接是 , 或 )",
+          "name": "variable.parameter.x",
+          "match": "(?<=[,(])(\\s*)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)(?=\\s*[,)])",
+          "captures": {
+            "2": {
+              "name": "variable.parameter.x"
+            }
+          }
+        }
+      ]
+    },
+    "typeRefs": {
+      "comment": "签名区里的类型引用：内置类型 + 大写开头的类型名 + 中文类型别名。\n单独一份而不是直接 include #identifiers，是为了在签名内不误染变量名。",
+      "patterns": [
+        {
+          "include": "#builtinTypes"
+        },
+        {
+          "name": "entity.name.type.x",
+          "match": "[A-Z][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "builtinTypes": {
+      "comment": "内置类型。清单来自 src/compile.c 的 ty_from_name —— 只有 7 个名字会被识别：\n  Int Float Bool String Array void Void\n（另有 Unknown，但它不是给用户写的类型名，见下）\n\n── 为什么必须严格照 ty_from_name，不能照设计文档 ──────────────\n\n之前按设计文档额外列了 Int8/Int16/Int32/Int64/UInt8../Size/Float32/\nFloat64/Complex/Matrix/Char，全删了。理由是它们**静默失效**，比报错更危险：\nty_from_name 对未知名字返回 TY_UNKNOWN，compile_var_decl 看到 UNKNOWN 就\n跳过类型检查、照原样编译。实测 `let a: Int8 = 1` / `let a: Char = 'x'` /\n`let a: Complex = 1` 全部**零警告编过**，但 Int8 的位宽语义完全没生效 ——\n用户以为自己拿到了 8 位整数。\n把这类名字标成类型色，等于替编译器背书一个它并不支持的承诺。\n\n中文别名走独立的规则，因为词法器会把它们归一化成英文再进语法树。",
+      "patterns": [
+        {
+          "name": "support.type.primitive.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(Int|Float|Bool|String|Array|void|Void)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "中文类型别名，来自 src/lexer.c 的 kZhTypeAliases（共 8 条）。\n但**不是全都要高亮**：词法器归一化后还要过 ty_from_name，而它只认\nInt/Float/Bool/String/Array/void/Void。所以：\n  整数→Int ✓  浮点→Float ✓  布尔→Bool ✓  字符串→String ✓  数组→Array ✓  无→void ✓\n  字符→Char ✗  复数→Complex ✗  —— 归一化后仍是未知类型，实测静默编过、\n                                约束不生效（同 Int8 那条理由），所以不高亮。\n\n`无` 同时是 void 的中文关键字别名（kZhAliases 里有 {\"无\", TK_VOID}）和\n中文类型别名（{\"无\",\"void\"}）。lex_ident 里关键字优先，但两种情况\n着色相同（都是内置/关键字色），放这里统一处理即可。",
+          "name": "support.type.primitive.zh.x",
+          "match": "(整数|浮点|布尔|字符串|数组|无)(?![\\w\\u0080-\\uFFFF])"
+        }
+      ]
+    },
+    "identifiers": {
+      "comment": "兜底。放最后，前面都没命中才落这里。\n\n显式写出来而不是省略，是为了让「普通变量」有一个确定的 scope ——\n省略的话它是 undefined scope，颜色由编辑器默认值决定，换主题就变。\n\n这里也统一处理内建函数、关键字、类型名，因为它们是「词」级匹配，\n必须和标识符在同一个扫描层里竞争，否则标识符会先吃掉关键字。",
+      "patterns": [
+        {
+          "include": "#builtins"
+        },
+        {
+          "include": "#keywords"
+        },
+        {
+          "include": "#operators"
+        },
+        {
+          "include": "#builtinTypes"
+        },
+        {
+          "comment": "用户自定义类型在「使用处」的高亮（let x: User、字段 board: Board）。\n内建类型已被上面的 builtinTypes 吃掉，落到这里的冒号后大写名就是自定义类型。\n\n── 为什么开头要有负向先行 ─────────────────────────────────\n\n这个规则从冒号后第一个字符起配（lookbehind 在那里成立），若冒号和\n类型名之间有空格，起点落在空格上、`\\s*` 会连空格一起吃掉 —— 于是\n`: Int` 里的 Int 也被这里整段吞走，内建类型失去 support.type.primitive\n色（check-grammar 里 `let x: Int = 1` 那条断言就是这么变红的）。\n负向先行把内建类型名排除掉：内建类型交给 builtinTypes，这里只收\n自定义类型。名单必须与 #builtinTypes 保持一致，改一边要改另一边。\n\n── 为什么限定冒号+大写 ────────────────────────────────────\n\n语言里 `:` 还出现在结构体字面量 `Rect { x: 0, y: 0 }` 的\n「字段名: 值」里 —— 冒号后面跟的不一定是类型。大写开头是类型命名\n约定（类/结构体全大写驼峰），按约定放宽会把字面量里的大写变量也\n误染成类型色；中文类型名（如 `let r: 甲`）无法与中文字段值区分，\n同样不放宽 —— 这是取舍，不是疏漏。",
+          "match": "(?<=:)(\\s*)(?!(Int|Float|Bool|String|Array|void|Void|整数|浮点|布尔|字符串|数组|无)(?![\\w\\u0080-\\uFFFF]))([A-Z][A-Za-z0-9_]*)",
+          "captures": {
+            "3": {
+              "name": "entity.name.type.x"
+            }
+          }
+        },
+        {
+          "name": "variable.other.x",
+          "match": "[A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*"
+        }
+      ]
+    },
+    "builtins": {
+      "comment": "内建函数。清单**不是手写的**，来自 src/lsp_data.h（由\ncd vscode-x && node tools/gen-completions.js --write 生成），而那份数据又\n来自 src/bytecode.c 的 g_builtins[] + compile.c 里认的特殊形式，共 96 个。\n\n凭印象写会高亮一堆不存在的函数，用户复制过去编不过 —— 这比没有高亮更伤。\n\n── 为什么分段而不用一条大 alternation ─────────────────────\n\n96 个名字塞一条正则，一旦某个名字拼错，肉眼在那一长串里找不出来。\n按前缀（win-/arr-/str-/fs-/net-）分段后，每段都能和 bytecode.c 里的\n命名约定对上，审查成本低。语义上完全等价。\n\n── 不在这里的两类名字 ────────────────────────────────────\n\n1. math 的 25 个子函数名（pow sqrt cbrt floor ceil round trunc abs sign\n   min max sin cos tan asin acos atan atan2 log log2 log10 exp hypot fmod clamp）\n   实测 `println(sqrt(16))` 报「未定义的函数 sqrt」—— 它们只能在 math(sqrt, x)\n   里当裸标识符传，不是可调用内建。高亮它们会让人写 `sqrt(16)`。\n   注意 math 本身在 g_builtins 里，已在下面列出。\n\n2. `static` / `constructor` —— 不是内建也不是关键字，单独处理。",
+      "patterns": [
+        {
+          "comment": "窗口 / 图形（win*，17 个）。来自 g_builtins 的 XBI_WIN_* 段。",
+          "name": "support.function.builtin.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(winOpen|winClose|winShouldClose|winBeginFrame|winEndFrame|winFillRect|winBorderRect|winText|winTextWidth|winTextHeight|winPollClick|winMouseX|winMouseY|winMouseDown|winTime|winSleep|winScreenshot|winFillRound|winBorderRound|winEllipse|winPath|winGradient|winPushTransform|winPopTransform|winAlpha|winPopAlpha|winClip|winUnclip|winTextRot)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "数组（arr*，11 个）。注意没有 arrNew —— 数组只能 array(n, fill) 构造，\n也没有数组字面量 [a, b]（'[' 在表达式位置不被识别）。",
+          "name": "support.function.builtin.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(arrPush|arrPop|arrInsert|arrRemove|arrSlice|arrConcat|arrReverse|arrIndexOf|arrContains|arrFill|arrSort|arrCopy)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "字符串（str*，18 个）。",
+          "name": "support.function.builtin.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(strAt|strSub|strFind|strFindFrom|strSplit|strJoin|strUpper|strLower|strTrim|strReplace|strStarts|strEnds|strRepeat|strCode|strFromCode|strParseInt|strParseFloat|strFromBytes|strBytes)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "文件（fs*，13 个）。",
+          "name": "support.function.builtin.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(fsRead|fsReadOr|fsWrite|fsAppend|fsExists|fsIsDir|fsRemove|fsSize|fsList|fsMkdir|fsReplace)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "网络（net*，10 个）。",
+          "name": "support.function.builtin.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(netListen|netAccept|netRecv|netSend|netClose|netConnect|netPort|netPeer|netError|netPending)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "杂项内核内建：math / random / randomSeed / fail / typeOf / sleep。\n\nmath 是单入口 + 编译期按名字查表（见上面「不在这里的两类名字」）。",
+          "name": "support.function.builtin.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(math|random|randomSeed|fail|typeOf|sleep)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "反射（v0.16，9 个）。签名对不上会静默出错，所以这里给出准确形态：\n  className(x) / classParent(x) / classIs(x, \"Name\")\n  classFields(x) / classMethods(x)              → 数组\n  fieldGet(x, \"f\") / fieldSet(x, \"f\", v) / fieldHas(x, \"f\") / methodHas(x, \"m\")\n\n反射**遵守可见性**：对 private 字段用 fieldGet 会运行时报错（实测用例\n40-reflect-private-deny.fail）。这属于运行期语义，不影响词法高亮。",
+          "name": "support.function.builtin.reflect.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(className|classParent|classIs|classFields|classMethods|fieldGet|fieldSet|fieldHas|methodHas)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "注解查询（v0.16，4 个）。注意签名里 **member 是必填参数**：\n  annoHas(x, \"field\", \"name\", \"Column\")\n  annoGet(x, \"class\", \"\", \"Table\")        类目标的 member 传空串\n  annoGetKV 同上 / annoAll(x, \"method\", \"legacy\")  少一个参数\n\n第一版 annoGet 写成 (x, target, name) 三参，多个字段带同名注解时返回空数组，\n而空数组看起来完全像「这个注解没有实参」—— 所以后来加了 member。",
+          "name": "support.function.builtin.annotation.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(annoHas|annoGet|annoGetKV|annoAll)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "编译器特殊形式（8 个），不在 g_builtins[] 里。\n\n它们是编译器里的特殊形式，因为参数个数可变、要做隐式转字符串，\n直接编成 OP_PRINT 更省事。后果是任何「从 g_builtins 提取内建」的工具\n都会漏掉它们 —— 生成器专门从 compile.c 的 strcmp(n, ...) 里补了这一批。\n\n其中 array 比较特殊：它是**唯一**的数组构造方式（array(n, fill)），\n没有 arrNew，也没有字面量。",
+          "name": "support.function.builtin.special.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(print|println|toInt|toFloat|toString|len|array|abs)(?![\\w\\u0080-\\uFFFF])"
+        }
+      ]
+    },
+    "keywords": {
+      "comment": "关键字。判据只有一条：**build/x.exe check 能不能过**。\n\nlexer.c 里定义了 57 个英文词 + 56 个中文别名，但 parser.c 只消费了其中 37/36 个。\n逐个实测后，真正能编译的只有（详见 tools/probe-dead-keywords.sh，它会把\n实测结果和 gen-completions.js 的 DEAD_KEYWORDS 逐项对账）：\n\n  en: fn let var const if else for while loop break continue return in\n      true false null pub public or not defer import from as void\n      class interface abstract final extends implements override\n      private protected public self new struct match\n\n以下 19 个词是**死 token** —— 词法器能识别，解析器一律报\n「期望一个表达式，实际读到 X」，所以不高亮：\n  enum trait impl type mod case do catch spawn dyn where\n  unsafe comptime extern yield mut ref par super\n\n中文对应（同样不高亮）：结构(sturct 是活的，见下) 枚举 特征 实现 模组\n  可变 引用 类型 编译期 外部 不安全 动态 并行 约束 情形 做 捕获 产出 父类\n  —— 注意 `结构` / `实现接口` / `类` / `接口` / `抽象` / `终态` / `私有` /\n     `保护` / `公开` / `覆写` / `新建` / `继承` / `匹配` 是**活的**，中文类系统与\n     match 完整可用。\n\n为什么必须区分：把这些词染成关键字色，用户会照着写，然后编译失败。\n高亮是给「这一行能跑」做背书的，不能替不存在的语法背书。\n\n── 两个「不是关键字但必须高亮」的词 ──────────────────────\n\n  static       parser.c 用 strcmp(t->s, \"static\") 认，没有 TokKind，\n               也没有中文别名（实测 `静态 fn 双()` 报错，`static 函 双()` 可以）\n  constructor  同样用 strcmp 认，只此一份，无中文别名\n\n它们在这里高亮，是因为「语法上成立」比「词法上是关键字」更重要。",
+      "patterns": [
+        {
+          "comment": "控制流与声明。实测全部可编译。\n\nv0.17 新增 match / 匹配：match 从「死 token」移入活列表（parser.c 里\n已实现 EX_MATCH，支持字面量、范围、绑定、守卫、通配、嵌套）。",
+          "name": "keyword.control.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(if|else|for|while|loop|break|continue|return|in|match)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "name": "keyword.control.zh.x",
+          "match": "(如果|否则|遍历|当|循环|跳出|继续|返回|于|匹配)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "词级运算符与模块相关。or / not / import / from / as 都能编译，\n但它们是「词不是符号」，主题常给它们与符号运算符不同的颜色。",
+          "name": "keyword.operator.word.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(or|not|import|from|as)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "name": "keyword.operator.word.zh.x",
+          "match": "(或|非|引入|从|作为)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "类系统：继承关系。`extends` 是单继承，`implements` 可跟多个接口\n（实测 `class A implements I, J` 能编过）。\n\n这里把**父类/接口名一起捕获**，而不是让 extends 光秃秃地过去。\n理由：后面那个名字落在 #identifiers 兜底里会变成 variable.other，\n而它明明是类型。实测过：`class A extends B` 里 B 若只走兜底，\n颜色和普通变量一样 —— 读代码时会以为 B 是个变量。\n\n多个接口时只有第一个拿到类型色（`implements I, J` 里的 J 仍落兜底），\n因为一条 match 不能重复匹配。收益不值得再拆规则：罕见的写法多一种颜色，\n比常见的写法错色轻。",
+          "name": "keyword.other.inheritance.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(extends|implements)(\\s+)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.other.inheritance.x"
+            },
+            "3": {
+              "name": "entity.name.type.x"
+            }
+          }
+        },
+        {
+          "name": "keyword.other.inheritance.zh.x",
+          "match": "(继承|实现接口)(\\s+)([A-Za-z_\\u0080-\\uFFFF][\\w\\u0080-\\uFFFF]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.other.inheritance.zh.x"
+            },
+            "3": {
+              "name": "entity.name.type.x"
+            }
+          }
+        },
+        {
+          "comment": "类体修饰符。\n\npub 与 public 是同一个 TokKind（TK_PUB）的两个拼写：另外两个修饰符\nprivate / protected 都是全写，只有公开那个原本是缩写，于是 `private x`\n旁边写 `pub y` 看起来像打错了 —— v0.16 加了 public 作为别名。\n三个修饰符现在能写成同一套风格。\n\nabstract 有两种位置，都实测可编过：类前（`abstract class A`）和方法前\n（`abstract fn area()`）。词级规则一次覆盖。final 同理。\n\nstatic 不是关键字（见本节开头），但必须在这里 —— 漏了它，类里的静态\n方法就没有任何颜色，而 `static fn double` 是 37-class.xle 里用到的真实语法。\n\ndefer 不是修饰符而是语句前缀（parser.c 1039 行有 TK_DEFER 分支），\n放这里只是让主题给它修饰符色，视觉上等同关键字。",
+          "name": "storage.modifier.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(pub|public|private|protected|abstract|final|override|static|defer)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "name": "storage.modifier.zh.x",
+          "match": "(公开|私有|保护|抽象|终态|覆写|延后)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "self / 自身。给 variable.language 而不是 keyword：它是「当前实例的\n引用」，语义更接近变量而不是语法结构，多数主题对 variable.language\n（this / self / super）有专门的配色。\n\n实测 self 在方法体内可以自由使用、在类外使用会报错；作为方法参数\n写 `fn f(self)` 或省略 self 参数也可以（37-class.xle 两种都用了）。",
+          "name": "variable.language.self.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(self)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "name": "variable.language.self.zh.x",
+          "match": "(自身)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "name": "constant.language.boolean.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(true|false)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "null 是字面量不是类型。之前它被塞进 builtinTypes 的 support.type.primitive，\n结果 null 和 Int/Float 同色 —— 读代码时会以为它对类型。",
+          "name": "constant.language.null.x",
+          "match": "(?<![\\w\\u0080-\\uFFFF])(null)(?![\\w\\u0080-\\uFFFF])"
+        },
+        {
+          "comment": "中文的 真/假/空 是常量词，不是布尔 —— 一起放进 constant 类。",
+          "name": "constant.language.zh.x",
+          "match": "(真|假|空)(?![\\w\\u0080-\\uFFFF])"
+        }
+      ]
+    },
+    "operators": {
+      "comment": "运算符。整组严格按「长度降序」排列：三字符 → 两字符 → 单字符。\n\n为什么必须这样排：TextMate 第一条命中即停。之前把 comparison 写在 shift 前面，\n`a << 2` 里第一个 < 就被 comparison 的 < 吃掉，`<<` 永远匹配不到；\n`=>` 也一样，被 assignment 的 = 抢先切成「= 然后 >」。\n这类 bug 不报错、只是颜色不对，必须靠顺序根治，不能靠零散打补丁。\n\n组内不同 scope 之间不重叠（<= 与 << 不冲突，== 与 => 不冲突），可以放心并列。\n\n注意 `@` 在这里只是个兜底：真实用途（注解、包引用）已由 #attributes 抢在前面\n处理掉了。留下它是为了防止「注解规则没命中、@ 完全没有颜色」这种裸奔。",
+      "patterns": [
+        {
+          "name": "keyword.operator.range.x",
+          "match": "\\.\\.="
+        },
+        {
+          "name": "keyword.operator.assignment.x",
+          "match": "<<=|>>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^="
+        },
+        {
+          "name": "keyword.operator.arrow.x",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.comparison.x",
+          "match": "==|!=|<=|>="
+        },
+        {
+          "name": "keyword.operator.shift.x",
+          "match": "<<|>>"
+        },
+        {
+          "name": "keyword.operator.logical.x",
+          "match": "&&|\\|\\||!!|\\?\\?"
+        },
+        {
+          "name": "keyword.operator.arithmetic.x",
+          "match": "\\+\\+|--"
+        },
+        {
+          "name": "keyword.operator.range.x",
+          "match": "\\.\\."
+        },
+        {
+          "name": "keyword.operator.assignment.x",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.comparison.x",
+          "match": "<|>"
+        },
+        {
+          "name": "keyword.operator.arithmetic.x",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.bitwise.x",
+          "match": "&|\\||\\^|~|!"
+        },
+        {
+          "comment": "可选链 `?.` 与可选下标 `?[`。\n\n必须排在 `\\?` 单字符之前 —— TextMate 第一条命中即停，否则\n`a?.b` 里的 `?` 会被 question 吃掉，`.b` 又落进 punctuation，\n视觉上像是「`?` 然后一个点」，读不出这是一个运算符。\n\n`?[` 也在这里标上：它是可选下标（`a?[i]`），与 `a[i]` 区别就在这个 `?`。",
+          "name": "keyword.operator.optional.x",
+          "match": "\\?\\."
+        },
+        {
+          "name": "keyword.operator.question.x",
+          "match": "\\?"
+        },
+        {
+          "name": "punctuation.x",
+          "match": "[()\\[\\]{},;:]|\\.|@"
+        }
+      ]
+    }
+  }
+}

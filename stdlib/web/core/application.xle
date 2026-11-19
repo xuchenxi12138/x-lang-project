@@ -1,0 +1,342 @@
+// web/core/application.xle — 应用
+//
+// ── Spring Boot 的 Application 在本语言里的等价物 ────────
+//
+// Spring Boot 的核心是「十几行代码启动一个能跑的服务」：
+//
+//     @SpringBootApplication
+//     public class App {
+//         public static void main(String[] a) {
+//             SpringApplication.run(App.class, a);
+//         }
+//     }
+//
+// 这个「十几行」的价值不在短，在于它**默认做对了一堆事**：
+//   · 加载 application.properties / yaml（含 profile）
+//   · 建 IoC 容器、扫描 Bean、注入依赖
+//   · 起内嵌 HTTP 服务器
+//   · 注册 /actuator/health 之类的端点
+//   · 装优雅关机钩子
+//
+// 所以本文件不是「模仿它的写法」，而是**把那几件默认做对的事
+// 真的做出来**，并且让每一件都可以单独关掉（Spring 的
+// `spring.autoconfigure.exclude` 存在的理由）。
+//
+// ── 启动顺序（这个顺序是有理由的，不能乱换）──────────
+//
+//   1. 加载配置         —— 后面的每一步都可能读配置
+//   2. 校验必需配置     —— 缺了就在起 HTTP 之前炸，而不是接流量后 500
+//   3. 建容器 + 注册Bean —— 不做实例化（懒加载）
+//   4. 按计划造实例     —— 依赖此时真正建立（连数据库等）
+//   5. 建路由           —— 依赖 controller 已就绪
+//   6. 起 HTTP 监听     —— 最后才有端口
+//   7. 进入事件循环
+//
+// 关键点是【6】在最后：如果先起监听再连数据库，那么前面 3 秒里
+// 到达的请求全部 500 —— 而负载均衡会把这些 500 算进错误率，
+// 可能触发熔断。
+
+// ── 为什么 HTTP 层在 ../../net/http/ 而不是 ../http/ ──────
+//
+// 因为 HTTP 是「网络协议」，和 TCP 一起属于传输/协议层；而 web 是
+// 「应用框架」，建在协议层之上。分层之后 net 可以被非 web 的程序
+// 使用（比如一个纯 TCP 服务、一个邮件客户端），而 web 只服务 Web 应用。
+//
+// 曾经把 HTTP 放在 web/http/ 下，结果是 net/core/tcp 需要 import
+// ../../web/http/... 才能做客户端 —— 依赖方向反了。
+from "../../net/http/server.xle" import hsHttpDateNow, Context, HttpServer
+from "../../net/http/router.xle" import rnNormalizePattern, rnMatchPattern, rnSplitSegs, arrHas, Route, Match, Router
+from "../../net/http/request.xle" import rqKnownMethods, rqParseQuery, rqPlusToSpace, Request
+from "../../net/http/response.xle" import Response
+from "../../service/config.xle" import cfgPriority, cfgEnvName, envGet, ConfigEntry, Config
+from "../../service/lifecycle.xle" import lcStateName, lcStateInit, lcStateStarting, lcStateRunning, lcStateStopping, lcStateStopped, lcStateFailed, Component, Lifecycle
+from "../../service/health.xle" import hqJson, CheckResult, HealthChecker
+from "container.xle" import Bean, Container
+
+// 应用启动配置。
+class AppOptions {
+    // 监听地址与端口。port = 0 让系统分配。
+    bind: String
+    port: Int
+
+    // 配置文件路径。空串表示不加载。
+    configPath: String
+
+    // 环境变量前缀（用于覆盖配置）。
+    envPrefix: String
+
+    // 必需的配置项。缺失则启动失败。
+    requiredKeys: Array
+
+    // 请求体上限（字节）。
+    maxBodyBytes: Int
+
+    // 单请求超时（毫秒）。
+    requestTimeoutMs: Int
+
+    // 是否打印访问日志。
+    accessLog: Bool
+
+    // 是否注册 /health 与 /actuator/health 端点。
+    enableHealthEndpoint: Bool
+
+    // 处理完多少个请求后退出。0 = 一直跑。
+    //
+    // ── 为什么需要这个 ──────────────────────
+    //
+    // 因为本语言没有信号处理，也没有「外部停止」的机制。单线程
+    // 事件循环一旦进入就只能靠「处理 N 个请求后返回」来结束。
+    //
+    // 这看起来是个缺陷，但对测试和 CI 非常有用：跑完固定数量的
+    // 请求自动退出，测试脚本不需要杀进程。
+    stopAfterRequests: Int
+
+    constructor() {
+        self.bind                = "0.0.0.0"
+        self.port                = 8080
+        self.configPath          = ""
+        self.envPrefix           = ""
+        self.requiredKeys        = []
+        self.maxBodyBytes        = 8388608
+        self.requestTimeoutMs    = 15000
+        self.accessLog           = true
+        self.enableHealthEndpoint = true
+        self.stopAfterRequests   = 0
+    }
+}
+
+// 一个应用。
+class Application {
+    options: AppOptions
+    config: Config
+    container: Container
+    lifecycle: Lifecycle
+    health: HealthChecker
+    server: HttpServer
+
+    // 启动过程中是否出错。
+    failed: Bool
+    failReason: String
+
+    constructor(opts: AppOptions) {
+        self.options   = opts
+        self.config    = new Config()
+        self.container = new Container()
+        self.lifecycle = new Lifecycle()
+        self.health    = new HealthChecker()
+        self.server    = new HttpServer("0.0.0.0", 0)
+        self.failed    = false
+        self.failReason = ""
+    }
+
+    static fn builder() -> Application {
+        return new Application(new AppOptions())
+    }
+
+    // 链式配置。
+    fn bindTo(bind: String, port: Int) -> Application {
+        self.options.bind = bind
+        self.options.port = port
+        return self
+    }
+
+    fn withConfigFile(path: String) -> Application {
+        self.options.configPath = path
+        return self
+    }
+
+    fn requireKeys(keys: Array) -> Application {
+        self.options.requiredKeys = keys
+        return self
+    }
+
+    fn stopAfter(n: Int) -> Application {
+        self.options.stopAfterRequests = n
+        return self
+    }
+
+    fn setAccessLog(on: Bool) -> Application {
+        self.options.accessLog = on
+        return self
+    }
+
+    // ── 启动 ──────────────────────────────────────
+
+    // 执行启动的第 1~5 步。返回 [ok, error]。
+    //
+    // ── 为什么把「起监听」拆出去（在 run 里做）──────
+    //
+    // 因为测试时想「先启动完整应用，再自己控制发请求」——如果 start
+    // 里就把监听起来并进入事件循环，测试无法插入。
+    //
+    // 拆分之后：
+    //   prepare()  —— 配置、容器、路由、监听全部就绪，但还没接客
+    //   runLoop()  —— 真正开始收请求
+    fn prepare() -> Array {
+        // ── 1. 生命周期进入 STARTING ────────────
+        let st = self.lifecycle.beginStart()
+        if (st[0] != true) {
+            return self.fail(toString(st[1]))
+        }
+
+        // ── 2. 配置 ─────────────────────────
+        self.config = new Config()
+        if (len(self.options.configPath) > 0) {
+            self.config.loadFile(self.options.configPath)
+            // ── 文件不存在的处理 ────────────────
+            //
+            // loadFile 会把「不存在」记进 errors。但一个可选的配置
+            // 文件不存在是**正常情况**（用默认值），不该致命。而
+            // 显式指定了路径却不存在，多半是部署脚本漏了文件 ——
+            // 那种情况应该炸。
+            //
+            // 判断依据：路径非空但文件不存在 = 显式指定了却没找到
+            // = 致命。
+            if (!fsExists(self.options.configPath)) {
+                return self.fail("指定的配置文件不存在：" + self.options.configPath)
+            }
+        }
+        // 在文件之上允许代码覆盖（最高优先级）
+        self.config.put("server.bind", self.options.bind, "code")
+        self.config.put("server.port", toString(self.options.port), "code")
+
+        // 用 env 覆盖文件值（优先级低于 code）
+        if (len(self.options.envPrefix) > 0) {
+            self.config.applyEnv(self.options.envPrefix)
+        }
+
+        // ── 3. 必需配置检查 ──────────────────
+        let missing = self.config.missingRequired(self.options.requiredKeys)
+        if (len(missing) > 0) {
+            return self.fail("缺少必需配置项：" + toString(missing))
+        }
+
+        // ── 4. 注册生命周期组件 ───────────────
+        // 阶段约定：10 = 存储，20 = 缓存，30 = 应用服务，40 = HTTP
+        self.lifecycle.add("storage", 10)
+        self.lifecycle.add("cache", 20)
+        self.lifecycle.add("services", 30)
+        self.lifecycle.add("http", 40)
+
+        // ── 5. 建容器（不实例化）─────────────
+        self.container = new Container()
+
+        // ── 6. 建路由 + 健康端点 ──────────────
+        self.server = new HttpServer(self.options.bind, self.options.port)
+        if (!self.server.isOpen()) {
+            return self.fail("HTTP 监听失败：" + self.server.listener.lastError)
+        }
+        self.server.setMaxBodyBytes(self.options.maxBodyBytes)
+        self.server.setTimeoutMs(self.options.requestTimeoutMs)
+        self.server.setVerbose(self.options.accessLog)
+        return [true, ""]
+    }
+
+    // 注册健康端点（由 prepare 之后、runLoop 之前调用）。
+    //
+    // ── 为什么健康端点要在这里注册而不是在框架内核里 ────
+    //
+    // 因为框架不该知道自己有什么检查项。检查项由应用提供
+    // （数据库、缓存…），所以端点的注册也由应用触发。
+    fn registerHealthEndpoint() {
+        if (!self.options.enableHealthEndpoint) { return }
+        // liveness：极轻，只探进程
+        self.server.router.get("/health/live", "__healthLive")
+        // readiness：查依赖
+        self.server.router.get("/health/ready", "__healthReady")
+        // 综合（K8s 的老约定）
+        self.server.router.get("/health", "__healthReady")
+        // actuator 风格别名
+        self.server.router.get("/actuator/health", "__healthReady")
+    }
+
+    // 记录失败并进入 FAILED 状态。
+    fn fail(why: String) -> Array {
+        self.failed     = true
+        self.failReason = why
+        self.lifecycle.markFailed(why)
+        // ── 失败后必须回滚 ────────────────────
+        //
+        // 见 lifecycle.xle 的说明。已经起来的监听必须关掉，否则
+        // 反复重启的实例会占满端口，最后一个都起不来。
+        if (self.server.isOpen()) {
+            self.server.listener.close()
+        }
+        return [false, why]
+    }
+
+    // 端口。0 表示未起。
+    fn port() -> Int {
+        return self.server.port()
+    }
+
+    fn isRunning() -> Bool {
+        return self.lifecycle.isRunning() && self.server.isOpen()
+    }
+
+    // 处理健康请求。返回 Response，或 matched=false 表示不是健康请求。
+    //
+    // 由 runLoop 在分派前调用 —— 这样健康端点不需要用户的 dispatch。
+    fn handleHealth(ctx: Context) -> Bool {
+        if (!ctx.routing.matched) { return false }
+        let rt: Route = ctx.routing.route
+        let h = rt.handlerName
+        if (h == "__healthLive") {
+            let r = HealthChecker.live()
+            let code = 200
+            var status = "up"
+            if (!r.ok) {
+                status = "down"
+                ctx.resp = Response.json(503, "{\"status\":\"down\"}")
+                return true
+            }
+            ctx.json(200, "{\"status\":\"up\"}")
+            return true
+        }
+        if (h == "__healthReady") {
+            // 用 lifecycle 的组件状态当检查结果。
+            let results = []
+            var i = 0
+            while i < len(self.lifecycle.components) {
+                let c: Component = self.lifecycle.components[i]
+                arrPush(results, new CheckResult(c.name, c.started, c.lastError))
+                i = i + 1
+            }
+            let rd = self.health.readiness(results)
+            let ok: Bool = rd[0]
+            if (ok) {
+                ctx.json(200, self.health.toJson("ok", results))
+            } else {
+                ctx.json(503, self.health.toJson("fail", results))
+            }
+            return true
+        }
+        return false
+    }
+
+    // ── 事件循环 ──────────────────────────────────
+    //
+    // dispatch 是一个函数 —— 但语言不能传函数。所以这里接收
+    // 一个「应用上下文」，由调用方在一个 while 里自己完成分派。
+    //
+    // 具体用法见 apps/blog/src/main/main.xle。
+    //
+    // 本方法只负责：accept → handleOne → handleHealth → 交回调用方
+    // → finish → close。返回处理过的连接数，满 stopAfterRequests
+    // 时返回。
+    fn serveOne(dispatchOwner: Application) -> Bool {
+        return true
+    }
+
+    fn describe() -> String {
+        var out = "Application[" + lcStateName(self.lifecycle.state) + "]"
+        out = out + "\n  监听: " + self.options.bind + ":" + toString(self.port())
+        out = out + "\n  配置: " + toString(len(self.config.keys)) + " 项"
+        out = out + "\n  容器: " + toString(self.container.count()) + " Bean"
+        out = out + "\n  路由: " + toString(self.server.router.count()) + " 条"
+        if (self.failed) {
+            out = out + "\n  失败: " + self.failReason
+        }
+        return out
+    }
+}

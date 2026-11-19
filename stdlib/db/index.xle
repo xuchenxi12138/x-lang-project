@@ -1,0 +1,204 @@
+// db/index.xle — 数据库层统一入口
+//
+// ── 这个文件只做一件事：把七个驱动收在同一处 ─────────────
+//
+// 上层（业务代码、Spring Boot 风格的 Repository）不应该直接
+// `import "db/mysql/driver.xle"` —— 那样换库就要改 import 路径，
+// 而这正是抽象层要避免的事。
+//
+// 所以这里做两件：
+//
+//   1. 转出所有驱动的类型，让调用方只 import 一次
+//   2. 提供一个 `openDb(url, user, password)` 工厂，按 URL 的
+//      scheme 自动选驱动
+//
+// ── 为什么 openDb 返回的静态类型是工厂而不是 DataSource ────────
+//
+// 因为「返回哪个子类」在编译期无法知道，而语言没有联合类型。
+// 调用方拿到具体子类实例后可以用它自己类型的方法（比如
+// MySqlDataSource 的 run），也可以当 DataSource 用。
+//
+// ── 七种库的完成度 ────────────────────────────────
+//
+//   MySQL       ✓ 真机验证（9.3.0，caching_sha2_password）
+//   Postgres    ✓ 协议级完成（本机无服务，SCRAM-SHA-256 全流程）
+//   Redis       ✓ 真机验证（AUTH/字符串/哈希/列表/错误）
+//   MongoDB     ✓ 真机验证（7.0，BSON 9 个浮点精确往返）
+//   Elasticsearch ✓ 结果集离线验证（本机无服务，四种响应形态）
+//   SQLite      ✓ 真机验证（真实文件，含 rowid 别名回填）
+//   Oracle      协议层完成，认证未实现（见 oracle/driver.xle 文件头）
+
+from "core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "core/datasource.xle" import sqlBind, execAll, DataSource
+from "core/result.xle" import ResultSet
+from "core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "core/pool.xle" import makeDataSource, supportedKinds, kindSupported, Pool
+from "core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+
+from "codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "codec/sha1.xle" import Sha1, SHA1_H0, SHA1_H1, SHA1_H2, SHA1_H3, SHA1_H4, SHA1_MASK32
+from "codec/sha256.xle" import Sha256, SHA256_H0, SHA256_H1, SHA256_H2, SHA256_H3, SHA256_H4, SHA256_H5, SHA256_H6, SHA256_H7, SHA256_MASK32
+from "codec/md5.xle" import md5K, md5S, md5HexOf, md5HexText, Md5, MD5_MASK32
+from "codec/hmac.xle" import hmacNormKey, hmacSha256, hmacSha256Hex, pbkdf2Sha256, HMAC_BLOCK, HMAC_DIGEST
+from "codec/base64.xle" import b64Encode, b64EncodeText, b64Decode, b64DecodeText, b64Value, b64UrlEncode, b64UrlDecode, B64_ALPHABET
+
+from "mysql/driver.xle" import myParseUrl, MySqlDataSource, MY_COM_QUERY, MY_COM_PING, MY_COM_QUIT
+from "postgres/driver.xle" import pgParseSaslMechanisms, pgHasMechanism, pgMd5Password, pgParseUrl, PostgresDataSource, PG_PROTOCOL_3
+from "redis/driver.xle" import redisToResult, redisIsPairCommand, redisSplit, redisParseUrl, RedisDataSource
+from "mongo/driver.xle" import mongoToResultSet, mongoFindBatch, mongoBatchDoc, mongoHasString, mongoJsonToBson, mongoJsonParse, mongoJsonParseObj, mongoJsonParseValue, mongoIsSpace, mongoSplit, mongoArg, mongoParseUrl, MongoDataSource
+from "es/driver.xle" import esToResultSet, esCatResult, esExtractError, esContains, esSplit, esArg, esParseUrl, EsDataSource
+from "sqlite/driver.xle" import svEncodingName, svColHint, sqlHead, SqliteDataSource, SV_MASTER_ROOT, SV_MAX_FILE_BYTES
+from "oracle/driver.xle" import oraTnsState, oraParseUrl, OracleDataSource
+
+// URL 的 scheme → 方言种类。不认识返回 -1。
+//
+// ── 为什么要同时认 `://` 与 `:` ──────────────────────
+//
+// 因为 SQLite 的 URL 是 `file:/path/to.db`（一个斜杠，不是两个）。
+// 只按 `://` 切的话 scheme 会提取成整串 `file:/path/to.db`，于是
+// 「无法判断数据库类型」—— 而这条错误信息看起来像「URL 写错了」，
+// 实际是解析器太窄。
+//
+// 取舍：先找 `://`，没有就找第一个 `:`。这样 `file:/x.db`、
+// `file:///x.db`、`sqlite:demo.db` 三种写法都能认。
+fn dbSchemeKind(url: String) -> Int {
+    let p = strFind(url, "://")
+    var scheme = url
+    if (p >= 0) {
+        scheme = strSub(url, 0, p)
+    } else {
+        let c = strFind(url, ":")
+        if (c >= 0) { scheme = strSub(url, 0, c) }
+    }
+    let s = strLower(strTrim(scheme))
+
+    if (s == "mysql")     { return DB_MYSQL }
+    if (s == "postgres" || s == "postgresql" || s == "pgsql") { return DB_POSTGRES }
+    if (s == "oracle")    { return DB_ORACLE }
+    if (s == "sqlite" || s == "file") { return DB_SQLITE }
+    if (s == "mongodb" || s == "mongo") { return DB_MONGO }
+    if (s == "redis")     { return DB_REDIS }
+    if (s == "es" || s == "elasticsearch" || s == "http" || s == "https") { return DB_ES }
+    return 0 - 1
+}
+
+// 从 URL 里取出「scheme 之后的部分」（去掉 `://` 或 `:`）。
+fn dbUrlRest(url: String) -> String {
+    let p = strFind(url, "://")
+    if (p >= 0) { return strSub(url, p + 3, len(url)) }
+    let c = strFind(url, ":")
+    if (c >= 0) { return strSub(url, c + 1, len(url)) }
+    return url
+}
+
+// 按 URL 打开一个数据源并连接。
+//
+// 返回 [ok, DataSource, error]。失败时 ok=false、error 有可读原因、
+// 第二个分量是一个空的 mysql 数据源占位（语言没有 null，见
+// jsonpath.xle 里那段说明）—— 调用方必须**先判 ok**。
+//
+// ── 为什么这个函数要真的建立连接 ────────────────────
+//
+// 因为「打开」这个词在数据库语境里就是「连上」。返回一个未连接的
+// 句柄让调用方自己 connect()，等于把一次必然发生的失败推迟到
+// 更远的地方 —— 而那时错误信息里的上下文已经丢了一半。
+fn openDb(url: String, user: String, password: String) -> Array {
+    let kind = dbSchemeKind(url)
+    if (kind < 0) {
+        return [false, new MySqlDataSource(PlaceholderEp(), "", "", ""),
+                "无法从 `" + url + "` 判断数据库类型。支持的 scheme：" +
+                "mysql / postgres / redis / mongodb / es / sqlite / oracle"]
+    }
+
+    if (kind == DB_SQLITE) {
+        // SQLite 的 URL 形如 file:/path/to/db.sqlite，路径就是 scheme
+        // 之后的部分。没有账号概念，user/password 忽略。
+        let path = dbUrlRest(url)
+        let ds = SqliteDataSource.ofFile(path)
+        let ok = ds.connect()
+        if (!ok) {
+            return [false, ds, ds.lastError]
+        }
+        return [true, ds, ""]
+    }
+
+    if (kind == DB_ORACLE) {
+        let ds = OracleDataSource.ofUrl(url, user, password)
+        let ok = ds.connect()
+        if (!ok) { return [false, ds, ds.lastError] }
+        return [true, ds, ""]
+    }
+
+    if (kind == DB_MYSQL) {
+        let ds = MySqlDataSource.ofUrl(url, user, password)
+        let ok = ds.connect()
+        if (!ok) { return [false, ds, "MySQL 连接失败（见 lastError）"] }
+        return [true, ds, ""]
+    }
+
+    if (kind == DB_POSTGRES) {
+        let ds = PostgresDataSource.ofUrl(url, user, password)
+        let ok = ds.connect()
+        if (!ok) { return [false, ds, "PostgreSQL 连接失败（见 lastError）"] }
+        return [true, ds, ""]
+    }
+
+    if (kind == DB_REDIS) {
+        let ds = RedisDataSource.ofUrl(url, user, password)
+        let ok = ds.connect()
+        if (!ok) { return [false, ds, "Redis 连接失败"] }
+        return [true, ds, ""]
+    }
+
+    if (kind == DB_MONGO) {
+        let ds = MongoDataSource.ofUrl(url, user, password)
+        let ok = ds.connect()
+        if (!ok) { return [false, ds, ds.lastError] }
+        return [true, ds, ""]
+    }
+
+    // ES
+    let ds = EsDataSource.ofUrl(url, user, password)
+    let ok = ds.connect()
+    if (!ok) { return [false, ds, ds.lastError] }
+    return [true, ds, ""]
+}
+
+// openDb 失败时返回的占位端点。
+//
+// ── 为什么不用 null ────────────────────────────
+//
+// 语言没有可空类型，而 DataSource 是抽象类 —— 不能 `new DataSource()`。
+// 所以返回一个必然无效的 MySqlDataSource 当占位。
+//
+// 防误用：它的 host 是空、port 是 0，所以任何 connect() 都会因为
+// 连不上而失败，不会静默「成功」。
+fn PlaceholderEp() -> Endpoint {
+    return endpointOf("", 0)
+}
+
+// 七个驱动的完成度自述。写进文档和 /health 端点很有用。
+fn dbSupportMatrix() -> Array {
+    return [
+        ["mysql",         "已实现", "真机验证 9.3.0（caching_sha2_password fast path）"],
+        ["postgres",      "已实现", "协议级验证（SCRAM-SHA-256 / MD5 / cleartext）"],
+        ["redis",         "已实现", "真机验证（AUTH / 字符串 / 哈希 / 列表）"],
+        ["mongodb",       "已实现", "真机验证 7.0（BSON / OP_MSG / OP_QUERY）"],
+        ["elasticsearch", "已实现", "结果集离线验证（本机无 ES 服务）"],
+        ["sqlite",        "已实现（只读）", "真机验证（B-tree / 记录解码 / rowid 别名）"],
+        ["oracle",        "协议层完成", "认证未实现（O5LOGON 需 AES + PBKDF2-SHA512）"],
+    ]
+}
+
+// 一行摘要，便于日志。
+fn dbSupportSummary() -> String {
+    let m = dbSupportMatrix()
+    var s = ""
+    var i = 0
+    while (i < len(m)) {
+        if (i > 0) { s = s + " / " }
+        s = s + toString(m[i][0]) + ":" + toString(m[i][1])
+        i = i + 1
+    }
+    return s
+}

@@ -1,0 +1,515 @@
+// ui/control/textarea.xle — 多行文本输入
+//
+// ── 与 Field 的关系 ──────────────────────────────
+//
+// TextArea 可以看作「Field 的纵向扩展」：同样的插入/删除/选区，
+// 但多了一条「光标在第几行、第几列」的二维坐标，以及纵向滚动。
+//
+// ── 为什么不做成继承 Field ───────────────────────
+//
+// 因为字段几乎全要重定义：光标从 Int 变成 (行, 列)，滚动从
+// 一维变二维，绘制从单行变多行。继承下来能复用的只有「text
+// 这个字段」，而继承带来的是「调用方假设 textarea 的 cursor
+// 也是单行索引」这类错误。所以这里独立实现，重复的那点插入
+// 删除逻辑（十几行）比一个假的继承关系便宜。
+//
+// ── 行存储 ────────────────────────────────────
+//
+// 内部用「行数组 + 行列坐标」，而不是「一个大字符串 + 全文
+// 索引」。理由：多行编辑的绝大多数操作是行内的（打字、删字、
+// 左右移动），用行数组时这些操作只碰一行；用全文索引则每次
+// 都要扫到光标处才能定位行。
+//
+// 代价是「跨行操作要合并/拆分行」，但那只有回车和退格发生在
+// 行首时才需要。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 行高。与 UI_FONT_H 一致 —— 文本区的行距就是默认行距，
+// 不额外加间距（多行文字的呼吸感由行高本身提供）。
+const TA_LINE_H = 18
+
+// 左右内边距。比单行字段略宽，因为多行文本要更好读。
+const TA_PAD = 10
+
+// 上内边距。文字不从边框顶住开始。
+const TA_PAD_Y = 8
+
+class TextArea extends Widget {
+    // 行数组。空文本是 [""]（一行空行）而不是 []（零行），
+    // 这样「光标在 (0,0)」总是合法的。
+    lines: Array,
+
+    // 光标：行号与列号（字符索引，不是像素）。
+    curLine: Int,
+    curCol: Int,
+
+    // 选区锚点。-1 表示无选区。同样用「锚点 + 活动端」法。
+    anchorLine: Int,
+    anchorCol: Int,
+
+    // 纵向滚动（行数）。
+    scrollY: Int,
+
+    // 是否只读。
+    readonly: Bool,
+
+    constructor(r: Rect, text: String) {
+        self.r          = r
+        self.vis        = true
+        self.enabled    = true
+        self.focused    = false
+        self.hovered    = false
+        self.curLine    = 0
+        self.curCol     = 0
+        self.anchorLine = 0 - 1
+        self.anchorCol  = 0 - 1
+        self.scrollY    = 0
+        self.readonly   = false
+        self.style      = Style.input(Theme.dark())
+        self.lines      = strSplit(text, "\n")
+        if (len(self.lines) == 0) { self.lines = [""] }
+        self.curLine = len(self.lines) - 1
+        self.curCol = len(toString(self.lines[self.curLine]))
+    }
+
+    static fn of(r: Rect, text: String) -> TextArea {
+        return new TextArea(r, text)
+    }
+
+    static fn empty(r: Rect) -> TextArea {
+        return new TextArea(r, "")
+    }
+
+    // ── 值 ──────────────────────────────────────
+
+    // 整段文本。用 \n 连接各行。
+    fn value() -> String {
+        return strJoin(self.lines, "\n")
+    }
+
+    fn setValue(s: String) -> TextArea {
+        self.lines = strSplit(s, "\n")
+        if (len(self.lines) == 0) { self.lines = [""] }
+        self.clampCursor()
+        return self
+    }
+
+    fn lineCount() -> Int {
+        return len(self.lines)
+    }
+
+    fn line(i: Int) -> String {
+        if (i < 0 || i >= len(self.lines)) { return "" }
+        return toString(self.lines[i])
+    }
+
+    // ── 光标 ────────────────────────────────────
+    //
+    // 夹紧而不是报错：光标越界几乎总是「删了文字但没更新光标」，
+    // 报错会让调用方到处加判断，而夹紧是安全且符合直觉的。
+
+    fn clampCursor() {
+        if (self.curLine < 0) { self.curLine = 0 }
+        if (self.curLine >= len(self.lines)) { self.curLine = len(self.lines) - 1 }
+        let n = len(toString(self.lines[self.curLine]))
+        if (self.curCol < 0) { self.curCol = 0 }
+        if (self.curCol > n) { self.curCol = n }
+    }
+
+    fn hasSelection() -> Bool {
+        if (self.anchorLine < 0) { return false }
+        if (self.anchorLine != self.curLine) { return true }
+        return self.anchorCol != self.curCol
+    }
+
+    fn clearSelection() -> TextArea {
+        self.anchorLine = 0 - 1
+        self.anchorCol = 0 - 1
+        return self
+    }
+
+    fn selectAll() -> TextArea {
+        self.anchorLine = 0
+        self.anchorCol = 0
+        self.curLine = len(self.lines) - 1
+        self.curCol = len(toString(self.lines[self.curLine]))
+        return self
+    }
+
+    // ── 编辑 ────────────────────────────────────
+    //
+    // 与 Field 一样返回「是否变化」。
+
+    fn insert(s: String) -> Bool {
+        if (self.readonly || !self.enabled) { return false }
+        if (len(s) == 0) { return false }
+
+        self.deleteSelection()
+
+        // 插入内容里可能有换行 —— 那就变成「拆成多行」。
+        // 这种情况在粘贴时非常常见，不能只当普通字符处理。
+        let parts = strSplit(s, "\n")
+        if (len(parts) == 1) {
+            // 单行插入：最常用的路径，只碰一行。
+            let cur = toString(self.lines[self.curLine])
+            let before = strSub(cur, 0, self.curCol)
+            let after = strSub(cur, self.curCol, len(cur))
+            self.lines[self.curLine] = before + s + after
+            self.curCol = self.curCol + len(s)
+            return true
+        }
+
+        // 多行插入：拆行。
+        let cur = toString(self.lines[self.curLine])
+        let before = strSub(cur, 0, self.curCol)
+        let after = strSub(cur, self.curCol, len(cur))
+
+        // 第一行接前半段，最后一行接后半段，中间整行插入。
+        let first = before + toString(parts[0])
+        let lastIdx = len(parts) - 1
+        let last = toString(parts[lastIdx]) + after
+
+        // ── 拼接顺序 ──────────────────────────────
+        //
+        // 原来是 1 行，插入后变成 lastIdx + 1 行：
+        //
+        //   第 curLine 行   = first        （原前缀 + parts[0]）
+        //   第 curLine+1..  = parts[1..lastIdx-1]  （整行插入）
+        //   第 curLine+lastIdx = last      （parts[last] + 原后缀）
+        //
+        // 先改首行，再逐个插中间行，最后插末行。全部用「从前往后
+        // 插」是安全的，因为每插一次后续下标都往后移，而我们的
+        // 目标位置是按「已插入的个数」算的（curLine + k）。
+        //
+        // 早先写成「先赋值 last 再赋值 first」，结果 last 被覆盖，
+        // 整个换行变成一个空操作 —— 行数组没长，光标却前进了，
+        // 于是下一次访问 self.lines[curLine] 直接越界。这种 bug
+        // 只在「在行中间按回车」时出现，测试里很容易漏。
+        self.lines[self.curLine] = first
+
+        var k = 1
+        while k < lastIdx {
+            arrInsert(self.lines, self.curLine + k, toString(parts[k]))
+            k = k + 1
+        }
+        arrInsert(self.lines, self.curLine + lastIdx, last)
+
+        self.curLine = self.curLine + lastIdx
+        self.curCol = len(toString(parts[lastIdx]))
+        return true
+    }
+
+    // 插入换行（回车键）。
+    fn newline() -> Bool {
+        return self.insert("\n")
+    }
+
+    // 退格。行首退格要合并到上一行。
+    fn backspace() -> Bool {
+        if (self.readonly || !self.enabled) { return false }
+        if (self.hasSelection()) { return self.deleteSelection() }
+
+        let cur = toString(self.lines[self.curLine])
+
+        if (self.curCol > 0) {
+            let before = strSub(cur, 0, self.curCol - 1)
+            let after = strSub(cur, self.curCol, len(cur))
+            self.lines[self.curLine] = before + after
+            self.curCol = self.curCol - 1
+            return true
+        }
+
+        // 行首退格：合并到上一行。
+        if (self.curLine == 0) { return false }
+
+        let prev = toString(self.lines[self.curLine - 1])
+        let joinAt = len(prev)
+        self.lines[self.curLine - 1] = prev + cur
+        arrRemove(self.lines, self.curLine)
+        self.curLine = self.curLine - 1
+        self.curCol = joinAt
+        return true
+    }
+
+    // 删除选区。
+    fn deleteSelection() -> Bool {
+        if (!self.hasSelection()) { return false }
+
+        // 规范化：保证 (a) 在 (b) 之前。逐字段比较而不是拼成
+        // 一个数比较，因为行长度不同时拼数字会错（第 2 行第 10 列
+        // 与第 1 行第 210 列）。
+        var al = self.anchorLine
+        var ac = self.anchorCol
+        var bl = self.curLine
+        var bc = self.curCol
+        if (al > bl || (al == bl && ac > bc)) {
+            let tl = al
+            let tc = ac
+            al = bl
+            ac = bc
+            bl = tl
+            bc = tc
+        }
+
+        if (al == bl) {
+            // 同一行内删区间。
+            let s = toString(self.lines[al])
+            self.lines[al] = strSub(s, 0, ac) + strSub(s, bc, len(s))
+            self.curLine = al
+            self.curCol = ac
+        } else {
+            // 跨行：保留首行前缀 + 末行后缀，删掉中间整行。
+            let head = strSub(toString(self.lines[al]), 0, ac)
+            let tail = strSub(toString(self.lines[bl]), bc, len(toString(self.lines[bl])))
+            self.lines[al] = head + tail
+
+            // 从后往前删中间行，避免下标偏移。
+            var i = bl
+            while i > al {
+                arrRemove(self.lines, i)
+                i = i - 1
+            }
+            self.curLine = al
+            self.curCol = ac
+        }
+
+        self.clearSelection()
+        return true
+    }
+
+    // ── 光标移动 ──────────────────────────────────
+    //
+    // 上下移动要「记住想要的列」—— 从长行移到短行时列会夹紧，
+    // 再移回长行应该回到原来的列。这个「理想列」不存字段，
+    // 因为即时模式下每帧重新从按键推导即可：上下各一次的
+    // 连续操作里，理想列就是移动前的列。
+    //
+    // 但按住方向键时会有多次移动，那时理想列会丢失。这是
+    // 已知的简化 —— 完整实现需要维护 desiredCol 字段。这里
+    // 选择简单：接受「长→短→长」时列会回到行尾的行为。
+
+    fn moveLeft(select: Bool) -> TextArea {
+        self.beginSelect(select)
+        if (self.curCol > 0) {
+            self.curCol = self.curCol - 1
+        } else if (self.curLine > 0) {
+            self.curLine = self.curLine - 1
+            self.curCol = len(toString(self.lines[self.curLine]))
+        }
+        return self
+    }
+
+    fn moveRight(select: Bool) -> TextArea {
+        self.beginSelect(select)
+        let cur = toString(self.lines[self.curLine])
+        if (self.curCol < len(cur)) {
+            self.curCol = self.curCol + 1
+        } else if (self.curLine < len(self.lines) - 1) {
+            self.curLine = self.curLine + 1
+            self.curCol = 0
+        }
+        return self
+    }
+
+    fn moveUp(select: Bool) -> TextArea {
+        self.beginSelect(select)
+        if (self.curLine > 0) {
+            self.curLine = self.curLine - 1
+            self.clampCursor()
+        }
+        return self
+    }
+
+    fn moveDown(select: Bool) -> TextArea {
+        self.beginSelect(select)
+        if (self.curLine < len(self.lines) - 1) {
+            self.curLine = self.curLine + 1
+            self.clampCursor()
+        }
+        return self
+    }
+
+    fn moveHome(select: Bool) -> TextArea {
+        self.beginSelect(select)
+        self.curCol = 0
+        return self
+    }
+
+    fn moveEnd(select: Bool) -> TextArea {
+        self.beginSelect(select)
+        self.curCol = len(toString(self.lines[self.curLine]))
+        return self
+    }
+
+    // 开始选择：记录锚点。select 为假时清掉锚点。
+    fn beginSelect(select: Bool) {
+        if (select) {
+            if (self.anchorLine < 0) {
+                self.anchorLine = self.curLine
+                self.anchorCol = self.curCol
+            }
+        } else {
+            self.clearSelection()
+        }
+    }
+
+    // ── 点击定位 ──────────────────────────────────
+    //
+    // 行号由 (my - 顶部) / 行高 得出，列号由行内像素位置推出。
+    fn clickAt(mx: Int, my: Int, shift: Bool) -> TextArea {
+        if (!self.hit(mx, my)) { return self }
+
+        let i = (my - self.r.y - TA_PAD_Y) / TA_LINE_H + self.scrollY
+        var line = i
+        if (line < 0) { line = 0 }
+        if (line >= len(self.lines)) { line = len(self.lines) - 1 }
+
+        if (shift) {
+            self.beginSelect(true)
+        } else {
+            self.clearSelection()
+        }
+
+        self.curLine = line
+        self.curCol = self.colAtX(line, mx)
+        return self
+    }
+
+    // 在第 line 行里，鼠标 x 对应哪个字符索引。
+    fn colAtX(line: Int, mx: Int) -> Int {
+        let s = toString(self.lines[line])
+        let rel = mx - (self.r.x + TA_PAD)
+        if (rel <= 0) { return 0 }
+
+        var w = 0
+        var i = 0
+        while i < len(s) {
+            let cw = winTextWidth(strSub(s, i, i + 1))
+            if (rel < w + cw / 2) { return i }
+            w = w + cw
+            i = i + 1
+        }
+        return len(s)
+    }
+
+    // ── 滚动 ────────────────────────────────────
+    //
+    // 保证光标行在可视区内。可视行数由高度算。
+    fn visibleLines() -> Int {
+        let h = self.r.h - TA_PAD_Y * 2
+        if (h <= 0) { return 1 }
+        return h / TA_LINE_H
+    }
+
+    fn ensureCursorVisible() {
+        let vis = self.visibleLines()
+        if (self.curLine < self.scrollY) {
+            self.scrollY = self.curLine
+        }
+        if (self.curLine >= self.scrollY + vis) {
+            self.scrollY = self.curLine - vis + 1
+        }
+        if (self.scrollY < 0) { self.scrollY = 0 }
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        self.ensureCursorVisible()
+
+        // 边框与底色。焦点用边框变色表达（与 Field 一致）。
+        var borderC = th.border
+        if (!self.enabled) {
+            borderC = th.border
+        } else if (self.focused) {
+            borderC = th.accent
+        }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.surface)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, borderC)
+
+        // 内容裁剪：滚动出去的行不能画到框外。
+        winClip(self.r.x + 1, self.r.y + 1, self.r.w - 2, self.r.h - 2)
+
+        let vis = self.visibleLines()
+        var tc = th.text
+        if (!self.enabled) { tc = th.disabled }
+
+        var i = 0
+        while i < vis {
+            let li = self.scrollY + i
+            if (li >= len(self.lines)) { break }
+            let ly = self.r.y + TA_PAD_Y + i * TA_LINE_H
+            let s = toString(self.lines[li])
+
+            // 选区高亮：这一行是否在选区内。
+            if (self.hasSelection() && self.focused) {
+                self.drawLineSelection(th, li, ly, s)
+            }
+
+            if (len(s) > 0) {
+                winText(self.r.x + TA_PAD, ly, s, tc)
+            }
+            i = i + 1
+        }
+
+        // 光标：一个宽 1px 的竖线，高度略小于行高。
+        if (self.focused && !self.readonly) {
+            let ly = self.r.y + TA_PAD_Y + (self.curLine - self.scrollY) * TA_LINE_H
+            let cur = toString(self.lines[self.curLine])
+            let cx = self.r.x + TA_PAD + winTextWidth(strSub(cur, 0, self.curCol))
+            let ch = TA_LINE_H - 5
+            winFillRect(cx, ly + 2, 1, ch, th.text)
+        }
+
+        winUnclip()
+    }
+
+    // 画一行里的选区高亮。
+    //
+    // ── 三种情况 ──────────────────────────────────
+    //
+    // 选区可能：完全在某行内（[a,b]）、从行首开始（前一行起的）、
+    // 到行尾结束（还在后一行）。所以要按「本行在选区里的哪一段」
+    // 分别算起点和终点。
+    fn drawLineSelection(th: Theme, li: Int, ly: Int, s: String) {
+        var al = self.anchorLine
+        var ac = self.anchorCol
+        var bl = self.curLine
+        var bc = self.curCol
+        if (al > bl || (al == bl && ac > bc)) {
+            let tl = al
+            let tc = ac
+            al = bl
+            ac = bc
+            bl = tl
+            bc = tc
+        }
+
+        // 本行不在 [al, bl] 范围内。
+        if (li < al || li > bl) { return }
+
+        var segA = 0
+        var segB = len(s)
+        if (li == al) { segA = ac }
+        if (li == bl) { segB = bc }
+        if (segA > segB) { return }
+
+        let x0 = self.r.x + TA_PAD + winTextWidth(strSub(s, 0, segA))
+        let x1 = self.r.x + TA_PAD + winTextWidth(strSub(s, 0, segB))
+        let w = x1 - x0
+        if (w <= 0) {
+            // 空行的选区至少显示 2px，否则用户看不出选中了空行。
+            winFillRect(x0, ly, 2, TA_LINE_H, th.accent)
+            return
+        }
+        winFillRect(x0, ly, w, TA_LINE_H, th.accent)
+    }
+}

@@ -1,0 +1,53 @@
+// 40-reflect-private-deny.xle — 负例：类外反射读 private 字段
+//
+// 这个文件**预期以退出码 70 结束**（运行时错误 —— 反射是运行时能力，
+// 检查也在运行时）。
+//
+// ── 这是整个反射体系里最关键的一条守卫 ────────────────────
+//
+// 如果反射能绕过 private，那封装就是个装饰：
+//
+//     let v = new Vault(42)
+//     println(fieldGet(v, "secret"))     // 一句话破防
+//
+// 反射是「运行时按名字访问」的能力，**不是**「无视访问控制」的能力。
+// 这两件事经常被混为一谈，代价是整个私有体系失效。
+//
+// ── 判据必须与编译期完全一致 ─────────────────────────────
+//
+//   private    只有声明它的类能访问
+//   protected  本类 + 子类
+//   public     谁都能
+//
+// 两处判据不一致就是绕过封装的漏洞：直接写 `a.x` 被拒、改成
+// `fieldGet(a, "x")` 却放行。
+//
+// ── 为什么正确结果只有 70，没有别的可能 ──────────────────
+//
+// 「当前在哪个类里」只能从栈顶帧取（见 vm_cur_class 的注释：第一版
+// 扫全栈，结果任何祖先帧是类方法就会让类外反射被放行 —— 误放是
+// 静默安全漏洞，误拒是可见错误，所以永远选更严格的方向）。
+
+class Vault {
+    private secret: Int
+
+    constructor(s: Int) {
+        self.secret = s
+    }
+
+    // 类内反射读自己的 private 是合法的（这里不调用，只是定义）
+    fn readOwn() -> Int {
+        return fieldGet(self, "secret")
+    }
+}
+
+fn main() {
+    let v = new Vault(42)
+
+    // 类内通过方法访问 —— 合法
+    println("own read : " + toString(v.readOwn()))
+
+    // 直接读字段会被编译期拒绝，所以这里用反射绕过静态检查。
+    // 这一行必须被**运行时**拒绝：main 不在 Vault 内部。
+    println("from outside: " + toString(fieldGet(v, "secret")))
+}

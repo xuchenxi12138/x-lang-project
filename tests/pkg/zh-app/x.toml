@@ -1,0 +1,11 @@
+[package]
+name = "zh_app"
+version = "0.1.0"
+entry = "src/main.xlc"
+
+[dependencies]
+# 指向仓库里的 zh 别名包本体（x-lang/pkg/zh）。
+# 「包的源码放在注册表外、项目用 path 依赖引用」是合法用法 ——
+# 这也正是 zh 包在本仓库里的存在形态：随仓库分发，用户项目
+# 也可以把它发进注册表后改成版本依赖。
+zh = { path = "../../../pkg/zh" }

@@ -1,0 +1,1259 @@
+// ============================================================
+// zh —— 标准库中文别名包（04 文档 §3：L2 标准库别名层）
+// ============================================================
+//
+// 这是什么：
+//   一个纯 X 包。用户在自己的 x.toml 里声明它、在源码里
+//   `引入 @zh`，之后就能用中文调用高频标准库函数：
+//
+//     引入 @zh
+//     打印行(开方(9.0))          // println(sqrt(9.0))
+//
+// 它不是什么：
+//   不是第二个标准库。函数与类型都是轻量包装，本体永远是
+//   内建与 std.*。中文名与英文名并存（04 §3.3），可以混用：
+//
+//     令 a = 求和(xs)             // zh 提供的名字
+//     令 b = arrSum(xs)           // 完全等价
+//
+// ── 语言能力（v0.1.0 起依赖的两个编译器特性）────────────────
+//
+// 1. **重载**：同名不同签名可以并存，调用点按实参类型挑选。
+//    「查找」现在同时是字符串版与数组版，不用再分 查找 / 查下标。
+//    注意：参数签名完全一致才算重复定义；仅返回类型不同无法区分，
+//    仍是重复定义。
+//
+// 2. **Any（任意）类型**：参数标注 Any = 接受任何值（调用点不查
+//    该参数的类型）；返回值标注 Any = 透传函数体的返回值，运行时
+//    是什么类型就是什么类型。二者合起来，abs / min / max / arrPop
+//    这类「返回类型保持输入」的函数终于包得住：
+//
+//      fn 绝对值(x: Any) -> Any { return math(abs, x) }
+//
+//    代价：Any 返回值在调用点是静态未知的，后续运算走动态路径、
+//    编译期不再帮它查类型 —— 需要强类型时用英文原函数。
+//
+// 覆盖范围：
+//   通用   打印 / 数学 / 统计 / 矩阵 / 字符串 / 数组 / 文件 / 时间 / 转换
+//   编辑器 文档 / 查找 / 高亮 / 按键 / 界面控件 / 窗口与剪贴板
+//   不做   db / http / json / 反射。
+// 编辑器类型采用组合包装，应用层不需要接触英文方法、字段或平台内建。
+// ============================================================
+
+from std.math import matZeros, matOnes, matEye, matFromRows, matGet, matSet, matAdd, matSub, matMulElem, matScale, matAddScalar, matMul, matTranspose, matSum, matMean, matMin, matMax, matArgMin, matArgMax, matRowSums, matColSums, arrayMean, variance, popVariance, stddev, popStddev, median, lerp, normalize, fact, comb, gcd, lcm, isPrime, nearly, epsDefault
+from std.array import arrIndexesOf, arrFind, arrSum, arrAvg, arrMin, arrMax, arrIsEmpty, arrTake, arrDrop, arrUnique, arrFlatten, arrRepeat, arrSorted, arrSortedDesc, arrMapMul, arrMapAdd, arrMapAbs, arrMapInt, arrMapFloat, arrMapStr, arrFilterEq, arrFilterNot, arrFilterGt, arrFilterLt, arrJoin, arrProduct, arrShuffle, arrSample, arrSampleN, nullValue, arrUnion, arrIntersect, arrDiff, arrChunk, arrCol, arrRow
+from std.str import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from std.conv import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+from std.fs import fsJoin, fsJoinAll, fsBaseName, fsDirName, fsExtName, fsIsAbsolute, fsNormalize, fsReadLines, fsSplitLines, fsWriteLines, fsAppendLine, fsReadText, fsWriteDeep, fsEnsureDir, fsListFiles, fsListDirs, fsListByExt, fsWalk, fsDirStats, fsTouch, fsWriteIfChanged, fsFindLine, fsParseKV, fsKVGet, fsCopy, fsTempPath
+from std.text.doc import Doc, txtLen, txtEolName
+from std.text.codeview import CodeView
+from std.text.find import findAllIn, countIn, findNextIn, findPrevIn, replaceOne, replaceAll
+from std.text.highlight import hlLine, hlStates, hlLangFromPath, hlLangName
+from std.text.keys import keyCode, keyChar, keyMods, keyHasChar, keyName, modCtrl, modShift, modAlt
+from std.ui.index import Theme, Rect, MenuBar, Menu, Toolbar, Tabs, StatusBar, Field, Button
+from std.ui.index import rectOf, menuLabel, uiTextLeft, BTN_PRIMARY, BTN_GHOST
+
+// ============================================================
+// 一、打印与核心（自由内建的多态包装）
+// ============================================================
+
+// 输出一行（自动换行）。参数任意类型。
+// 多参数打印 P0 包不了（没有可变参数），需要时用英文 println。
+fn 打印行(x: Any) -> Void {
+    println(x)
+}
+
+// 输出但不换行。
+fn 打印(x: Any) -> Void {
+    print(x)
+}
+
+// 任何值转成字符串。
+fn 转字符串(x: Any) -> String {
+    return toString(x)
+}
+
+// 转整数。字符串按解析算，浮点向零截断，布尔 真=1 假=0。
+fn 转整数(x: Any) -> Int {
+    return toInt(x)
+}
+
+// 转浮点。
+fn 转浮点(x: Any) -> Float {
+    return toFloat(x)
+}
+
+// 长度。字符串是 UTF-8 字节数，数组是元素个数。
+fn 长度(xs: Any) -> Int {
+    return len(xs)
+}
+
+// 建一个长度 n、每个元素都是 填充 的数组。
+fn 建数组(n: Int, 填充: Any) -> Array {
+    return array(n, 填充)
+}
+
+// ============================================================
+// 二、数学（math 单入口的具名包装）
+// ============================================================
+//
+// 标量数学走 `math(操作名, 参数...)` 单入口。zh 在这里把它摊平
+// 成具名函数 —— 调用点读起来是 开方(9.0)，不再是 math(sqrt, 9.0)。
+
+fn 开方(x: Float) -> Float {
+    return math(sqrt, x)
+}
+
+fn 幂(a: Float, b: Float) -> Float {
+    return math(pow, a, b)
+}
+
+fn 立方根(x: Float) -> Float {
+    return math(cbrt, x)
+}
+
+fn 向下取整(x: Float) -> Int {
+    return math(floor, x)
+}
+
+fn 向上取整(x: Float) -> Int {
+    return math(ceil, x)
+}
+
+fn 四舍五入(x: Float) -> Int {
+    return math(round, x)
+}
+
+fn 截断小数(x: Float) -> Int {
+    return math(trunc, x)
+}
+
+fn 正弦(x: Float) -> Float {
+    return math(sin, x)
+}
+
+fn 余弦(x: Float) -> Float {
+    return math(cos, x)
+}
+
+fn 正切(x: Float) -> Float {
+    return math(tan, x)
+}
+
+fn 反正弦(x: Float) -> Float {
+    return math(asin, x)
+}
+
+fn 反余弦(x: Float) -> Float {
+    return math(acos, x)
+}
+
+fn 反正切(x: Float) -> Float {
+    return math(atan, x)
+}
+
+fn 自然对数(x: Float) -> Float {
+    return math(log, x)
+}
+
+fn 二进对数(x: Float) -> Float {
+    return math(log2, x)
+}
+
+fn 常用对数(x: Float) -> Float {
+    return math(log10, x)
+}
+
+fn 指数(x: Float) -> Float {
+    return math(exp, x)
+}
+
+fn 斜边长(a: Float, b: Float) -> Float {
+    return math(hypot, a, b)
+}
+
+fn 浮点求余(a: Float, b: Float) -> Float {
+    return math(fmod, a, b)
+}
+
+// ---- 类型保持组（Any 进、原类型出）----
+//
+// math(min/max/abs) 与 arrPop 的返回类型跟随输入，只有 Any 返回
+// 类型能透传。下游做算术前编译期不再查类型 —— 要强类型就用
+// 英文 abs / min / max。
+
+fn 绝对值(x: Any) -> Any {
+    return math(abs, x)
+}
+
+fn 最小值(a: Any, b: Any) -> Any {
+    return math(min, a, b)
+}
+
+fn 最大值(a: Any, b: Any) -> Any {
+    return math(max, a, b)
+}
+
+// 符号：负 → -1，零 → 0，正 → 1（math 表固定返回 Int）。
+fn 符号(x: Any) -> Int {
+    return math(sign, x)
+}
+
+// ============================================================
+// 三、数论与统计（std.math / std.array）
+// ============================================================
+
+fn 阶乘(n: Int) -> Float {
+    return fact(n)
+}
+
+fn 组合数(n: Int, k: Int) -> Float {
+    return comb(n, k)
+}
+
+fn 最大公约数(a: Int, b: Int) -> Int {
+    return gcd(a, b)
+}
+
+fn 最小公倍数(a: Int, b: Int) -> Int {
+    return lcm(a, b)
+}
+
+fn 是质数(n: Int) -> Bool {
+    return isPrime(n)
+}
+
+// 浮点比较不能用 ==，用这个 + 容差。
+fn 近似相等(a: Float, b: Float, 容差: Float) -> Bool {
+    return nearly(a, b, 容差)
+}
+
+fn 线性插值(a: Float, b: Float, t: Float) -> Float {
+    return lerp(a, b, t)
+}
+
+// 把 x 从 [下限, 上限] 归一化到 [0, 1]。
+fn 归一化(x: Float, 下限: Float, 上限: Float) -> Float {
+    return normalize(x, 下限, 上限)
+}
+
+// ---- 数值统计（数组按 Float 累计）----
+
+fn 求和(xs: Array) -> Float {
+    return arrSum(xs)
+}
+
+fn 平均值(xs: Array) -> Float {
+    return arrayMean(xs)
+}
+
+fn 方差(xs: Array) -> Float {
+    return variance(xs)
+}
+
+fn 总体方差(xs: Array) -> Float {
+    return popVariance(xs)
+}
+
+fn 标准差(xs: Array) -> Float {
+    return stddev(xs)
+}
+
+fn 总体标准差(xs: Array) -> Float {
+    return popStddev(xs)
+}
+
+fn 中位数(xs: Array) -> Float {
+    return median(xs)
+}
+
+fn 数值最大值(xs: Array) -> Float {
+    return arrMax(xs)
+}
+
+fn 数值最小值(xs: Array) -> Float {
+    return arrMin(xs)
+}
+
+fn 数值乘积(xs: Array) -> Float {
+    return arrProduct(xs)
+}
+
+// ============================================================
+// 四、矩阵（std.math，行优先扁平数组）
+// ============================================================
+//
+// P0 没有结构体，矩阵 = 长度 rows*cols 的一维数组，元素 (r,c)
+// 在下标 r*cols + c。每个函数显式收行列数，不打包成对象。
+
+fn 零矩阵(rows: Int, cols: Int) -> Array {
+    return matZeros(rows, cols)
+}
+
+fn 全一矩阵(rows: Int, cols: Int) -> Array {
+    return matOnes(rows, cols)
+}
+
+fn 单位矩阵(rows: Int, cols: Int) -> Array {
+    return matEye(rows, cols)
+}
+
+fn 矩阵加(a: Array, b: Array) -> Array {
+    return matAdd(a, b)
+}
+
+fn 矩阵减(a: Array, b: Array) -> Array {
+    return matSub(a, b)
+}
+
+fn 对位乘(a: Array, b: Array) -> Array {
+    return matMulElem(a, b)
+}
+
+fn 矩阵缩放(m: Array, k: Float) -> Array {
+    return matScale(m, k)
+}
+
+fn 矩阵乘(a: Array, a行: Int, a列: Int, b: Array, b列: Int) -> Array {
+    return matMul(a, a行, a列, b, b列)
+}
+
+fn 转置(m: Array, rows: Int, cols: Int) -> Array {
+    return matTranspose(m, rows, cols)
+}
+
+fn 取元素(m: Array, cols: Int, r: Int, c: Int) -> Float {
+    return matGet(m, cols, r, c)
+}
+
+fn 设元素(m: Array, cols: Int, r: Int, c: Int, v: Float) -> Void {
+    matSet(m, cols, r, c, v)
+}
+
+// ============================================================
+// 五、字符串（str* 内建 + std.str）
+// ============================================================
+//
+// 所有下标按**码点**算（一个汉字是一个），不是字节 —— 与编辑器
+// 光标一致。区间一律左闭右开。
+
+fn 取字符(s: String, i: Int) -> String {
+    return strAt(s, i)
+}
+
+// 左闭右开：取子串("中文编程", 0, 2) == "中文"。
+fn 取子串(s: String, 起点: Int, 终点: Int) -> String {
+    return strSub(s, 起点, 终点)
+}
+
+// 重载一：子串第一次出现的码点下标，找不到返回 -1。
+fn 查找(s: String, 子: String) -> Int {
+    return strFind(s, 子)
+}
+
+// 重载二：元素第一次出现的下标，找不到返回 -1。
+fn 查找(xs: Array, v: Any) -> Int {
+    return arrIndexOf(xs, v)
+}
+
+// 从指定下标开始找。
+fn 查找自(s: String, 子: String, 起点: Int) -> Int {
+    return strFindFrom(s, 子, 起点)
+}
+
+fn 切分(s: String, 分隔: String) -> Array {
+    return strSplit(s, 分隔)
+}
+
+// 数组元素转字符串后用 分隔 连接。
+fn 拼接(xs: Array, 分隔: String) -> String {
+    return strJoin(xs, 分隔)
+}
+
+fn 转大写(s: String) -> String {
+    return strUpper(s)
+}
+
+fn 转小写(s: String) -> String {
+    return strLower(s)
+}
+
+fn 去首尾空白(s: String) -> String {
+    return strTrim(s)
+}
+
+fn 替换(s: String, 旧: String, 新: String) -> String {
+    return strReplace(s, 旧, 新)
+}
+
+fn 开头是(s: String, 前缀: String) -> Bool {
+    return strStarts(s, 前缀)
+}
+
+fn 结尾是(s: String, 后缀: String) -> Bool {
+    return strEnds(s, 后缀)
+}
+
+fn 重复(s: String, n: Int) -> String {
+    return strRepeat(s, n)
+}
+
+// 单字符 → Unicode 码点。
+fn 字符码(c: String) -> Int {
+    return strCode(c)
+}
+
+// Unicode 码点 → 单字符。
+fn 码转字符(n: Int) -> String {
+    return strFromCode(n)
+}
+
+// 字符串 → 整数，解析不了返回 0。
+fn 解析整数(s: String) -> Int {
+    return strParseInt(s)
+}
+
+// 字符串 → 浮点，解析不了返回 0.0。
+fn 解析浮点(s: String) -> Float {
+    return strParseFloat(s)
+}
+
+fn 是空串(s: String) -> Bool {
+    return strIsEmpty(s)
+}
+
+// 只含空白（或长度为 0）才算真 —— 与 是空串 的区别。
+fn 是空白串(s: String) -> Bool {
+    return strIsBlank(s)
+}
+
+fn 左补齐(s: String, 宽: Int, 补: String) -> String {
+    return strPadLeft(s, 宽, 补)
+}
+
+fn 右补齐(s: String, 宽: Int, 补: String) -> String {
+    return strPadRight(s, 宽, 补)
+}
+
+fn 居中补齐(s: String, 宽: Int, 补: String) -> String {
+    return strPadCenter(s, 宽, 补)
+}
+
+// 显示宽度：汉字占 2，ASCII 占 1 —— 与终端实际渲染一致。
+fn 显示宽度(s: String) -> Int {
+    return strDisplayWidth(s)
+}
+
+fn 出现次数(s: String, 子: String) -> Int {
+    return strCount(s, 子)
+}
+
+fn 反转(s: String) -> String {
+    return strReverse(s)
+}
+
+fn 行数(s: String) -> Int {
+    return strLineCount(s)
+}
+
+// ============================================================
+// 六、数组（arr* 内建 + std.array）
+// ============================================================
+//
+// 原地修改类（追加/插入/倒转/排序/填充/洗牌）直接改数组本体；
+// 返回新数组的（取段/合并/去重/...）不动原数组。
+
+// 尾部追加一个元素，返回新长度。**原地修改**。
+fn 追加(xs: Array, v: Any) -> Int {
+    return arrPush(xs, v)
+}
+
+// 在下标 i 处插入，返回新长度。**原地修改**。
+fn 插入(xs: Array, i: Int, v: Any) -> Int {
+    return arrInsert(xs, i, v)
+}
+
+// 删除下标 i 处的元素。**原地修改**。
+fn 移除(xs: Array, i: Int) -> Any {
+    return arrRemove(xs, i)
+}
+
+// 取 [起点, 终点) 的元素，负数与越界钳制。返回新数组。
+fn 取段(xs: Array, 起点: Int, 终点: Int) -> Array {
+    return arrSlice(xs, 起点, 终点)
+}
+
+// 两个数组首尾相接。返回新数组。
+fn 合并(a: Array, b: Array) -> Array {
+    return arrConcat(a, b)
+}
+
+// 原地反转。
+fn 倒转(xs: Array) -> Void {
+    arrReverse(xs)
+}
+
+// 原地升序排序。
+fn 排序(xs: Array) -> Void {
+    arrSort(xs)
+}
+
+// 深拷贝一份。
+fn 复制(xs: Array) -> Array {
+    return arrCopy(xs)
+}
+
+fn 包含(xs: Array, v: Any) -> Bool {
+    return arrContains(xs, v)
+}
+
+// 把所有元素设为 v。**原地修改**。
+fn 填充(xs: Array, v: Any) -> Void {
+    arrFill(xs, v)
+}
+
+// v 出现的所有下标。
+fn 所有下标(xs: Array, v: Int) -> Array {
+    return arrIndexesOf(xs, v)
+}
+
+fn 是空数组(xs: Array) -> Bool {
+    return arrIsEmpty(xs)
+}
+
+// 取前 n 个 / 去掉前 n 个。都返回新数组。
+fn 取前n个(xs: Array, n: Int) -> Array {
+    return arrTake(xs, n)
+}
+
+fn 去前n个(xs: Array, n: Int) -> Array {
+    return arrDrop(xs, n)
+}
+
+// 保留首次出现，去掉后面的重复。返回新数组。
+fn 去重(xs: Array) -> Array {
+    return arrUnique(xs)
+}
+
+// 二维拍平成一维。
+fn 展平(xs: Array) -> Array {
+    return arrFlatten(xs)
+}
+
+// 重复 的数组重载：整个数组重复 n 遍。
+fn 重复(xs: Array, n: Int) -> Array {
+    return arrRepeat(xs, n)
+}
+
+// 排好序的**副本**（原数组不动 —— 与 排序 的原地版区分）。
+fn 已排序(xs: Array) -> Array {
+    return arrSorted(xs)
+}
+
+fn 降序排序(xs: Array) -> Array {
+    return arrSortedDesc(xs)
+}
+
+// 原地随机打乱。
+fn 洗牌(xs: Array) -> Void {
+    arrShuffle(xs)
+}
+
+// 随机抽 n 个（不重复）。
+fn 抽取(xs: Array, n: Int) -> Array {
+    return arrSampleN(xs, n)
+}
+
+fn 并集(a: Array, b: Array) -> Array {
+    return arrUnion(a, b)
+}
+
+fn 交集(a: Array, b: Array) -> Array {
+    return arrIntersect(a, b)
+}
+
+// a 有 b 没有的元素。
+fn 差集(a: Array, b: Array) -> Array {
+    return arrDiff(a, b)
+}
+
+// 把一维数组按每 cols 个一行分块。
+fn 分块(xs: Array, cols: Int) -> Array {
+    return arrChunk(xs, cols)
+}
+
+// 行优先扁平矩阵的行 / 列。
+fn 取行(xs: Array, cols: Int, r: Int) -> Array {
+    return arrRow(xs, cols, r)
+}
+
+fn 取列(xs: Array, rows: Int, cols: Int, c: Int) -> Array {
+    return arrCol(xs, rows, cols, c)
+}
+
+// ---- 逐元素映射与筛选 ----
+//
+// 语言还没有闭包，所以「对每个元素做 X」是一组具名函数。
+// 这是当前语言形态下唯一正确的做法（std.array 顶部注释有完整论证）。
+
+fn 每项乘(xs: Array, k: Float) -> Array {
+    return arrMapMul(xs, k)
+}
+
+fn 每项加(xs: Array, k: Float) -> Array {
+    return arrMapAdd(xs, k)
+}
+
+fn 每项取绝对值(xs: Array) -> Array {
+    return arrMapAbs(xs)
+}
+
+fn 每项转整数(xs: Array) -> Array {
+    return arrMapInt(xs)
+}
+
+fn 每项转浮点(xs: Array) -> Array {
+    return arrMapFloat(xs)
+}
+
+fn 每项转字符串(xs: Array) -> Array {
+    return arrMapStr(xs)
+}
+
+fn 筛选等于(xs: Array, v: Int) -> Array {
+    return arrFilterEq(xs, v)
+}
+
+fn 筛选不等于(xs: Array, v: Int) -> Array {
+    return arrFilterNot(xs, v)
+}
+
+fn 筛选大于(xs: Array, v: Float) -> Array {
+    return arrFilterGt(xs, v)
+}
+
+fn 筛选小于(xs: Array, v: Float) -> Array {
+    return arrFilterLt(xs, v)
+}
+
+// ============================================================
+// 七、文件（fs* 内建 + std.fs）
+// ============================================================
+
+// 读整个文件为 UTF-8 文本，读不到直接报错。
+fn 读文件(p: String) -> String {
+    return fsRead(p)
+}
+
+// 读不到返回 缺省 而不是报错。
+fn 读文件或(p: String, 缺省: String) -> String {
+    return fsReadOr(p, 缺省)
+}
+
+// 整体覆盖写。返回是否成功。
+fn 写文件(p: String, s: String) -> Bool {
+    return fsWrite(p, s)
+}
+
+fn 追加写(p: String, s: String) -> Bool {
+    return fsAppend(p, s)
+}
+
+fn 存在吗(p: String) -> Bool {
+    return fsExists(p)
+}
+
+fn 是目录吗(p: String) -> Bool {
+    return fsIsDir(p)
+}
+
+fn 删除文件(p: String) -> Bool {
+    return fsRemove(p)
+}
+
+// 字节数。
+fn 文件大小(p: String) -> Int {
+    return fsSize(p)
+}
+
+// 目录下的文件与子目录名。返回新数组。
+fn 列目录(p: String) -> Array {
+    return fsList(p)
+}
+
+// 单层目录，父目录必须已存在。
+fn 建目录(p: String) -> Bool {
+    return fsMkdir(p)
+}
+
+// 逐级建齐整条路径。
+fn 确保目录(p: String) -> Bool {
+    return fsEnsureDir(p)
+}
+
+// 自动补缺失的父目录。
+fn 深度写(p: String, s: String) -> Bool {
+    return fsWriteDeep(p, s)
+}
+
+fn 按行读(p: String) -> Array {
+    return fsReadLines(p)
+}
+
+fn 按行写(p: String, 行集: Array) -> Bool {
+    return fsWriteLines(p, 行集)
+}
+
+fn 追加一行(p: String, 行: String) -> Bool {
+    return fsAppendLine(p, 行)
+}
+
+fn 拼路径(a: String, b: String) -> String {
+    return fsJoin(a, b)
+}
+
+fn 取文件名(p: String) -> String {
+    return fsBaseName(p)
+}
+
+fn 取目录名(p: String) -> String {
+    return fsDirName(p)
+}
+
+fn 取扩展名(p: String) -> String {
+    return fsExtName(p)
+}
+
+// ============================================================
+// 八、时间与随机
+// ============================================================
+
+// [0, 1) 随机浮点。
+fn 随机数() -> Float {
+    return random()
+}
+
+fn 设随机种子(n: Int) -> Void {
+    randomSeed(n)
+}
+
+fn 当前毫秒() -> Int {
+    return nowMillis()
+}
+
+// Unix epoch 起的秒数。
+fn 当前秒() -> Int {
+    return nowSeconds()
+}
+
+// 单调时钟 —— 计时用这个，不受系统改时间影响。
+fn 单调毫秒() -> Int {
+    return monoMillis()
+}
+
+fn 睡眠(ms: Int) -> Void {
+    sleep(ms)
+}
+
+// 弹出尾部元素并返回它（**原地修改**）。空数组的行为与 arrPop 一致。
+fn 弹出(xs: Array) -> Any {
+    return arrPop(xs)
+}
+
+// ============================================================
+// 九、转换（std.conv）
+// ============================================================
+
+// 解析失败返回 缺省 而不是 0 —— 适合「配置项读不出就用默认值」。
+fn 转整数或(s: String, 缺省: Int) -> Int {
+    return toIntOr(s, 缺省)
+}
+
+fn 转浮点或(s: String, 缺省: Float) -> Float {
+    return toFloatOr(s, 缺省)
+}
+
+// 只认英文布尔字面量（不区分大小写）："true"/"yes"/"y"/"on"/"1" → 真，
+// 其余一律假（与 toBool 逐字节一致）。中文「是/否」**不是**布尔字面量
+// —— 转换层不做智能猜测（04 §5：中英混排自动转换明确不做）。
+fn 转布尔(s: String) -> Bool {
+    return toBool(s)
+}
+
+fn 转布尔或(s: String, 缺省: Bool) -> Bool {
+    return toBoolOr(s, 缺省)
+}
+
+fn 转十六进制(n: Int) -> String {
+    return toHex(n)
+}
+
+fn 转二进制(n: Int) -> String {
+    return toBin(n)
+}
+
+fn 转八进制(n: Int) -> String {
+    return toOct(n)
+}
+
+fn 从十六进制(s: String) -> Int {
+    return fromHex(s)
+}
+
+fn 从二进制(s: String) -> Int {
+    return fromBin(s)
+}
+
+fn 补零(n: Int, 宽: Int) -> String {
+    return padZero(n, 宽)
+}
+
+// 固定小数位输出，如 保留小数(3.14159, 2) == "3.14"。
+fn 保留小数(x: Float, 位: Int) -> String {
+    return fixed(x, 位)
+}
+
+fn 千分位(n: Int) -> String {
+    return thousands(n)
+}
+
+fn 百分比(x: Float, 位: Int) -> String {
+    return percent(x, 位)
+}
+
+fn 布尔转字符串(b: Bool) -> String {
+    return boolToString(b)
+}
+
+// 整个字符串长得像整数 / 浮点（用于输入校验，比先解析再回滚干净）。
+fn 是整数样(s: String) -> Bool {
+    return convIsIntLike(s)
+}
+
+fn 是浮点样(s: String) -> Bool {
+    return convIsFloatLike(s)
+}
+
+// ============================================================
+// 十、文本编辑器：文档、查找、高亮与按键
+// ============================================================
+//
+// 这些类型只保存英文对象本体，公开方法与访问器全部使用中文。
+// 字段读写也经过访问器，避免应用层重新出现 path/lang/dirty 等名字。
+
+const 语言纯文本 = 0
+const 语言自研 = 1
+const 语言西 = 2
+const 语言数据 = 3
+const 语言网页 = 4
+const 语言蟒蛇 = 5
+const 语言标记 = 6
+const 语言配置 = 7
+
+const 着色关键字 = 1
+const 着色字符串 = 2
+const 着色注释 = 3
+const 着色数字 = 4
+const 着色函数 = 5
+const 着色标签 = 8
+const 着色键 = 10
+
+const 键退格 = 8
+const 键制表 = 9
+const 键回车 = 13
+const 键退出 = 27
+const 键上页 = 33
+const 键下页 = 34
+const 键末尾 = 35
+const 键开头 = 36
+const 键左 = 37
+const 键上 = 38
+const 键右 = 39
+const 键下 = 40
+const 键删除 = 46
+const 键功能3 = 114
+const 键全选 = 65
+const 键复制 = 67
+const 键复制行 = 68
+const 键查找 = 70
+const 键跳转 = 71
+const 键替换 = 72
+const 键删除行 = 76
+const 键新建 = 78
+const 键打开 = 79
+const 键注释 = 81
+const 键保存 = 83
+const 键大写 = 85
+const 键粘贴 = 86
+const 键关闭 = 87
+const 键剪切 = 88
+const 键重做 = 89
+const 键撤销 = 90
+const 键主键盘加 = 187
+const 键主键盘减 = 189
+const 键小键盘加 = 107
+const 键小键盘减 = 109
+const 键零 = 48
+
+class 文档 {
+    值: Doc,
+
+    constructor() {
+        self.值 = new Doc()
+    }
+
+    fn 行数() -> Int { return self.值.lineCount() }
+    fn 行内容(i: Int) -> String { return self.值.lineAt(i) }
+    fn 当前行() -> String { return self.值.curLine() }
+    fn 标题() -> String { return self.值.title() }
+    fn 文本() -> String { return self.值.text() }
+    fn 设文本(s: String) { self.值.setText(s) }
+    fn 字数() -> Int { return self.值.charCount() }
+    fn 词数() -> Int { return self.值.wordCount() }
+
+    fn 名称() -> String { return self.值.name }
+    fn 设名称(s: String) { self.值.name = s }
+    fn 路径() -> String { return self.值.path }
+    fn 设路径(s: String) { self.值.path = s }
+    fn 语言() -> Int { return self.值.lang }
+    fn 设语言(n: Int) { self.值.lang = n }
+    fn 已修改() -> Bool { return self.值.dirty }
+    fn 设已修改(b: Bool) { self.值.dirty = b }
+    fn 光标行() -> Int { return self.值.ln }
+    fn 光标列() -> Int { return self.值.col }
+    fn 换行方式() -> Int { return self.值.eol }
+    fn 设换行方式(n: Int) { self.值.eol = n }
+
+    fn 有选区() -> Bool { return self.值.hasSel() }
+    fn 清除选区() { self.值.clearSel() }
+    fn 选区起点() -> Array { return self.值.selStart() }
+    fn 选区终点() -> Array { return self.值.selEnd() }
+    fn 选中文本() -> String { return self.值.selText() }
+    fn 选中字数() -> Int { return self.值.selCharCount() }
+    fn 选中行范围() -> Array { return self.值.selLineRange() }
+    fn 设光标(行: Int, 列: Int, 扩展: Int) { self.值.setCursor(行, 列, 扩展) }
+    fn 选区(起行: Int, 起列: Int, 止行: Int, 止列: Int) {
+        self.值.selectRange(起行, 起列, 止行, 止列)
+    }
+    fn 全选() { self.值.selectAll() }
+
+    fn 可撤销() -> Bool { return self.值.canUndo() }
+    fn 可重做() -> Bool { return self.值.canRedo() }
+    fn 撤销() { self.值.undo() }
+    fn 重做() { self.值.redo() }
+    fn 编辑前() { self.值.beforeEdit() }
+    fn 静默删选区() -> Bool { return self.值.deleteSelSilent() }
+    fn 插入文本(s: String) { self.值.insertText(s) }
+    fn 换行() { self.值.newline() }
+    fn 退格() -> Bool { return self.值.backspace() }
+    fn 向后删除() -> Bool { return self.值.deleteForward() }
+
+    fn 缩进() { self.值.tabIndent() }
+    fn 减少缩进() { self.值.tabUnindent() }
+    fn 复制当前行() { self.值.duplicateLine() }
+    fn 删除当前行() { self.值.deleteLine() }
+    fn 上移当前行() { self.值.moveLineUp() }
+    fn 下移当前行() { self.值.moveLineDown() }
+    fn 切换注释(前缀: String, 后缀: String) { self.值.toggleComment(前缀, 后缀) }
+    fn 排序选中行() { self.值.sortLines() }
+    fn 删除行尾空白() { self.值.trimTrailing() }
+    fn 选区转大写() { self.值.toUpperSel() }
+    fn 选区转小写() { self.值.toLowerSel() }
+    fn 转换换行(方式: Int) { self.值.convertEol(方式) }
+
+    fn 左移(扩展: Int) { self.值.moveLeft(扩展) }
+    fn 右移(扩展: Int) { self.值.moveRight(扩展) }
+    fn 上移(扩展: Int) { self.值.moveUp(扩展) }
+    fn 下移(扩展: Int) { self.值.moveDown(扩展) }
+    fn 到行首(扩展: Int) { self.值.moveHome(扩展) }
+    fn 到行尾(扩展: Int) { self.值.moveEnd(扩展) }
+    fn 到文首(扩展: Int) { self.值.moveDocStart(扩展) }
+    fn 到文末(扩展: Int) { self.值.moveDocEnd(扩展) }
+    fn 上页(行数: Int, 扩展: Int) { self.值.pageUp(行数, 扩展) }
+    fn 下页(行数: Int, 扩展: Int) { self.值.pageDown(行数, 扩展) }
+    fn 跳到行(n: Int) { self.值.gotoLine(n) }
+}
+
+fn 文本长度(s: String) -> Int { return txtLen(s) }
+fn 换行名(方式: Int) -> String { return txtEolName(方式) }
+
+fn 查找全部(d: 文档, 词: String, 区分: Int, 全词: Int) -> Array {
+    return findAllIn(d.值, 词, 区分, 全词)
+}
+
+fn 匹配数(d: 文档, 词: String, 区分: Int, 全词: Int) -> Int {
+    return countIn(d.值, 词, 区分, 全词)
+}
+
+fn 查找下一个(d: 文档, 词: String, 区分: Int, 全词: Int, 循环: Int) -> Bool {
+    return findNextIn(d.值, 词, 区分, 全词, 循环)
+}
+
+fn 查找上一个(d: 文档, 词: String, 区分: Int, 全词: Int, 循环: Int) -> Bool {
+    return findPrevIn(d.值, 词, 区分, 全词, 循环)
+}
+
+fn 替换一处(d: 文档, 词: String, 新文: String, 区分: Int, 全词: Int) -> Bool {
+    return replaceOne(d.值, 词, 新文, 区分, 全词)
+}
+
+fn 替换全部(d: 文档, 词: String, 新文: String, 区分: Int, 全词: Int) -> Int {
+    return replaceAll(d.值, 词, 新文, 区分, 全词)
+}
+
+fn 语言自路径(路径: String) -> Int { return hlLangFromPath(路径) }
+fn 语言名(语言: Int) -> String { return hlLangName(语言) }
+fn 高亮行(行: String, 语言: Int, 状态: Int) -> Array { return hlLine(行, 语言, 状态) }
+fn 高亮状态(行集: Array, 语言: Int) -> Array { return hlStates(行集, 语言) }
+
+fn 键码(事件: Array) -> Int { return keyCode(事件) }
+fn 键字符(事件: Array) -> String { return keyChar(事件) }
+fn 键修饰(事件: Array) -> Int { return keyMods(事件) }
+fn 键有字符(事件: Array) -> Bool { return keyHasChar(事件) }
+fn 键名(键: Int) -> String { return keyName(键) }
+fn 按控制(修饰: Int) -> Bool { return modCtrl(修饰) }
+fn 按上档(修饰: Int) -> Bool { return modShift(修饰) }
+fn 按交替(修饰: Int) -> Bool { return modAlt(修饰) }
+
+// ============================================================
+// 十一、编辑器界面：几何、主题、视图与控件
+// ============================================================
+
+class 矩形 {
+    值: Rect,
+
+    constructor(x: Int, y: Int, 宽: Int, 高: Int) {
+        self.值 = rectOf(x, y, 宽, 高)
+    }
+
+    fn 横() -> Int { return self.值.x }
+    fn 纵() -> Int { return self.值.y }
+    fn 宽() -> Int { return self.值.w }
+    fn 高() -> Int { return self.值.h }
+    fn 包含(x: Int, y: Int) -> Bool { return self.值.contains(x, y) }
+}
+
+class 主题 {
+    值: Theme,
+
+    constructor(深: Bool) {
+        if (深) { self.值 = Theme.dark() } else { self.值 = Theme.light() }
+    }
+
+    static fn 深色() -> 主题 { return new 主题(true) }
+    static fn 浅色() -> 主题 { return new 主题(false) }
+
+    fn 背景() -> Int { return self.值.bg }
+    fn 面板() -> Int { return self.值.surface }
+    fn 边框() -> Int { return self.值.border }
+    fn 次要文字() -> Int { return self.值.textDim }
+}
+
+class 代码视图 {
+    值: CodeView,
+
+    constructor(区域: 矩形, d: 文档) {
+        self.值 = new CodeView(区域.值, d.值)
+    }
+
+    fn 行数() -> Int { return self.值.rows() }
+    fn 更新行号宽() { self.值.updateGutter() }
+    fn 设状态(状态: Array) { self.值.states = 状态 }
+    fn 设滚动(行: Int, 横向: Int) {
+        self.值.scrollLine = 行
+        self.值.scrollX = 横向
+    }
+    fn 设文档(d: 文档) { self.值.doc = d.值 }
+    fn 设区域(区域: 矩形) { self.值.r = 区域.值 }
+    fn 切换行号() {
+        self.值.showLineNumbers = !self.值.showLineNumbers
+        self.值.updateGutter()
+    }
+    fn 确保可见() { self.值.ensureVisible() }
+    fn 滚轮(行: Int) { self.值.wheel(行) }
+    fn 按下(x: Int, y: Int) -> Bool { return self.值.onPress(x, y) }
+    fn 拖动(x: Int, y: Int) { self.值.onDrag(x, y) }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+class 菜单栏 {
+    值: MenuBar,
+
+    constructor(区域: 矩形, 项目: Array) {
+        self.值 = new MenuBar(区域.值, 项目)
+    }
+
+    fn 设区域(区域: 矩形) { self.值.r = 区域.值 }
+    fn 项区域(i: Int) -> 矩形 {
+        let r: Rect = self.值.itemRect(i)
+        return new 矩形(r.x, r.y, r.w, r.h)
+    }
+    fn 索引于(x: Int, y: Int) -> Int { return self.值.indexAt(x, y) }
+    fn 更新悬停(x: Int, y: Int) { self.值.updateHover(x, y) }
+    fn 打开序号() -> Int { return self.值.openIndex }
+    fn 设打开序号(i: Int) { self.值.openIndex = i }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+class 菜单 {
+    值: Menu,
+
+    constructor(项目: Array) {
+        self.值 = new Menu(项目)
+    }
+
+    fn 项目() -> Array { return self.值.items }
+    fn 设项目(项目: Array) { self.值.items = 项目 }
+    fn 打开于(x: Int, y: Int) { self.值.openAt(x, y) }
+    fn 关闭() { self.值.close() }
+    fn 点击(x: Int, y: Int) -> Int { return self.值.click(x, y) }
+    fn 弹出区域() -> 矩形 {
+        let r: Rect = self.值.popupRect()
+        return new 矩形(r.x, r.y, r.w, r.h)
+    }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+class 工具栏 {
+    值: Toolbar,
+
+    constructor(区域: 矩形, 项目: Array) {
+        self.值 = new Toolbar(区域.值, 项目)
+    }
+
+    fn 设区域(区域: 矩形) { self.值.r = 区域.值 }
+    fn 项目() -> Array { return self.值.items }
+    fn 点击(x: Int, y: Int) -> Int { return self.值.click(x, y) }
+    fn 项文字(s: String) -> String { return self.值.itemText(s) }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+class 标签条 {
+    值: Tabs,
+
+    constructor(区域: 矩形, 标签: Array) {
+        self.值 = new Tabs(区域.值, 标签)
+    }
+
+    fn 设区域(区域: 矩形) { self.值.r = 区域.值 }
+    fn 内容区域() -> 矩形 {
+        let r: Rect = self.值.content()
+        return new 矩形(r.x, r.y, r.w, r.h)
+    }
+    fn 点击(x: Int, y: Int) -> Bool { return self.值.click(x, y) }
+    fn 当前() -> Int { return self.值.current() }
+    fn 设标签(标签: Array) { self.值.labels = 标签 }
+    fn 设选中(i: Int) { self.值.selected = i }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+class 状态栏 {
+    值: StatusBar,
+
+    constructor(区域: 矩形) {
+        self.值 = new StatusBar(区域.值)
+    }
+
+    fn 设区域(区域: 矩形) { self.值.r = 区域.值 }
+    fn 设左侧(项目: Array) { self.值.setLeft(项目) }
+    fn 设右侧(项目: Array) { self.值.setRight(项目) }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+class 输入框 {
+    值: Field,
+
+    constructor(区域: 矩形) {
+        self.值 = Field.empty(区域.值)
+    }
+
+    fn 值文本() -> String { return self.值.value() }
+    fn 设值(s: String) { self.值.setValue(s) }
+    fn 设占位(s: String) { self.值.placeholder = s }
+    fn 设区域(区域: 矩形) { self.值.r = 区域.值 }
+    fn 命中(x: Int, y: Int) -> Bool { return self.值.hit(x, y) }
+    fn 点击于(x: Int, y: Int, 上档: Bool) { self.值.clickAt(x, y, 上档) }
+    fn 退格() -> Bool { return self.值.backspace() }
+    fn 向后删除() -> Bool { return self.值.deleteForward() }
+    fn 插入(s: String) -> Bool { return self.值.insert(s) }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+class 按钮 {
+    值: Button,
+
+    constructor(区域: 矩形, 文字: String) {
+        self.值 = new Button(区域.值, 文字)
+    }
+
+    static fn 主要(区域: 矩形, 文字: String) -> 按钮 {
+        let b = new 按钮(区域, 文字)
+        b.值.kind = BTN_PRIMARY
+        return b
+    }
+
+    static fn 次要(区域: 矩形, 文字: String) -> 按钮 {
+        return new 按钮(区域, 文字)
+    }
+
+    static fn 透明(区域: 矩形, 文字: String) -> 按钮 {
+        let b = new 按钮(区域, 文字)
+        b.值.kind = BTN_GHOST
+        return b
+    }
+
+    fn 设主要(是主要: Bool) {
+        if (是主要) { self.值.kind = BTN_PRIMARY } else { self.值.kind = BTN_GHOST }
+    }
+    fn 设区域(区域: 矩形) { self.值.r = 区域.值 }
+    fn 命中(x: Int, y: Int) -> Bool { return self.值.hit(x, y) }
+    fn 画(配色: 主题) { self.值.draw(配色.值) }
+}
+
+fn 菜单文字(s: String) -> String { return menuLabel(s) }
+fn 左写文字(区域: 矩形, 文字: String, 边距: Int, 颜色: Int) {
+    uiTextLeft(区域.值, 文字, 边距, 颜色)
+}
+
+// ============================================================
+// 十二、窗口、文件对话框与剪贴板
+// ============================================================
+
+fn 设窗口可缩放(启用: Int) -> Void { winSetResizable(启用) }
+fn 打开窗口(标题: String, 宽: Int, 高: Int) -> Bool { return winOpen(标题, 宽, 高) }
+fn 关闭窗口() -> Void { winClose() }
+fn 窗口应关闭() -> Bool { return winShouldClose() }
+fn 窗口宽度() -> Int { return winWidth() }
+fn 窗口高度() -> Int { return winHeight() }
+fn 设窗口标题(标题: String) -> Void { winSetTitle(标题) }
+fn 设窗口字体(字体: String, 字号: Int, 字重: Int) -> Bool {
+    return winSetFont(字体, 字号, 字重)
+}
+fn 取点击事件() -> Array { return winPollClick() }
+fn 取按键事件() -> Array { return winPollKey() }
+fn 取滚轮() -> Int { return winPollWheel() }
+fn 鼠标横() -> Int { return winMouseX() }
+fn 鼠标纵() -> Int { return winMouseY() }
+fn 开始帧() -> Void { winBeginFrame() }
+fn 结束帧() -> Void { winEndFrame() }
+fn 窗口暂停(毫秒: Int) -> Void { winSleep(毫秒) }
+fn 填充矩形(x: Int, y: Int, 宽: Int, 高: Int, 颜色: Int) -> Void {
+    winFillRect(x, y, 宽, 高, 颜色)
+}
+fn 窗口截图(路径: String) -> Bool { return winScreenshot(路径) }
+fn 消息框(标题: String, 内容: String, 类型: Int) -> Int {
+    return winMessage(标题, 内容, 类型)
+}
+fn 打开文件对话框(标题: String, 过滤: String, 初始: String) -> String {
+    return winOpenFile(标题, 过滤, 初始)
+}
+fn 保存文件对话框(标题: String, 过滤: String, 初始: String) -> String {
+    return winSaveFile(标题, 过滤, 初始)
+}
+fn 写剪贴板(s: String) -> Bool { return winClipSet(s) }
+fn 读剪贴板() -> String { return winClipGet() }
+
+// ============================================================
+// 包版本（供宿主程序探测，如 打印行(中文别名版本)）
+// ============================================================
+const 中文别名版本 = "0.1.0"

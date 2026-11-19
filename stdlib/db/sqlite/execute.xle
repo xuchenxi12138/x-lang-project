@@ -1,0 +1,359 @@
+// db/sqlite/execute.xle — 过滤、投影、聚合
+//
+// 本文件把「解析好的 SvQuery」套到「已解码的行」上。它不碰文件、
+// 不碰 B-tree，只做行集合的变换 —— 所以可以完全脱离数据库单测。
+//
+// ── 为什么比较要分类型做 ────────────────────────────
+//
+// SQL 的比较语义和字符串比较不同：
+//
+//   `WHERE age = 10`     要和整数 10 比（不是和字符串 "10"）
+//   `WHERE name = '10'`  要和文本 "10" 比
+//
+// 如果一律转成字符串比，`WHERE score > 9` 会把 100 判成「小于 9」
+// （因为 "100" < "9" 按字典序成立）。这是最常见的一类静默错误。
+
+from "record.xle" import svSerialKind, svSerialBytes, svReadRecord, svReadSignedBE, svReadDoubleBE, svRecordColCount, SvValue, SV_NULL, SV_INT, SV_FLOAT, SV_TEXT, SV_BLOB
+from "select.xle" import svParseSelect, svCollapseWs, svFindKeyword, svIdentEnd, svNormProjection, svParseCondition, svFindOperator, svNormLiteral, SvQuery
+from "../core/result.xle" import ResultSet
+
+// 判断一行是否匹配 WHERE。
+//
+// `vals` 是这一行的 SvValue 数组，`cols` 是列名。
+fn svRowMatches(vals: Array, cols: Array, q: SvQuery) -> Bool {
+    if (!q.hasWhere) { return true }
+
+    let idx = svColIndex(cols, q.whereCol)
+    if (idx < 0) {
+        // 列不存在：SQL 会报错，但这里没有报错通道，按「不匹配」
+        // 处理会让结果为空且无声 —— 所以返回 true 反而更糟。
+        //
+        // 折中：返回 false（不匹配）。调用方看到 0 行时，错误信息
+        // 由 driver 在「0 行且 hasWhere」时补一条提示。
+        return false
+    }
+    if (idx >= len(vals)) { return false }
+
+    let v: SvValue = vals[idx]
+    return svCompareValue(v, q.whereOp, q.whereVal)
+}
+
+// 列名 → 下标。大小写不敏感（SQL 的标识符默认不敏感）。
+fn svColIndex(cols: Array, name: String) -> Int {
+    let n = strLower(name)
+    var i = 0
+    while (i < len(cols)) {
+        if (strLower(toString(cols[i])) == n) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// 一个 SvValue 与一个 SQL 字面量比较。
+fn svCompareValue(v: SvValue, op: String, lit: String) -> Bool {
+    // NULL 与任何值比较都是 UNKNOWN（SQL 三值逻辑），WHERE 里视为
+    // 不匹配。这是规范行为，不是偷懒：`WHERE memo = NULL` 在真实
+    // SQLite 里也永远返回 0 行（要写 IS NULL）。
+    if (v.kind == SV_NULL) { return false }
+
+    // 数值列 + 数值字面量 → 按数值比
+    if (v.kind == SV_INT || v.kind == SV_FLOAT) {
+        let num = svParseNumber(lit)
+        if (num[0] == true) {
+            let a = svAsFloat(v)
+            let b = toFloat(num[1])
+            return svCmpFloat(a, op, b)
+        }
+        // 字面量不是数字：按文本比（SQL 会做类型亲和转换，
+        // 这里简化成文本比较）
+    }
+
+    // 文本 / BLOB / 非数值字面量 → 按文本比
+    let a = v.text()
+    return svCmpText(a, op, lit)
+}
+
+fn svAsFloat(v: SvValue) -> Float {
+    if (v.kind == SV_INT) { return toFloat(v.i) }
+    if (v.kind == SV_FLOAT) { return v.f }
+    return toFloatOr(v.text(), 0.0)
+}
+
+// 字面量是否是数字。返回 [是否, 值]。
+//
+// 用 strParseFloat 的容错来判断太宽松（"12abc" 可能被解析成 12），
+// 所以自己扫：允许可选负号、数字、一个小数点、可选的指数。
+fn svParseNumber(s: String) -> Array {
+    let t = strTrim(s)
+    if (len(t) == 0) { return [false, 0.0] }
+    var i = 0
+    if (strAt(t, 0) == "-" || strAt(t, 0) == "+") { i = 1 }
+    var digits = 0
+    var dots = 0
+    while (i < len(t)) {
+        let c = strAt(t, i)
+        // ── 为什么用码点比较而不是 `c >= "0"` ──────────────
+        //
+        // 因为本语言里 `>=` 对两个 String 用的是**字典序/数值比较**
+        // 中某一套固定语义，而单字符之间的「是否在 '0'..'9' 区间」
+        // 靠它并不可靠 —— 实测 `c >= "0"` 直接报
+        // 「比较运算需要数值，实际是 String 和 String」，
+        // 说明 String 之间的 `>=` 根本没实现。
+        //
+        // 所以先取码点，再在数字区间里比较。strCode 对 ASCII 数字
+        // 返回的就是它的码点（'0' = 48, '9' = 57）。
+        let code = strCode(c)
+        if (code >= 48 && code <= 57) {
+            digits = digits + 1
+        } else if (c == ".") {
+            dots = dots + 1
+            if (dots > 1) { return [false, 0.0] }
+        } else if (c == "e" || c == "E") {
+            // 指数部分整体交给 strParseFloat
+            break
+        } else {
+            return [false, 0.0]
+        }
+        i = i + 1
+    }
+    if (digits == 0) { return [false, 0.0] }
+    return [true, strParseFloat(t)]
+}
+
+fn svCmpFloat(a: Float, op: String, b: Float) -> Bool {
+    if (op == "=" || op == "==")  { return a == b }
+    if (op == "!=" || op == "<>") { return a != b }
+    if (op == "<")  { return a < b }
+    if (op == "<=") { return a <= b }
+    if (op == ">")  { return a > b }
+    if (op == ">=") { return a >= b }
+    return false
+}
+
+fn svCmpText(a: String, op: String, b: String) -> Bool {
+    if (op == "=" || op == "==")  { return a == b }
+    if (op == "!=" || op == "<>") { return a != b }
+    if (op == "<")  { return a < b }
+    if (op == "<=") { return a <= b }
+    if (op == ">")  { return a > b }
+    if (op == ">=") { return a >= b }
+    return false
+}
+
+// ── 投影 ────────────────────────────────────────
+
+// 把保留的行按投影列表变成 ResultSet。
+fn svProject(kept: Array, cols: Array, q: SvQuery) -> ResultSet {
+    let star = len(q.projection) == 1 && toString(q.projection[0]) == "*"
+
+    // 决定输出列
+    let outCols = []
+    let idxs = []       // 每个输出列对应源列的下标
+    if (star) {
+        var i = 0
+        while (i < len(cols)) {
+            arrPush(outCols, cols[i])
+            arrPush(idxs, i)
+            i = i + 1
+        }
+    } else {
+        var k = 0
+        while (k < len(q.projection)) {
+            let p = toString(q.projection[k])
+            let ci = svColIndex(cols, p)
+            arrPush(outCols, p)
+            arrPush(idxs, ci)
+            k = k + 1
+        }
+    }
+
+    // 行数据
+    let rows = []
+    let nulls = []
+    var r = 0
+    while (r < len(kept)) {
+        // LIMIT
+        if (q.limit >= 0 && r >= q.limit) { break }
+        let vals = kept[r]
+        let row = []
+        let nf = []
+        var c = 0
+        while (c < len(idxs)) {
+            let si = toInt(idxs[c])
+            if (si < 0 || si >= len(vals)) {
+                arrPush(row, "")
+                arrPush(nf, true)
+            } else {
+                let v: SvValue = vals[si]
+                arrPush(row, v.text())
+                if (v.kind == SV_NULL) { arrPush(nf, true) }
+                else { arrPush(nf, false) }
+            }
+            c = c + 1
+        }
+        arrPush(rows, row)
+        arrPush(nulls, nf)
+        r = r + 1
+    }
+
+    let rs = ResultSet.make(outCols, rows)
+    rs.nulls = nulls
+    return rs
+}
+
+// ── 聚合 ────────────────────────────────────────
+
+// 对 kept 做聚合。投影里可能同时有多个聚合（`SELECT COUNT(*), SUM(x)`）。
+fn svAggregate(kept: Array, cols: Array, q: SvQuery) -> ResultSet {
+    let outCols = []
+    let row = []
+    let nf = []
+
+    var i = 0
+    while (i < len(q.projection)) {
+        let p = toString(q.projection[i])
+        let c = strFind(p, ":")
+        let fname = strSub(p, 0, c)
+        let arg = strSub(p, c + 1, len(p))
+
+        arrPush(outCols, p)
+
+        if (fname == "COUNT") {
+            // COUNT(*) 与 COUNT(col) 的差别：后者不数 NULL。
+            if (arg == "*") {
+                arrPush(row, toString(len(kept)))
+            } else {
+                let ci = svColIndex(cols, arg)
+                var n = 0
+                var k = 0
+                while (k < len(kept)) {
+                    let vals = kept[k]
+                    if (ci >= 0 && ci < len(vals)) {
+                        let v: SvValue = vals[ci]
+                        if (v.kind != SV_NULL) { n = n + 1 }
+                    }
+                    k = k + 1
+                }
+                arrPush(row, toString(n))
+            }
+            arrPush(nf, false)
+            i = i + 1
+            continue
+        }
+
+        // SUM / AVG / MIN / MAX 都要取数值列
+        let ci = svColIndex(cols, arg)
+        if (ci < 0) {
+            arrPush(row, "")
+            arrPush(nf, true)
+            i = i + 1
+            continue
+        }
+
+        if (fname == "SUM" || fname == "AVG") {
+            var sum = 0.0
+            var n = 0
+            var k = 0
+            while (k < len(kept)) {
+                let vals = kept[k]
+                if (ci < len(vals)) {
+                    let v: SvValue = vals[ci]
+                    if (v.kind == SV_INT || v.kind == SV_FLOAT) {
+                        sum = sum + svAsFloat(v)
+                        n = n + 1
+                    }
+                }
+                k = k + 1
+            }
+            if (n == 0) {
+                // 空集的 SUM/AVG 在 SQL 里是 NULL（不是 0）
+                arrPush(row, "")
+                arrPush(nf, true)
+            } else if (fname == "SUM") {
+                arrPush(row, svNumText(sum))
+                arrPush(nf, false)
+            } else {
+                arrPush(row, svNumText(sum / toFloat(n)))
+                arrPush(nf, false)
+            }
+            i = i + 1
+            continue
+        }
+
+        // MIN / MAX
+        if (fname == "MIN" || fname == "MAX") {
+            var has = false
+            var best = 0.0
+            var bestText = ""
+            var useNum = false
+            var k = 0
+            while (k < len(kept)) {
+                let vals = kept[k]
+                if (ci < len(vals)) {
+                    let v: SvValue = vals[ci]
+                    if (v.kind != SV_NULL) {
+                        if (v.kind == SV_INT || v.kind == SV_FLOAT) {
+                            let f = svAsFloat(v)
+                            if (!has ||
+                                (fname == "MIN" && f < best) ||
+                                (fname == "MAX" && f > best)) {
+                                best = f
+                                has = true
+                                useNum = true
+                            }
+                        } else {
+                            // 文本列：按字典序。混合类型时优先数值，
+                            // 这是 SQL 的「类型亲和」近似。
+                            let t = v.text()
+                            if (!has) {
+                                bestText = t
+                                has = true
+                                useNum = false
+                            } else if (!useNum) {
+                                if ((fname == "MIN" && t < bestText) ||
+                                    (fname == "MAX" && t > bestText)) {
+                                    bestText = t
+                                }
+                            }
+                        }
+                    }
+                }
+                k = k + 1
+            }
+            if (!has) {
+                arrPush(row, "")
+                arrPush(nf, true)
+            } else if (useNum) {
+                arrPush(row, svNumText(best))
+                arrPush(nf, false)
+            } else {
+                arrPush(row, bestText)
+                arrPush(nf, false)
+            }
+            i = i + 1
+            continue
+        }
+
+        // 不认识的函数
+        arrPush(row, "")
+        arrPush(nf, true)
+        i = i + 1
+    }
+
+    let rs = ResultSet.make(outCols, [row])
+    rs.nulls = [nf]
+    return rs
+}
+
+// 数值 → 文本。整数不显示小数点。
+//
+// ── 为什么要特判 ───────────────────────────────────
+//
+// 因为 toString(3.0) 给出 "3.0"，而 SQL 的 SUM 对整数列应给 "3"。
+// 用户拿 "3.0" 去做 toInt 能成功，但显示出来不对；更麻烦的是
+// 拼进 SQL 再查会带上小数点。
+fn svNumText(f: Float) -> String {
+    let i = toInt(f)
+    if (toFloat(i) == f) { return toString(i) }
+    return toString(f)
+}

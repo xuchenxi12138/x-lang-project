@@ -1,0 +1,123 @@
+// ui/control/toggle.xle — 勾选类控件的抽象基类
+//
+// ── 为什么先抽象出 Toggle ─────────────────────────
+//
+// 复选框和单选框在视觉上只差一个形状（方 vs 圆），逻辑上几乎完全
+// 一样：指示器的位置、文字的相对偏移、命中区域、禁用态的表现，
+// 全都一致。如果两个类各写一遍，两份代码会漂移 —— 比如某天给
+// 复选框加了「点整行都能切换」，单选框就忘了加，用户会发现
+// 「圆点必须精确点中才有效」。
+//
+// 所以这里把「指示器在左、文字在右、整行可点」这套布局写一次，
+// 子类只覆写指示器的画法（drawIndicator）。
+//
+// ── 拆成四个文件而不是一个 ─────────────────────────
+//
+// 这个文件只有基类。Check / Radio / RadioGroup 各自独立：
+//
+//   toggle.xle      本文件，基类 + 共享常量
+//   check.xle       方框 + 对勾
+//   radio.xle       圆形 + 中心点
+//   radiogroup.xle  一组圈 + 选中索引
+//
+// 按「一个文件一个类」拆的实际好处不是洁癖，而是**改一个不会
+// 碰到另一个**：想调对勾的笔画粗细时，打开 check.xle 就只看到
+// 对勾相关的东西，不用在 300 行里找。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 指示器边长（复选框）与外接圆直径（单选框）。统一 16px：
+// 太小点不准，太大挤占文字。这条与常见桌面框架一致。
+const CK_BOX = 16
+
+// 文字与指示器之间的间隙。
+const CK_GAP = 8
+
+abstract class Toggle extends Widget {
+    label: String,
+    on: Bool,
+
+    // 指示器的绘制色。由子类或外部按需覆盖，UI_NONE 表示跟随主题。
+    tintColor: Int,
+
+    constructor(r: Rect, label: String, on: Bool) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.label     = label
+        self.on        = on
+        self.tintColor = UI_NONE
+        self.style     = Style.plain()
+    }
+
+    // 指示器矩形：贴左边、垂直居中。
+    //
+    // 垂直居中而不是贴顶：单行控件的文字是垂直居中的，指示器
+    // 贴顶会和文字错位半行。
+    fn box() -> Rect {
+        let by = self.r.y + (self.r.h - CK_BOX) / 2
+        return rectOf(self.r.x, by, CK_BOX, CK_BOX)
+    }
+
+    // 文字矩形：指示器右侧，剩下的全部宽度。
+    fn labelRect() -> Rect {
+        let bx = self.r.x + CK_BOX + CK_GAP
+        let bw = self.r.w - CK_BOX - CK_GAP
+        if (bw < 0) { bw = 0 }
+        return rectOf(bx, self.r.y, bw, self.r.h)
+    }
+
+    // 子类实现：在 box() 里画出「开」或「关」的样子。
+    abstract fn drawIndicator(th: Theme, b: Rect)
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        let b = self.box()
+        self.drawIndicator(th, b)
+
+        // 文字。超长省略，宽度用文字区剩余空间。
+        let lr = self.labelRect()
+        if (len(self.label) > 0 && lr.w > 0) {
+            var s = self.label
+            if (winTextWidth(s) > lr.w) { s = uiEllipsize(s, lr.w) }
+            let lc = th.text
+            if (!self.enabled) {
+                uiTextLeft(lr, s, 0, th.disabled)
+            } else {
+                uiTextLeft(lr, s, 0, lc)
+            }
+        }
+
+        self.drawFocusRing(th)
+    }
+
+    // 整个「指示器 + 文字 + 间隙」都是可点区域 —— 点文字也能切换
+    // 是所有人的预期。只让 16px 的小方块可点会让人点得很烦。
+    fn hit(mx: Int, my: Int) -> Bool {
+        if (!self.vis) { return false }
+        if (!self.enabled) { return false }
+        return self.r.contains(mx, my)
+    }
+
+    fn toggle() -> Toggle {
+        self.on = !self.on
+        return self
+    }
+
+    fn setOn(v: Bool) -> Toggle {
+        self.on = v
+        return self
+    }
+
+    fn text() -> String {
+        return self.label
+    }
+}

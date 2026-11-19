@@ -1,0 +1,9 @@
+let t1=nowMillis()
+let count=0
+for i in 0..1000000000{
+    count=count+1
+}
+let t2=nowMillis()
+let t3=t2-t1
+println(count)
+println(t3)

@@ -1,0 +1,24 @@
+// tests/pkg/mathutil/src/lib.xle
+//
+// 被 tests/pkg/app 依赖的一个库。它的存在意义不是「有用」，
+// 而是**证明包管理端到端成立**：
+//
+//   1. 它有自己的目录与 src/lib.xle（包的入口约定）
+//   2. app 通过 x.toml 声明它、通过 import @mathutil 引用它
+//   3. 编译时 main.c 按清单把它解析到这里，文本合并进编译单元
+//
+// 这个文件故意不放 println：被 import 的文件只允许 fn 与不可变声明
+// （顶层可执行语句会插进入口的 main 里，执行顺序无法推理）。
+
+// 一个容易被手算验证的纯函数，方便断言。
+fn square(x: Int) -> Int {
+    return x * x
+}
+
+fn cube(x: Int) -> Int {
+    return x * x * x
+}
+
+// 常量也必须是不带副作用的声明。
+// 用它顺便验证「依赖文件里的 const 能被子包看到」。
+const PKG_VERSION = "1.0.0"

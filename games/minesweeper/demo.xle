@@ -1,0 +1,167 @@
+// demo.xle — 用构造好的局面截图，做界面回归验证
+//
+// ── 为什么需要这个 ──────────────────────────────────────────
+//
+// 扫雷的真实用法是「人手点鼠标」，没法放进自动化测试。
+// 但界面代码几乎所有的 bug 都能在一个**确定局面**上暴露：
+// 数字颜色对不对、旗子画没画、踩雷后所有雷有没有显示、
+// 胜利横幅有没有出——这些只需要一张截图就能看出来。
+//
+// 所以这个脚本做三件事：
+//   1. 用固定种子造三个局面（进行中 / 失败 / 胜利）
+//   2. 每个局面画一帧、截图、关窗
+//   3. 把截图存到 build/shot-*.bmp
+//
+// 之后要么人眼看一次，要么把它作为基线做像素比对。
+//
+// ── 为什么不检查截图内容 ────────────────────────────────────
+//
+// 检查「像素对不对」在没有基线的情况下毫无意义（第一版永远
+// 「不对」）。真正的价值在于**留下基线**：改了绘制代码之后重跑，
+// 用 diff 看出哪里变了 —— 那才是回归测试。
+
+from "ui.xle" import num_color, g_new, board_px_w, board_px_h, win_w, win_h, hit_cell, draw_num, draw_flag, draw_mine, draw_x, draw_header, draw_board, draw_footer, draw_banner, do_reveal, do_flag, CELL, PAD, HEADER, MINES_H, FOOTER, FACE_W, BTN_W, BTN_H, BTN_GAP, C_N1, C_N2, C_N3, C_N4, C_N5, C_N6, C_N7, C_N8, C_BG, C_PANEL, C_CELL_UP, C_CELL_UP_H, C_CELL_DN, C_GRID, C_TEXT, C_DIM, C_RED, C_FLAG, C_WIN, G_BOARD, G_DIFF, G_START, G_ELAPSED, G_W, G_H, G_OVER, G_SEED
+
+// 固定种子造局面。seed 决定雷位，所以同一 seed 每次结果相同。
+fn make_playing(seed: Int) -> Array {
+    let g = g_new(0)
+    let b = g[G_BOARD]
+    board_place_mines(b, 4, 4, seed)
+    board_count(b)
+    // 故意点开几个位置，让画面有数字也有空白
+    board_open(b, 4, 4)
+    board_open(b, 0, 0)
+    board_open(b, 8, 8)
+    g[G_START]   = 0.0
+    g[G_ELAPSED] = 17
+    return g
+}
+
+// 造一个「已经输了」的局面：点开所有非雷格之外的一颗雷
+fn make_lost(seed: Int) -> Array {
+    let g = g_new(0)
+    let b = g[G_BOARD]
+    board_place_mines(b, 4, 4, seed)
+    board_count(b)
+    board_open(b, 4, 4)
+    // 插两面旗（一面插对、一面插错），让截图覆盖「旗 + 叉」两种标记
+    var flagged = 0
+    var wrong = 0
+    for y in 0..9 {
+        for x in 0..9 {
+            if b_mine(b, x, y) == 1 && flagged == 0 {
+                board_flag(b, x, y)
+                flagged = 1
+            }
+            if b_mine(b, x, y) == 0 && wrong == 0 && b_open(b, x, y) == 0 {
+                board_flag(b, x, y)
+                wrong = 1
+            }
+        }
+    }
+    // 踩雷。
+    //
+    // 必须走 board_open 而不是直接把雷设成「已翻开」：踩中的那颗
+    // 雷要由 board_open 记进 B_DEAD，否则截图里分辨不出「我踩的是
+    // 哪一颗」——而这一格的红底正是最需要验证的绘制分支。
+    for y in 0..9 {
+        for x in 0..9 {
+            if b_mine(b, x, y) == 1 && board_state(b) == ST_PLAY {
+                board_open(b, x, y)
+            }
+        }
+    }
+    g[G_START]   = 0.0
+    g[G_ELAPSED] = 43
+    g[G_OVER]    = 1
+    return g
+}
+
+// 造一个「已经赢了」的局面：翻开所有非雷格
+fn make_won(seed: Int) -> Array {
+    let g = g_new(0)
+    let b = g[G_BOARD]
+    board_place_mines(b, 4, 4, seed)
+    board_count(b)
+    for y in 0..9 {
+        for x in 0..9 {
+            if b_mine(b, x, y) == 0 {
+                board_open(b, x, y)
+            }
+        }
+    }
+    // 给所有雷插旗，看起来像个「打完的盘」
+    for y in 0..9 {
+        for x in 0..9 {
+            if b_mine(b, x, y) == 1 {
+                board_flag(b, x, y)
+            }
+        }
+    }
+    board_check_win(b)
+    g[G_START]   = 0.0
+    g[G_ELAPSED] = 62
+    g[G_OVER]    = 1
+    return g
+}
+
+// 画一帧并截图
+fn shot(g: Array, name: String) {
+    winBeginFrame()
+    winFillRect(0, 0, win_w(g), win_h(g), C_BG)
+    draw_header(g, 4, 4)
+    draw_board(g, 4, 4)
+    draw_footer(g, 4, 4)
+    draw_banner(g)
+    winEndFrame()
+    let path = "build/shot-" + name + ".bmp"
+    println(winScreenshot(path))
+}
+
+fn main() -> Int {
+    // 三个局面都用同一个种子，这样截图之间只有「状态」不同，
+    // 雷位完全一致 —— 对比时不会因为雷位随机而看不出改动。
+    let seed = 20240501
+
+    let gp = make_playing(seed)
+    if !winOpen("shot: playing", win_w(gp), win_h(gp)) {
+        return 1
+    }
+    winSleep(120)
+    shot(gp, "playing")
+    winClose()
+
+    let gl = make_lost(seed)
+    if !winOpen("shot: lost", win_w(gl), win_h(gl)) {
+        return 1
+    }
+    winSleep(120)
+    shot(gl, "lost")
+    winClose()
+
+    let gw = make_won(seed)
+    if !winOpen("shot: won", win_w(gw), win_h(gw)) {
+        return 1
+    }
+    winSleep(120)
+    shot(gw, "won")
+    winClose()
+
+    // 中级难度单独截一张：验证「棋盘尺寸变化后布局仍然对」
+    let gi = g_new(1)
+    let bi = gi[G_BOARD]
+    board_place_mines(bi, 8, 8, seed)
+    board_count(bi)
+    board_open(bi, 8, 8)
+    gi[G_START]   = 0.0
+    gi[G_ELAPSED] = 9
+    if !winOpen("shot: inter", win_w(gi), win_h(gi)) {
+        return 1
+    }
+    winSleep(120)
+    shot(gi, "inter")
+    winClose()
+
+    println("demo ok")
+    return 0
+}

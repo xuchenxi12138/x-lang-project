@@ -1,0 +1,285 @@
+// ui/control/spinner.xle — 数字步进器
+//
+// ── 步进器与滑块的分工 ────────────────────────────
+//
+// 两者都是「在范围内选一个数」，但：
+//
+//   滑块   —— 连续拖动的体感，用于「大致调一下」（音量、亮度）
+//   步进器 —— 精确到个位，用于「我要 37 不是 36」（数量、页码、
+//             超时秒数）
+//
+// 所以步进器的核心价值是**能打字**。它内部有一个 Field，用户
+// 既能点加减号也能直接输入。这一点很容易被忽略 —— 只能点按钮的
+// 步进器，在需要从 1 调到 500 时是灾难。
+//
+// ── 为什么不用 Slider 加一个「精确模式」 ────────────
+//
+// 因为交互模型完全不同：滑块是「按下拖动」，步进器是「点击 + 键盘
+// 输入」。两个状态机硬塞进一个类，字段会有一半在任何时刻都是
+// 无意义的（dragging 对步进器无意义，editing 对滑块无意义）。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 加减按钮的宽度。正方形（= 控件高）最好按，但太宽会挤占数字区，
+// 所以取 0.75 倍高的近似值。
+const SP_BTN_W = 24
+
+class Spinner extends Widget {
+    value: Int,
+    lo: Int,
+    hi: Int,
+    step: Int,
+
+    // 内部输入缓冲。用户打字时先写这里，回车/失焦才提交。
+    //
+    // ── 为什么不直接改 value ──────────────────────
+    //
+    // 因为输入过程必然出现「暂时不是合法数字」的状态（比如
+    // 删光了、或者打了 "-"）。直接写 value 就要为每个中间态
+    // 定义行为，而「输入到一半值就变成 0」是明显的错误体验。
+    // 缓冲 + 提交是唯一干净的做法。
+    buffer: String,
+
+    // 是否处于输入状态。
+    editing: Bool,
+
+    // 是否显示单位后缀。
+    suffix: String,
+
+    constructor(r: Rect, lo: Int, hi: Int, v: Int) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.lo      = lo
+        self.hi      = hi
+        self.step    = 1
+        self.suffix  = ""
+        self.editing = false
+        self.buffer  = ""
+        self.style   = Style.plain()
+        self.setValue(v)
+    }
+
+    static fn of(r: Rect, lo: Int, hi: Int, v: Int) -> Spinner {
+        let s = new Spinner(r, lo, hi, v)
+        return s
+    }
+
+    // ── 值 ──────────────────────────────────────
+
+    fn setValue(v: Int) -> Spinner {
+        var x = v
+        if (x < self.lo) { x = self.lo }
+        if (x > self.hi) { x = self.hi }
+        self.value = x
+        return self
+    }
+
+    fn get() -> Int {
+        return self.value
+    }
+
+    fn setStep(n: Int) -> Spinner {
+        if (n > 0) { self.step = n }
+        return self
+    }
+
+    // 加/减。返回是否变化（到边界时不变）。
+    //
+    // ── 为什么到边界不「回绕」 ────────────────────
+    //
+    // 回绕（到 hi 后再 +1 变成 lo）在页码控件里有时是想要的，
+    // 但在「超时秒数」里是灾难 —— 用户点多了会突然变成 1 秒。
+    // 默认不回绕，因为不可逆的意外行为比「点了没反应」更糟。
+    fn inc() -> Bool {
+        if (!self.enabled) { return false }
+        if (self.value >= self.hi) { return false }
+        let old = self.value
+        self.value = self.value + self.step
+        if (self.value > self.hi) { self.value = self.hi }
+        self.buffer = toString(self.value)
+        return self.value != old
+    }
+
+    fn dec() -> Bool {
+        if (!self.enabled) { return false }
+        if (self.value <= self.lo) { return false }
+        let old = self.value
+        self.value = self.value - self.step
+        if (self.value < self.lo) { self.value = self.lo }
+        self.buffer = toString(self.value)
+        return self.value != old
+    }
+
+    // ── 编辑 ────────────────────────────────────
+
+    fn beginEdit() -> Spinner {
+        self.editing = true
+        self.buffer = toString(self.value)
+        return self
+    }
+
+    // 键盘输入。返回是否消费。
+    //
+    // 只接受数字与负号 —— 让非法字符进不来比「进来再报错」体验好。
+    fn typeKey(key: String) -> Bool {
+        if (!self.editing) {
+            if (len(key) == 1) { self.beginEdit() } else { return false }
+        }
+
+        if (key == "Enter") {
+            self.commit()
+            return true
+        }
+        if (key == "Escape") {
+            self.editing = false
+            self.buffer = ""
+            return true
+        }
+        if (key == "Backspace") {
+            let n = len(self.buffer)
+            if (n > 0) {
+                self.buffer = strSub(self.buffer, 0, n - 1)
+            }
+            return true
+        }
+        if (len(key) == 1) {
+            let c = strCode(key)
+            // '0'..'9' 与 '-'
+            if ((c >= 48 && c <= 57) || c == 45) {
+                self.buffer = self.buffer + key
+                return true
+            }
+        }
+        return false
+    }
+
+    // 提交缓冲。解析失败就恢复成当前值 —— 而不是报错或归零。
+    //
+    // ── 为什么不报错 ────────────────────────────
+    //
+    // 用户把内容删空然后点别处，是极其常见的动作（本意是「清空
+    // 重打」）。此时报错会打断流程，归零会静默改坏数据。恢复原值
+    // 是最不意外的选择。
+    fn commit() {
+        self.editing = false
+        if (len(self.buffer) == 0) {
+            self.buffer = ""
+            return
+        }
+        let isInt = strIsInt(self.buffer)
+        if (!isInt) {
+            self.buffer = ""
+            return
+        }
+        let v = strParseInt(self.buffer)
+        self.setValue(v)
+        self.buffer = ""
+    }
+
+    // ── 命中 ────────────────────────────────────
+
+    fn minusRect() -> Rect {
+        return rectOf(self.r.x, self.r.y, SP_BTN_W, self.r.h)
+    }
+
+    fn plusRect() -> Rect {
+        return rectOf(self.r.x + self.r.w - SP_BTN_W, self.r.y,
+                      SP_BTN_W, self.r.h)
+    }
+
+    fn valueRect() -> Rect {
+        let x = self.r.x + SP_BTN_W
+        let w = self.r.w - SP_BTN_W * 2
+        if (w < 0) { w = 0 }
+        return rectOf(x, self.r.y, w, self.r.h)
+    }
+
+    // 点哪里做了什么。返回是否变化。
+    fn click(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+        if (!self.r.contains(mx, my)) { return false }
+
+        if (self.minusRect().contains(mx, my)) {
+            return self.dec()
+        }
+        if (self.plusRect().contains(mx, my)) {
+            return self.inc()
+        }
+        if (self.valueRect().contains(mx, my)) {
+            self.beginEdit()
+            return false
+        }
+        return false
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 整体底色。
+        var bg = th.surface
+        if (self.hovered && self.enabled) { bg = th.surfaceHover }
+        if (!self.enabled) { bg = th.bg }
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, bg)
+
+        // 边框：编辑中/聚焦时用主色。
+        var bc = th.border
+        if (self.editing || self.focused) { bc = th.accent }
+        if (!self.enabled) { bc = th.border }
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, bc)
+
+        // ── 加减按钮 ──
+        // 用竖线分隔而不是各画一个独立框 —— 独立框看起来像三个
+        // 并排的控件，而步进器是一个控件。
+        let mr = self.minusRect()
+        let pr = self.plusRect()
+
+        let mx0 = mr.x + mr.w - 1
+        winFillRect(mx0, mr.y + 3, 1, mr.h - 6, th.border)
+        let px0 = pr.x
+        winFillRect(px0, pr.y + 3, 1, pr.h - 6, th.border)
+
+        // 「−」和「+」用横竖两条线画，不用字符。
+        var sym = th.text
+        if (!self.enabled) { sym = th.disabled }
+        let my1 = mr.y + mr.h / 2
+        let mcx = mr.x + mr.w / 2
+        winFillRect(mcx - 5, my1, 10, 1, sym)
+
+        let pcx = pr.x + pr.w / 2
+        winFillRect(pcx - 5, my1, 10, 1, sym)
+        winFillRect(pcx, my1 - 5, 1, 10, sym)
+
+        // ── 数值 ──
+        let vr = self.valueRect()
+        var shown = toString(self.value)
+        if (self.editing) { shown = self.buffer }
+        if (len(self.suffix) > 0) { shown = shown + self.suffix }
+
+        var tc = th.text
+        if (!self.enabled) { tc = th.disabled }
+        if (self.editing) {
+            // 编辑中左对齐（像输入框），非编辑态居中。
+            uiTextLeft(vr, shown, 8, tc)
+        } else {
+            uiTextInRect(vr, shown, tc)
+        }
+
+        // 编辑中的光标。
+        if (self.editing) {
+            let raw = self.buffer
+            let cx = vr.x + 8 + winTextWidth(raw)
+            let ch = winTextHeight() - 4
+            winFillRect(cx, vr.y + (vr.h - ch) / 2, 1, ch, th.text)
+        }
+    }
+}

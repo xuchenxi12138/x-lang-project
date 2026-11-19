@@ -1,0 +1,321 @@
+// net/http/client.xle — HTTP/1.1 客户端
+//
+// ── 这个客户端只做「一次请求」 ─────────────────────
+//
+// 它不做连接池、不做重试、不做 keep-alive 复用、不跟重定向。理由：
+//
+//   · 连接池需要「连接生命周期管理」（什么算空闲、怎么探活、
+//     池满了怎么办），那是组件级的问题，应该独立成 ConnectionPool
+//     类而不是塞进 HttpClient。
+//   · 重试需要幂等性判断（GET 可以重试，POST 不行 —— 可能导致重复
+//     下单）。让调用方显式重试比在底层偷偷重试安全得多。
+//   · 跟重定向需要策略（跨域要不要带 cookie、最多跟几次、循环检测）。
+//
+// 所以这里提供「可靠的单次请求」这一块，其余由调用方组合。
+//
+// ── 为什么必须手写报文而不复用库 ───────────────────
+//
+// 因为要能生成任意请求（自定义方法、自定义头顺序、原始 body 字节），
+// 而任何「封装好的 API 再拆出来」的做法都会丢东西（比如头的顺序、
+// 重复的头）。手写报文，就没有丢的可能。
+
+from "../core/tcp_stream.xle" import TcpStream, TS_POLL_MS, TS_DEFAULT_WAIT_MS
+from "uri.xle" import uriIsUnreserved, uriPctEncodeByte, uriEncode, uriEncodePath, uriEncodeQueryValue, uriDecode, uriHexVal, uriFindSchemeColon, uriSplitAuthority, strLastFind, uriDirOf, uriNormalizePath, Uri
+from "header.xle" import arrRemoveAt, Headers, HD_COLON, HD_MAX_LINE
+from "request.xle" import rqKnownMethods, rqParseQuery, rqPlusToSpace, Request
+from "response.xle" import Response
+from "reader.xle" import hsCrlfCrlf, out2Append, ResponseHead, HsReader, HS_MAX_LINE
+
+// 一次请求的完整配置。
+class HttpRequest {
+    method: String
+    url: Uri
+    headers: Headers
+    body: Array
+    timeoutMs: Int
+
+    constructor(method: String, url: Uri) {
+        self.method    = strUpper(method)
+        self.url       = url
+        self.headers   = new Headers()
+        self.body      = []
+        self.timeoutMs = 10000
+    }
+
+    fn setHeader(name: String, value: String) -> HttpRequest {
+        self.headers.set(name, value)
+        return self
+    }
+
+    fn setBodyText(s: String) -> HttpRequest {
+        self.body = bbFromUtf8(s)
+        return self
+    }
+
+    fn setBodyBytes(b: Array) -> HttpRequest {
+        self.body = b
+        return self
+    }
+
+    fn setTimeout(ms: Int) -> HttpRequest {
+        self.timeoutMs = ms
+        return self
+    }
+}
+
+// 一次请求的结果。
+class HttpResult {
+    ok: Bool
+    status: Int
+    reason: String
+    headers: Headers
+    body: Array
+    error: String
+
+    constructor() {
+        self.ok      = false
+        self.status  = 0
+        self.reason  = ""
+        self.headers = new Headers()
+        self.body    = []
+        self.error   = ""
+    }
+
+    fn bodyText() -> String {
+        return bbToText(self.body)
+    }
+
+    fn isSuccess() -> Bool {
+        return self.ok && self.status >= 200 && self.status < 300
+    }
+
+    fn describe() -> String {
+        if (!self.ok) { return "HttpResult FAILED: " + self.error }
+        return "HttpResult " + toString(self.status) + " " + self.reason +
+               " (" + toString(len(self.body)) + " body 字节, " +
+               toString(self.headers.count()) + " 头)"
+    }
+}
+
+class HttpClient {
+    // 默认请求头。每次请求都会带上（会被单次请求的同名头覆盖）。
+    defaults: Headers
+
+    // 默认超时（毫秒）。
+    timeoutMs: Int
+
+    constructor() {
+        self.defaults  = new Headers()
+        self.timeoutMs = 10000
+        // ── 默认 UA ───────────────────────────
+        //
+        // 不是礼貌问题：有些站点（Cloudflare、微信公众号后台）会
+        // 直接拒绝没有 User-Agent 的请求，返回 403 —— 而错误信息
+        // 是「Access denied」，完全看不出缺 UA。
+        self.defaults.set("User-Agent", "x-http/1.0")
+        // ── Connection: close ─────────────────
+        //
+        // 因为本实现不复用连接。声明 close 让服务端主动关闭，
+        // 省掉一个「等 FIN 超时」的等待。
+        //
+        // 不声明的话，服务端按 keep-alive 保持连接，而我们发完就
+        // 关 —— 服务端会记录一次「客户端异常断开」。不影响功能，
+        // 但会给对方留下大量异常日志。
+        self.defaults.set("Connection", "close")
+    }
+
+    static fn create() -> HttpClient {
+        return new HttpClient()
+    }
+
+    fn setDefault(name: String, value: String) -> HttpClient {
+        self.defaults.set(name, value)
+        return self
+    }
+
+    // ── 发起请求 ──────────────────────────────────
+
+    static fn doRequest(req: HttpRequest) -> HttpResult {
+        let c = new HttpClient()
+        return c.execute(req)
+    }
+
+    fn execute(req: HttpRequest) -> HttpResult {
+        let res = new HttpResult()
+
+        // ── 1. 检查 URL 可连接性 ────────────────
+        //
+        // 这里有一个必须显式处理的情况：URL 没有 host。常见原因是
+        // 调用方给了一个相对路径（`/api/x`）而没提供 base —— 直接
+        // 连会连到 "0.0.0.0:80"，得到的是「连接被拒绝」这种误导性
+        // 错误。所以提前给出精确诊断。
+        if (!req.url.hasAuthority || len(req.url.host) == 0) {
+            res.error = "URL 没有主机名（`" + req.url.toString() +
+                        "`）。相对路径需要先用 Uri.resolve(base, path) 补全"
+            return res
+        }
+
+        let scheme = req.url.scheme
+        // ── 明确拒绝 https ─────────────────────
+        //
+        // 因为本实现没有 TLS 层。硬连 443 会得到一个「连接建立但
+        // 握手无响应」的挂起到超时 —— 而真正的原因是「不支持 TLS」。
+        // 直接说清楚比让调用方排查十分钟有价值。
+        if (scheme == "https") {
+            res.error = "本实现不支持 HTTPS（没有 TLS 层）。" +
+                        "请改用 http:// 端点，或在前面放一个反向代理做 TLS 终止"
+            return res
+        }
+        if (scheme != "http" && len(scheme) > 0) {
+            res.error = "不支持的协议 `" + scheme + "`（只支持 http）"
+            return res
+        }
+
+        let port = req.url.effectivePort()
+        if (port <= 0) {
+            // 没有 scheme 也没写端口：这几乎必然是配置错误。
+            // HTTP 的默认端口是 80，但「没写 scheme 也没写端口」时
+            // 猜 80 会让 `localhost/api` 这种输入连到 80 而不是
+            // 调用方以为的 8080 —— 报错更有用。
+            port = 80
+        }
+
+        // ── 2. 建连 ───────────────────────────
+        let rc = TcpStream.connect(req.url.host, port)
+        if (rc[0] != true) {
+            res.error = toString(rc[2])
+            return res
+        }
+        let sock: TcpStream = rc[1]
+
+        // ── 3. 拼请求报文 ─────────────────────
+        let wire = self.buildRequest(req)
+        let rs = sock.sendAll(wire, req.timeoutMs)
+        if (rs[0] != true) {
+            res.error = "发送请求失败：" + toString(rs[2])
+            sock.close()
+            return res
+        }
+
+        // ── 4. 读响应头 ───────────────────────
+        let head = HsReader.readHead(sock, req.timeoutMs)
+        if (head[0] != true) {
+            res.error = toString(head[2])
+            sock.close()
+            return res
+        }
+        let headBytes: Array = head[1]
+        // ── 残留字节绝对不能丢 ──────────────────
+        //
+        // readHead 是按 \r\n\r\n 定位的，所以它读到的那一批数据里
+        // 很可能**已经包含 body 的开头**（尤其是小响应，一次 recv
+        // 就带来整个报文）。这个 leftover 必须交给 readBody 当初始
+        // 缓冲，否则 body 的开头就永久丢失了。
+        //
+        // 症状：{} 变成 }、{"a":1} 变成 "a":1}，报的是 JSON 解析
+        // 错误 —— 而问题在 HTTP 层。
+        let leftover: Array = head[2]
+
+        // ── 5. 拆响应头 ───────────────────────
+        let parsed = HsReader.parseHead(headBytes)
+        if (parsed[0] != true) {
+            res.error = toString(parsed[2])
+            sock.close()
+            return res
+        }
+        let rhead: ResponseHead = parsed[1]
+        res.status  = rhead.status
+        res.reason  = rhead.reason
+        res.headers = rhead.headers
+
+        // ── 6. 读 body ────────────────────────
+        //
+        // 只有 1xx/204/304 没有 body（见 status.xle）。其余按
+        // Content-Length 或 chunked 读。
+        if (hsHasNoBody(res.status)) {
+            res.ok = true
+            sock.close()
+            return res
+        }
+        let bodyRead = HsReader.readBody(sock, rhead, leftover, req.timeoutMs)
+        sock.close()
+        if (bodyRead[0] != true) {
+            res.error = "读取响应体失败：" + toString(bodyRead[2])
+            return res
+        }
+        res.body = bodyRead[1]
+        res.ok   = true
+        return res
+    }
+
+    // 拼请求报文字节。
+    fn buildRequest(req: HttpRequest) -> Array {
+        // 起始行。用 origin-form 目标（见 uri.xle 的 requestTarget）。
+        var out = req.method + " " + req.url.requestTarget() + " HTTP/1.1\r\n"
+
+        // ── Host 必须第一个（实践中） ────────────
+        //
+        // RFC 不要求位置，但很多中间设备（包括部分 WAF）只解析
+        // 前几行找 Host。放在最前面是最安全的。
+        out = out + "Host: " + req.url.hostHeader() + "\r\n"
+
+        // 合并头：defaults 打底，req 覆盖。
+        let merged = self.defaults.copy()
+        let names = req.headers.names()
+        var i = 0
+        while i < len(names) {
+            let n: String = names[i]
+            // ── 用 set 而不是 add ────────────────
+            //
+            // 因为单次请求的同名头应该覆盖默认值。用 add 会变成
+            // 两个同名头（`User-Agent: x-http/1.0` 和调用方给的
+            // 那个），服务端会用哪个不确定 —— 而多半不是期望的那个。
+            merged.set(n, req.headers.get(n))
+            i = i + 1
+        }
+
+        // host 已单独发过，从合并结果里删掉防止重复。
+        merged.remove("host")
+
+        // ── Content-Length 必须在头阶段确定 ────────
+        //
+        // 有 body 就必须有 Content-Length（本实现不发 chunked 请求）。
+        // 没有 body 的 GET 通常不加 —— 加了 `Content-Length: 0` 在
+        // 语义上没错，但少数老服务端会把「带了 CL 的 GET」当成可疑
+        // 请求拒绝。
+        if (len(req.body) > 0) {
+            merged.set("Content-Length", toString(len(req.body)))
+        }
+
+        out = out + merged.toText()
+        out = out + "\r\n"
+
+        let headBytes = bbFromUtf8(out)
+        if (len(req.body) == 0) { return headBytes }
+        return bbConcat(headBytes, req.body)
+    }
+
+    // ── 便捷方法 ─────────────────────────────────
+
+    fn get(url: String) -> HttpResult {
+        let req = new HttpRequest("GET", Uri.parse(url))
+        req.timeoutMs = self.timeoutMs
+        return self.execute(req)
+    }
+
+    fn postText(url: String, contentType: String, body: String) -> HttpResult {
+        let req = new HttpRequest("POST", Uri.parse(url))
+        req.setHeader("Content-Type", contentType)
+        req.setBodyText(body)
+        req.timeoutMs = self.timeoutMs
+        return self.execute(req)
+    }
+
+    fn postJson(url: String, json: String) -> HttpResult {
+        return self.postText(url, "application/json; charset=utf-8", json)
+    }
+
+    fn postForm(url: String, formBody: String) -> HttpResult {
+        return self.postText(url, "application/x-www-form-urlencoded; charset=utf-8", formBody)
+    }
+}

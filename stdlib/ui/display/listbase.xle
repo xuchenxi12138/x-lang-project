@@ -1,0 +1,235 @@
+// ui/display/listbase.xle — 列表与表格的公共基类
+//
+// ── 为什么抽基类而不是写两个独立的类 ─────────────────
+//
+// 列表和表格在实现上是同一个东西：**一组等高的行 + 滚动 + 选中**。
+// 表格不过是「行里的内容按列切开」而已。
+//
+// 滚动逻辑最容易被复制，也最容易漂移：一处做了「选中项自动滚进
+// 视野」，另一处忘了，用户就得手动滚。所以：
+//
+//   listbase.xle —— 本文件，滚动 / 选中 / 命中 / 行背景 / 虚拟化
+//   list.xle     —— 一行一个字符串
+//   table.xle    —— 一行拆成多列，每列有宽度和对齐
+//
+// 子类只需要实现 drawRowContent（一行里画什么）。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../control/label.xle" import Label, TEXT_CENTER, TEXT_LEFT, TEXT_RIGHT
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 列表行高。够放下 12px 字 + 上下留白。
+const LIST_ROW_H = 28
+
+//
+// 继承它就能得到「滚轮能用、点击能选中、选中项自动滚进视野」。
+abstract class ListBase extends Widget {
+    // 行数。由子类在数据变化时更新。
+    rowCount: Int,
+
+    // 当前选中行。-1 表示无选中。
+    selected: Int,
+
+    // 滚动偏移（像素）。
+    offset: Int,
+
+    rowH: Int,
+
+    // 是否允许选中。菜单之类不需要保持选中态的场景设 false。
+    selectable: Bool,
+
+    constructor(r: Rect) {
+        self.r          = r
+        self.vis        = true
+        self.enabled    = true;
+        self.focused    = false
+        self.hovered    = false
+        self.rowCount   = 0
+        self.selected   = 0 - 1
+        self.offset     = 0
+        self.rowH       = LIST_ROW_H
+        self.selectable = true
+        self.style      = Style.plain()
+    }
+
+    // 可见区（扣 1px 边框）。
+    fn viewport() -> Rect {
+        return Rect.inset(self.r, 1)
+    }
+
+    // 能完整显示的行数（不足一行也算一行，用于「最后一行只露半个」）。
+    fn visibleRows() -> Int {
+        let vh = self.viewport().h
+        if (self.rowH <= 0) { return 0 }
+        let n = (vh + self.rowH - 1) / self.rowH
+        return n
+    }
+
+    // 内容总高。
+    fn contentH() -> Int {
+        return self.rowCount * self.rowH
+    }
+
+    fn maxOffset() -> Int {
+        let over = self.contentH() - self.viewport().h
+        if (over < 0) { return 0 }
+        return over
+    }
+
+    fn clampOffset() {
+        let mx = self.maxOffset()
+        if (self.offset > mx) { self.offset = mx }
+        if (self.offset < 0) { self.offset = 0 }
+    }
+
+    // 滚轮。delta 为正向上。
+    fn scroll(delta: Int) -> ListBase {
+        self.offset = self.offset - delta * self.rowH
+        self.clampOffset()
+        return self
+    }
+
+    // 第 i 行在屏幕上的矩形（已经含滚动偏移）。
+    //
+    // 注意「屏幕坐标」这个词：返回的 y 已经减了 offset，调用方
+    // 可以直接拿去画。很多实现在这里返回「内容坐标」，然后每个
+    // 调用点多写一次 -offset —— 那种重复迟早会漏一处。
+    fn rowRect(i: Int) -> Rect {
+        let vp = self.viewport()
+        return rectOf(vp.x, vp.y + i * self.rowH - self.offset, vp.w, self.rowH)
+    }
+
+    // 鼠标位置对应哪一行。-1 表示不在任何行上。
+    fn rowAt(mx: Int, my: Int) -> Int {
+        let vp = self.viewport()
+        if (!vp.contains(mx, my)) { return 0 - 1 }
+        let rel = my - vp.y + self.offset
+        if (rel < 0) { return 0 - 1 }
+        let i = rel / self.rowH
+        if (i < 0 || i >= self.rowCount) { return 0 - 1 }
+        return i
+    }
+
+    // 点击。返回选中行是否变化。
+    fn clickRow(mx: Int, my: Int) -> Bool {
+        if (!self.vis || !self.enabled) { return false }
+        let i = self.rowAt(mx, my)
+        if (i < 0) { return false }
+        if (!self.selectable) { return false }
+        if (i == self.selected) { return false }
+        self.selected = i
+        return true
+    }
+
+    // 键盘上下键。返回是否消费。
+    fn keyMove(key: String) -> Bool {
+        if (key == "ArrowDown") {
+            var i = self.selected + 1
+            if (i >= self.rowCount) { i = self.rowCount - 1 }
+            if (i < 0) { i = 0 }
+            if (i == self.selected) { return true }
+            self.selected = i
+            self.ensureVisible(i)
+            return true
+        }
+        if (key == "ArrowUp") {
+            var i = self.selected - 1
+            if (i < 0) { i = 0 }
+            if (i == self.selected) { return true }
+            self.selected = i
+            self.ensureVisible(i)
+            return true
+        }
+        return false
+    }
+
+    // 让第 i 行完整可见。滚最小距离，不是居中 —— 居中会让
+    // 连续按方向键时视野一直在跳。
+    fn ensureVisible(i: Int) {
+        let top = i * self.rowH
+        let bot = top + self.rowH
+        let vh = self.viewport().h
+        if (top < self.offset) {
+            self.offset = top
+        }
+        if (bot > self.offset + vh) {
+            self.offset = bot - vh
+        }
+        self.clampOffset()
+    }
+
+    // 行背景。选中 / 悬停 / 斑马纹，三者优先级明确。
+    //
+    // ── 为什么选中优先于悬停 ──────────────────────
+    //
+    // 悬停是「鼠标在这」，选中是「用户选了它」。用户需要始终
+    // 知道选了哪个，所以选中必须压过悬停的视觉。
+    fn drawRowBg(th: Theme, i: Int, r: Rect) {
+        if (i == self.selected) {
+            winFillRect(r.x, r.y, r.w, r.h, th.surfaceActive)
+            return
+        }
+        if (self.hovered) {
+            let hx = winMouseX()
+            let hy = winMouseY()
+            if (self.rowAt(hx, hy) == i) {
+                winFillRect(r.x, r.y, r.w, r.h, th.surfaceHover)
+                return
+            }
+        }
+        // 斑马纹：偶数行给一点点底色差，长列表更好读。
+        //
+        // 用 alpha 混合而不是另取一个颜色：主题里只有有限的几个
+        // 色，而斑马纹需要「比 surface 稍深一点点」这种颜色，
+        // 那个色不存在也不该存在（每换一个主题就要调一个）。
+        if (i % 2 == 1) {
+            winFillRect(r.x, r.y, r.w, r.h, th.bg)
+        }
+    }
+
+    // 子类实现：画第 i 行的内容（背景已画好）。
+    abstract fn drawRowContent(th: Theme, i: Int, r: Rect)
+
+    // 空状态。没有数据时显示一行提示。
+    // 子类可以覆写成更定制的内容。
+    fn drawEmpty(th: Theme) {
+        let vp = self.viewport()
+        uiTextInRect(vp, "暂无数据", th.textDim)
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.surface)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, th.border)
+
+        if (self.rowCount == 0) {
+            self.drawEmpty(th)
+            return
+        }
+
+        let vp = self.viewport()
+        winClip(vp.x, vp.y, vp.w, vp.h)
+
+        // 只画可见的行。这是虚拟化的最低限度实现 —— 一万行数据
+        // 也只画 20 行，这是列表能处理大数据的唯一原因。
+        //
+        // 公式：第一个可见行 = offset / rowH（向下取整）。
+        let first = self.offset / self.rowH
+        let last = first + self.visibleRows() + 1
+
+        var i = first
+        while i < last && i < self.rowCount {
+            let rr: Rect = self.rowRect(i)
+            self.drawRowBg(th, i, rr)
+            self.drawRowContent(th, i, rr)
+            i = i + 1
+        }
+
+        winUnclip()
+    }
+}

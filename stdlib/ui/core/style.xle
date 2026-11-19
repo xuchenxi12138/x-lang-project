@@ -1,0 +1,419 @@
+// ui/core/style.xle — 样式（一组视觉属性的值对象）
+//
+// ── 为什么需要 Style，而不是给每个控件加字段 ──────────────
+//
+// v0.16 之前，控件的视觉属性散在各处：UiButton 有 kind（三档配色），
+// UiLabel 有 color（一个前景色），UiPanel 有 title，函数式 API 更是
+// 把 bg/bgHover/fg 当位置参数传 —— uiButtonEx 已经是 8 个参数。
+//
+// 想加一个「圆角」，三处都要改，而且函数式那套的每个调用点都会多一个
+// 位置参数。这不是「参数有点多」，是**样式没有归属**：它既不属于
+// 业务数据，也不属于几何，所以没人知道该放哪，最后就摊在参数表里。
+//
+// ── 解法：把样式收成一个值 ────────────────────────────
+//
+// Style 是一组**视觉属性**，全部有默认值，全部可覆盖，还能派生：
+//
+//     let s = Style.card().radius(10).fill(0x222233)
+//     let b = new UiButton(r, "OK")
+//     b.style = s
+//
+// 加一个属性只需要在 Style 里加一个字段 + 一个派生方法，
+// 所有控件的调用点一行都不用改。
+//
+// ── 为什么 Style 是 struct 而不是 class ────────────────
+//
+// 和 Rect / Theme 同一个理由：样式是值。拷贝一份改一个字段，
+// 原样式不受影响 —— 这让「基于主题派生一套局部样式」变得安全：
+//
+//     let base = Style.fromTheme(th)
+//     let danger = base.fill(th.err)      // base 没被改
+//     let warn   = base.fill(th.warn)     // 从同一个 base 派生
+//
+// 如果是引用语义，上面第二行会悄悄改掉 danger 的配色 —— 而
+// 那种 bug 只在同时用两个派生样式时才出现。
+
+from "palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+from "theme.xle" import Theme
+
+struct Style {
+    // ---- 填充 ----
+    //
+    // 三个状态色而不是一个：按钮的「悬停/按下」反馈是 UI 的基本要求，
+    // 让调用方自己判断状态再改样式，等于把每种控件的状态机都抄一遍。
+    fill: Int,          // 常态填充。UI_NONE(-1) 表示不填充
+    fillHover: Int,     // 悬停
+    fillActive: Int,    // 按下
+
+    // ---- 描边 ----
+    border: Int,        // UI_NONE 表示不描边
+    borderW: Int,       // 线宽（像素）
+
+    // ---- 圆角 ----
+    //
+    // 半径 0 = 直角。会按 min(w,h)/2 自动夹紧（见 gui_win32.c 的
+    // xgui_fill_round）—— 所以给一个大半径不会画出怪形状，
+    // 只会变成胶囊。
+    radius: Int,
+
+    // ---- 文字 ----
+    text: Int,
+    textDim: Int,       // 次要文字（标签、提示）
+    align: Int,         // 0=居中 1=左对齐 2=右对齐
+
+    // ---- 渐变 ----
+    //
+    // gradFrom / gradTo 都是 UI_NONE 时用纯色 fill。
+    // 只填一个时按 fill 处理（不算错误，但会忽略渐变）。
+    gradFrom: Int,
+    gradTo: Int,
+    gradVertical: Bool,
+
+    // ---- 透明度 ----
+    //
+    // 0~100 的整数而不是 0.0~1.0 的浮点。
+    //
+    // 理由：这个值几乎总是在做整数运算（50% + 25% 叠加），
+    // 而浮点比较的边界问题（0.30000000000000004 > 0.3）在样式
+    // 继承上会真的出错 —— 「明明设了 0.3 却不生效」。
+    // 整数百分比没有这个问题，且 UI_NONE(100) 语义清晰。
+    alpha: Int,
+
+    // ---- 变换 ----
+    //
+    // rotDeg 单位是度，正数逆时针。scale 是倍数（100 = 1.0 倍，
+    // 同样是整数避免浮点边界问题）。
+    rotDeg: Float,
+    scale: Int,
+
+    // ---- 裁剪 ----
+    //
+    // 为真时把绘制限制在控件矩形内。列表、滚动区域必须开 ——
+    // 否则超出的内容会画到别的控件上面。
+    clip: Bool,
+
+    // ---- 阴影 ----
+    //
+    // 简化成「偏移 + 颜色」，不做模糊：GDI 没有模糊，而为了阴影
+    // 引入一整个软件模糊层不值得。硬边阴影在深色主题下看起来是
+    // 「浮起一层」，视觉够用。
+    shadow: Int,        // UI_NONE 无阴影
+    shadowX: Int,
+    shadowY: Int,
+}
+
+fn Style.plain() -> Style {
+    return Style {
+        fill: UI_NONE, fillHover: UI_NONE, fillActive: UI_NONE,
+        border: UI_NONE, borderW: 1,
+        radius: 0,
+        text: UI_NONE, textDim: UI_NONE, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100,
+        rotDeg: 0.0, scale: 100,
+        clip: false,
+        shadow: UI_NONE, shadowX: 0, shadowY: 2,
+    }
+}
+
+// 从主题派生一套基础样式：面板色 + 细描边 + 小圆角。
+//
+// 这是绝大多数控件想要的起点，也是「主题一变、整套界面跟着变」
+// 的落点 —— 控件不存硬编码颜色，只持有从主题派生的 Style。
+fn Style.fromTheme(th: Theme) -> Style {
+    return Style {
+        fill: th.surface, fillHover: th.surfaceHover, fillActive: th.surfaceActive,
+        border: th.border, borderW: 1,
+        radius: 4,
+        text: th.text, textDim: th.textDim, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100,
+        rotDeg: 0.0, scale: 100,
+        clip: false,
+        shadow: UI_NONE, shadowX: 0, shadowY: 2,
+    }
+}
+
+// 卡片样式：大圆角 + 阴影，用于浮层和对话框。
+fn Style.card() -> Style {
+    return Style {
+        fill: UI_SURFACE, fillHover: UI_SURFACE, fillActive: UI_SURFACE,
+        border: UI_BORDER, borderW: 1,
+        radius: 10,
+        text: UI_TEXT, textDim: UI_TEXT_DIM, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100,
+        rotDeg: 0.0, scale: 100,
+        clip: false,
+        shadow: 0x000000, shadowX: 0, shadowY: 6,
+    }
+}
+
+// ---- 派生方法（链式）----
+//
+// 每个方法都返回一个新 Style。命名用短动词而不是 setFill：
+// 链式调用里 `s.fill(x).radius(8)` 比 `s.setFill(x).setRadius(8)`
+// 读起来更像描述而不是命令序列，而这正是「样式是值」的表达。
+
+fn Style.fill(self: Style, c: Int) -> Style {
+    return Style {
+        fill: c, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.states(self: Style, hover: Int, active: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: hover, fillActive: active,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.border(self: Style, c: Int, w: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: c, borderW: w, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.radius(self: Style, r: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: r,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.textColor(self: Style, c: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: c, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+// 注意参数名用 c1/c2 而不是 from/to：`from` 是关键字（循环与导入都用它）。
+// 这不是随手起名 —— 语言层不开放关键字做标识符，参数名就必须绕开。
+fn Style.gradient(self: Style, c1: Int, c2: Int, vertical: Bool) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: c1, gradTo: c2, gradVertical: vertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+// 透明度 0~100。夹紧而不是报错：样式派生链上去一点不奇怪，
+// 而为了一个越界值中断整个界面渲染没有意义。
+fn Style.opacity(self: Style, pct: Int) -> Style {
+    var p = pct
+    if (p < 0) { p = 0 }
+    if (p > 100) { p = 100 }
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: p, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.rotate(self: Style, deg: Float) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: deg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+// 缩放，百分比（100 = 原尺寸）。
+fn Style.scaleTo(self: Style, pct: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: pct,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.withClip(self: Style) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: true, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.withShadow(self: Style, c: Int, dx: Int, dy: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: c,
+        shadowX: dx, shadowY: dy,
+    }
+}
+
+// ── 语义化预设（v0.18 新增）────────────────────────────
+//
+// 上面那批派生方法解决「怎么改一个属性」，这里解决「常见控件长什么
+// 样」。它们的价值不在于省几行，而在于**统一**：十个地方画主按钮，
+// 圆角、悬停色、主色文字必须完全一样，否则界面看起来像拼装的。
+//
+// 全部接受 Theme 参数，所以换主题时这些预设自动跟着变 —— 这是
+// 硬编码颜色做不到的。
+
+// 主按钮：主色填充 + 白字（或黑字，取决于主题的 onAccent）。
+fn Style.primary(th: Theme) -> Style {
+    return Style {
+        fill: th.accent, fillHover: th.accentDark, fillActive: th.accentDark,
+        border: UI_NONE, borderW: 0,
+        radius: 6,
+        text: th.onAccent, textDim: th.onAccent, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100, rotDeg: 0.0, scale: 100,
+        clip: false, shadow: UI_NONE, shadowX: 0, shadowY: 2,
+    }
+}
+
+// 危险按钮：删除、清空、不可逆操作。
+fn Style.danger(th: Theme) -> Style {
+    return Style {
+        fill: th.err, fillHover: th.err, fillActive: th.err,
+        border: UI_NONE, borderW: 0,
+        radius: 6,
+        text: th.onAccent, textDim: th.onAccent, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100, rotDeg: 0.0, scale: 100,
+        clip: false, shadow: UI_NONE, shadowX: 0, shadowY: 2,
+    }
+}
+
+// 成功/确认按钮。
+fn Style.success(th: Theme) -> Style {
+    return Style {
+        fill: th.ok, fillHover: th.ok, fillActive: th.ok,
+        border: UI_NONE, borderW: 0,
+        radius: 6,
+        text: th.onAccent, textDim: th.onAccent, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100, rotDeg: 0.0, scale: 100,
+        clip: false, shadow: UI_NONE, shadowX: 0, shadowY: 2,
+    }
+}
+
+// 幽灵按钮：透明底 + 描边。放在密集工具栏里比实心按钮克制。
+fn Style.ghost(th: Theme) -> Style {
+    return Style {
+        fill: UI_NONE, fillHover: th.surfaceHover, fillActive: th.surfaceActive,
+        border: th.border, borderW: 1,
+        radius: 6,
+        text: th.text, textDim: th.textDim, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100, rotDeg: 0.0, scale: 100,
+        clip: false, shadow: UI_NONE, shadowX: 0, shadowY: 0,
+    }
+}
+
+// 输入框：内凹感的底色，比面板深一档。
+fn Style.input(th: Theme) -> Style {
+    return Style {
+        fill: th.bg, fillHover: th.bg, fillActive: th.bg,
+        border: th.border, borderW: 1,
+        radius: 4,
+        text: th.text, textDim: th.textDim, align: 1,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100, rotDeg: 0.0, scale: 100,
+        clip: true, shadow: UI_NONE, shadowX: 0, shadowY: 0,
+    }
+}
+
+// 获得焦点的输入框：边框换成焦点环色，线宽加一。
+fn Style.inputFocused(th: Theme) -> Style {
+    let s = Style.input(th)
+    return Style.border(s, th.focus, 2)
+}
+
+// 错误态输入框（校验失败）。
+fn Style.inputError(th: Theme) -> Style {
+    let s = Style.input(th)
+    return Style.border(s, th.err, 2)
+}
+
+// 禁用态：压暗整体透明度并用 disabled 色画文字。
+fn Style.disabled(th: Theme) -> Style {
+    let s = Style.fromTheme(th)
+    return Style {
+        fill: s.fill, fillHover: s.fill, fillActive: s.fill,
+        border: s.border, borderW: s.borderW, radius: s.radius,
+        text: th.disabled, textDim: th.disabled, align: s.align,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 60, rotDeg: 0.0, scale: 100,
+        clip: false, shadow: UI_NONE, shadowX: 0, shadowY: 0,
+    }
+}
+
+// 浮层（下拉菜单、tooltip、toast）：卡片底 + 明显阴影。
+fn Style.overlay(th: Theme) -> Style {
+    let s = Style.card()
+    return Style.withShadow(s, th.scrim, 0, 4)
+}
+
+// ── 状态合成 ───────────────────────────────────────
+//
+// 控件绘制时最常做的一件事：「根据 hover/pressed/disabled 三态
+// 选一个填充色」。写成函数，避免 20 个组件的 draw 里各写一遍
+// 同样的 if 链。
+fn Style.fillFor(self: Style, hover: Bool, active: Bool, enabled: Bool) -> Int {
+    if (!enabled) { return self.fill }
+    if (active) { return self.fillActive }
+    if (hover) { return self.fillHover }
+    return self.fill
+}
+
+fn Style.textFor(self: Style, enabled: Bool, th: Theme) -> Int {
+    if (!enabled) { return th.disabled }
+    if (self.text == UI_NONE) { return th.text }
+    return self.text
+}

@@ -1,0 +1,676 @@
+// web.xle — xboot 的 Web 层：注解路由 + 参数绑定 + 统一返回体
+//
+// ── 这一层的三个职责 ──────────────────────────────────────
+//
+//   1. 注解路由：把 @RestController 类里的 @GetMapping 等注解
+//      扫描成 stdlib Router 的路由表（scanRoutes）
+//   2. 参数绑定：把 HTTP 请求的路径变量 / 查询串 / body JSON 按
+//      methodParams 反射出的参数清单装配成实参数组（wbBindArgs）
+//   3. 统一返回体：handler 返回什么值，框架统一包装成
+//      {code, message, data}（rOk / rFail，dispatchRequest）
+//
+// ── 为什么路由表复用 stdlib 的 Router ─────────────────────
+//
+// Router 已经解决了模式匹配（:param 段）、404/405 区分（含 Allow 头）、
+// HEAD 复用 GET、末尾斜杠归一化 —— 这些是 HTTP 语义问题，不是框架
+// 问题，重写一遍只会引入第二套不一致的行为。xboot 做的只是「把注解
+// 翻译成路由注册」：扫描期一次，运行期零成本。
+//
+// 注册名用 handlerName 承载「bean::method」二元组 —— Router 的
+// handlerName 本来就是字符串（语言没有函数值），这里把两个语义装进
+// 同一个字符串，dispatchRequest 解析后 methodCall 按名调用。
+//
+// ── 为什么路径风格用 {id} 而注册时转成 :id ─────────────────
+//
+// 用户按 Spring 习惯写 @GetMapping("/users/{id}")。stdlib Router 的
+// 参数段语法是 :id。转换发生在扫描期（wjBraceToColon），用户代码
+// 保持 Spring 风格，运行时用 stdlib 的匹配器 —— 两边的惯用语法都
+// 没有被破坏。
+
+from "anno.xle" import mappingAnnoNames, isComponentAnno, beanNameOf, camelToSnake, isComponentClass, annoHasInherited, annoGetInherited, annoGetKVInherited, ANNO_COMPONENT, ANNO_SERVICE, ANNO_REPOSITORY, ANNO_CONTROLLER, ANNO_RESTCONTROLLER, ANNO_MAPPER, ANNO_AUTOWIRED, ANNO_VALUE, ANNO_GET_MAPPING, ANNO_POST_MAPPING, ANNO_PUT_MAPPING, ANNO_DELETE_MAPPING, ANNO_PATCH_MAPPING, ANNO_REQUEST_MAPPING, ANNO_TABLE, ANNO_TABLE_ID, ANNO_COLUMN, ANNO_QUERY
+from "ioc.xle" import convertByType, Container
+from "../../stdlib/net/http/server.xle" import hsHttpDateNow, Context, HttpServer
+from "../../stdlib/net/http/router.xle" import rnNormalizePattern, rnMatchPattern, rnSplitSegs, arrHas, Route, Match, Router
+from "../../stdlib/json.xle" import jsonParse, jsonParseScalar, jsonInt, jsonSetInt, jsonCur, jsonSkipWs, jsonFail, jsonParseValue, jsonExpect, jsonParseNumber, jsonParseString, jsonParseEscape, jsonHex4, jsonParseArray, jsonParseObject, jsonIsObject, jsonTypeOf, jsonGet, jsonGetOr, jsonHas, jsonKeys, jsonValues, jsonStringify, jsonArrayAny, jsonQuote, jsonHex, jsonNull, jsonNullValue, jsonBool, jsonNumber, jsonIntLit, jsonArrayOfStrings, jsonObject
+
+// ============================================================
+// JSON 序列化
+// ============================================================
+//
+// ── 为什么不直接用 jsonStringify ────────────────────────────
+//
+// stdlib 的 jsonStringify 不认识实例（Struct）：实例会走到
+// toString 分支，输出「User@0x1a2b」这种内存地址文本。REST 返回体
+// 的主体恰恰是实例和实例数组，所以框架要自己的递归序列化：
+//
+//   标量    → JSON 字面量（字符串加引号，null 输出 null）
+//   Array   → [元素, ...] 逐个递归
+//   Struct  → {"public 字段": 值, ...} 递归
+//
+// Struct 只序列化 **public 字段** —— 封装原则在序列化边界同样成立：
+// private 字段是内部状态，把它们泄漏进 JSON 是封装的静默溃口
+// （用户 memory 里的约定：VO 设计要防隐私字段泄漏，这里兑现）。
+
+// 标量 → JSON 文本。
+fn wjScalar(v) -> String {
+    let t = typeOf(v)
+    if (t == "Null")   { return "null" }
+    if (t == "String") { return jsonQuote(v) }
+    if (t == "Bool")   { return toString(v) }
+    // Int / Float：toString 就是合法的 JSON 数字
+    return toString(v)
+}
+
+// 实例的 public 字段序列化。classFields 返回 [[name, type, vis, final], ...]。
+fn wjFields(clsName: String, inst) -> String {
+    var out = "{"
+    let fields = classFields(clsName)
+    var first = true
+    var i = 0
+    while i < len(fields) {
+        let row: Array = fields[i]
+        let fname = toString(row[0])
+        let vis   = toString(row[2])
+        if (vis == "public") {
+            let v = fieldGet(inst, fname)
+            if (!first) { out = out + "," }
+            out = out + jsonQuote(fname) + ":" + wjValue(v)
+            first = false
+        }
+        i = i + 1
+    }
+    return out + "}"
+}
+
+// 任意值 → JSON 文本（递归）。
+//
+// ── 实例的判定是 "Class" 不是 "Struct" ──────────────────────
+//
+// 探针结论：typeOf(实例) 返回 "Class"，className(实例) 才是类名。
+// 别按直觉写成 "Struct"/"Object" —— 这个语言里 "Struct" 不是任何
+// 值的类型名。
+//
+// 循环引用防护：两对象互相引用会无限递归栈溢出。语言的 Struct 没有
+// 身份比较（== 对实例是值比较还是引用比较未定义），无法做 visited 集
+// —— 这是已知边界。实体和 VO 是树形数据（父持子、子不持父），正常
+// 设计不会成环；注释说明，不做运行时防护。
+fn wjValue(v) -> String {
+    let t = typeOf(v)
+    if (t == "Array") {
+        var out = "["
+        var i = 0
+        while i < len(v) {
+            if (i > 0) { out = out + "," }
+            out = out + wjValue(v[i])
+            i = i + 1
+        }
+        return out + "]"
+    }
+    if (t == "Class") {
+        return wjFields(className(v), v)
+    }
+    return wjScalar(v)
+}
+
+// ============================================================
+// 统一返回体
+// ============================================================
+//
+// ── 为什么是顶层函数而不是 R 类 ─────────────────────────────
+//
+// R 类的 data 字段要装任意值（实例、数组、标量），而字段声明必须有
+// 静态类型，语言没有「任意类型」字段（容器用 Array 装实例是同类
+// 问题的妥协）。返回体只需要「生成 JSON 字符串」，不需要「持有值」
+// —— 所以 R 是一组生成函数，handler 直接 return rOk(u)。
+//
+// 这也是用户团队的全局返回体约定：controller 不手动包 success，
+// 框架统一处理。handler 的返回值就是 data 的内容。
+
+const R_CODE_OK = 0
+const R_MSG_OK  = "success"
+
+// 成功：{"code":0,"message":"success","data":...}
+fn rOk(v) -> String {
+    return "{\"code\":" + toString(R_CODE_OK) +
+           ",\"message\":" + jsonQuote(R_MSG_OK) +
+           ",\"data\":" + wjValue(v) + "}"
+}
+
+// 成功（自定义消息）。
+fn rOkMsg(v, msg: String) -> String {
+    return "{\"code\":" + toString(R_CODE_OK) +
+           ",\"message\":" + jsonQuote(msg) +
+           ",\"data\":" + wjValue(v) + "}"
+}
+
+// 失败：{"code":非0,"message":..., "data":null}
+fn rFail(code: Int, msg: String) -> String {
+    return "{\"code\":" + toString(code) +
+           ",\"message\":" + jsonQuote(msg) +
+           ",\"data\":null}"
+}
+
+// 分页：data = {"records":[...], "total":n}
+// MyBatis-Plus 的 IPage 形态对应物。
+fn rPage(records: Array, total: Int) -> String {
+    return "{\"code\":" + toString(R_CODE_OK) +
+           ",\"message\":" + jsonQuote(R_MSG_OK) +
+           ",\"data\":{\"records\":" + wjValue(records) +
+           ",\"total\":" + toString(total) + "}}"
+}
+
+// ============================================================
+// 路由扫描
+// ============================================================
+
+// 拼接类级前缀和方法路径，处理斜杠边界。
+//   ("", "/users")     → /users
+//   ("/api", "/users") → /api/users
+//   ("/api/", "users") → /api/users
+fn wjJoinPath(a: String, b: String) -> String {
+    var l = a
+    var r = b
+    while (len(l) > 0 && strEnds(l, "/")) {
+        l = strSub(l, 0, len(l) - 1)
+    }
+    while (len(r) > 0 && strStarts(r, "/")) {
+        r = strSub(r, 1, len(r))
+    }
+    if (len(l) == 0 && len(r) == 0) { return "/" }
+    if (len(l) == 0) { return "/" + r }
+    if (len(r) == 0) { return l }
+    return l + "/" + r
+}
+
+// {var} → :var。stdlib Router 的参数段语法是 :name，用户的注解按
+// Spring 习惯写 {name}。扫描期转一次，运行期零成本。
+fn wjBraceToColon(path: String) -> String {
+    return strReplace(strReplace(path, "{", ":"), "}", "")
+}
+
+// 方法级映射注解 → HTTP 方法。
+// @RequestMapping 标在方法上时是通用映射：KV 里给 method = "GET"，
+// 不给缺省 GET（与 Spring 的缺省一致 —— 实际上 Spring 缺省是任意
+// 方法，这里收窄成 GET 是因为无参注解最常表达的意图就是「这个
+// 路径用 GET 看」，收窄让路由表更诚实）。
+fn wjAnnoMethod(annoName: String, clsName: String, mname: String) -> String {
+    if (annoName == ANNO_GET_MAPPING)    { return "GET" }
+    if (annoName == ANNO_POST_MAPPING)   { return "POST" }
+    if (annoName == ANNO_PUT_MAPPING)    { return "PUT" }
+    if (annoName == ANNO_DELETE_MAPPING) { return "DELETE" }
+    if (annoName == ANNO_PATCH_MAPPING)  { return "PATCH" }
+    // ANNO_REQUEST_MAPPING
+    let kv = annoGetKVInherited(clsName, "method", mname, ANNO_REQUEST_MAPPING)
+    var i = 0
+    while i < len(kv) {
+        let row: Array = kv[i]
+        if (toString(row[0]) == "method") {
+            return strUpper(toString(row[1]))
+        }
+        i = i + 1
+    }
+    return "GET"
+}
+
+// 统计模式里的参数段数（:name 段）。/api/users/:id/post/:pid → 2。
+fn wjParamCount(pattern: String) -> Int {
+    let segs = strSplit(pattern, "/")
+    var n = 0
+    var i = 0
+    while i < len(segs) {
+        if (strStarts(toString(segs[i]), ":")) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// 扫描容器里全部 @Controller / @RestController Bean，把方法上的
+// 映射注解注册进 Router。返回注册的路由条数。
+//
+// ── 为什么扫描的是容器的 Bean 清单 ─────────────────────────
+//
+// classAll() 会列出字节码里的**全部**类（含框架类、实体类）。容器
+// scan() 已经按组件注解过滤过一遍，controller 一定是 Bean —— 在
+// 容器清单上做 Web 扫描，等于把「谁参与路由」收敛到「谁被容器
+// 管理」，两层扫描不会出现不一致（比如实体类上误标 @GetMapping
+// 这种永远不会被发现的死注解）。
+//
+// ── 为什么注册前要排序 ─────────────────────────────────────
+//
+// stdlib Router 的匹配优先级 = 注册顺序。注解方法的枚举顺序来自
+// classMethods 的虚表槽序 —— 它**不是**源码声明顺序（实测同一
+// controller 的方法枚举顺序与声明顺序不同）。如果直接按枚举序
+// 注册，「/api/users/count」就可能排在「/api/users/{id}」之后，
+// 被 :id 吃掉 —— 而且只在特定方法组合下发生，换一行声明顺序就
+// 复现/消失，是最难查的那种 bug。
+//
+// 解法：先收集全部路由，按**参数段数升序**（参数少 = 更具体 =
+// 优先）稳定排序后再注册。classMethods 的枚举序保持为同权重
+// 路由间的次序，结果与「用户把静态路径写前面」的直觉一致，
+// 且不再依赖源码顺序。
+fn scanRoutes(container: Container, router: Router) -> Int {
+    // ── 阶段 1：收集（平行数组，元素 [method, pattern, handler]）──
+    var collected: Array = []
+    var i = 0
+    while i < len(container.classes) {
+        let cn = toString(container.classes[i])
+        let isRest = annoHasInherited(cn, "class", "", ANNO_RESTCONTROLLER) ||
+                     annoHasInherited(cn, "class", "", ANNO_CONTROLLER)
+        if (isRest) {
+            // 类级前缀：@RequestMapping("/api") 的第一个位置实参。
+            let prefixArr = annoGetInherited(cn, "class", "", ANNO_REQUEST_MAPPING)
+            var prefix = ""
+            if (len(prefixArr) > 0) {
+                prefix = toString(prefixArr[0])
+            }
+            // Bean 名 = handlerName 前半段。用容器登记的 bean 名
+            //（扫描时可能被显式改名），不用 beanNameOf 重算。
+            let beanName = toString(container.names[i])
+
+            // classMethods 返回 [[name, vis], ...]（虚表实现过的）。
+            let methods = classMethods(cn)
+            var m = 0
+            while m < len(methods) {
+                let mrow: Array = methods[m]
+                let mname = toString(mrow[0])
+                // 依次查 5 个专类注解，再查通用 @RequestMapping
+                let allAnnos = mappingAnnoNames()
+                var found = false
+                var a = 0
+                while a < len(allAnnos) {
+                    let ano = toString(allAnnos[a])
+                    if (annoHasInherited(cn, "method", mname, ano)) {
+                        let pArr = annoGetInherited(cn, "method", mname, ano)
+                        var sub = ""
+                        if (len(pArr) > 0) {
+                            sub = toString(pArr[0])
+                        }
+                        let pattern = wjBraceToColon(wjJoinPath(prefix, sub))
+                        let httpMethod = wjAnnoMethod(ano, cn, mname)
+                        arrPush(collected, [httpMethod, pattern,
+                                            beanName + "::" + mname])
+                        found = true
+                        // 一个方法只认第一个命中的映射注解 —— 两个映射
+                        // 注解标同一方法是无意义配置，先到先得并在
+                        // 这里静默取第一个（与 Spring 的「重复映射
+                        // 启动报错」相比弱一档，但避免双路由行为）。
+                        a = len(allAnnos)
+                    } else {
+                        a = a + 1
+                    }
+                }
+                if (!found && annoHasInherited(cn, "method", mname, ANNO_REQUEST_MAPPING)) {
+                    let pArr = annoGetInherited(cn, "method", mname, ANNO_REQUEST_MAPPING)
+                    var sub = ""
+                    if (len(pArr) > 0) {
+                        sub = toString(pArr[0])
+                    }
+                    let pattern = wjBraceToColon(wjJoinPath(prefix, sub))
+                    let httpMethod = wjAnnoMethod(ANNO_REQUEST_MAPPING, cn, mname)
+                    arrPush(collected, [httpMethod, pattern,
+                                        beanName + "::" + mname])
+                }
+                m = m + 1
+            }
+        }
+        i = i + 1
+    }
+
+    // ── 阶段 2：按参数段数升序稳定排序（插入排序）──────────
+    var j = 1
+    while j < len(collected) {
+        let cur: Array = collected[j]
+        let curW = wjParamCount(toString(cur[1]))
+        var k = j - 1
+        while k >= 0 {
+            let prev: Array = collected[k]
+            if (wjParamCount(toString(prev[1])) <= curW) {
+                break
+            }
+            collected[k + 1] = prev
+            k = k - 1
+        }
+        collected[k + 1] = cur
+        j = j + 1
+    }
+
+    // ── 阶段 3：注册 ──
+    var i3 = 0
+    while i3 < len(collected) {
+        let row: Array = collected[i3]
+        router.add(toString(row[0]), toString(row[1]), toString(row[2]))
+        i3 = i3 + 1
+    }
+    return len(collected)
+}
+
+// ============================================================
+// 参数绑定
+// ============================================================
+//
+// ── 绑定源与优先级 ─────────────────────────────────────────
+//
+// handler 的参数从四个来源按顺序解析，先到先得：
+//
+//   1. 路径变量   /users/{id} 里的 id（路由匹配已提取）
+//   2. 查询串     ?name=tom 里的 name
+//   3. body JSON  {"name":"tom"} 的顶层字段（Content-Type 含 json）
+//   4. 实体绑定   参数类型是自定义类 → 整个 body 填进新实例
+//
+// 参数类型是 Context 时直接注入 ctx 本身 —— handler 需要读请求头、
+// 写自定义响应时的逃逸舱口（对应 Spring 注入 HttpServletRequest）。
+//
+// 标量参数缺失时给声明类型的零值（Int 0 / String "" ...）而不是
+// 400 —— Spring 的必填语义靠 @RequestParam(required=true) 声明，
+// 本框架还没有参数级注解的必填机制，宽松缺省对 demo 和内部工具
+// 是更实用的默认。类型不匹配（?id=abc 绑 Int）才是错误 → 400。
+
+// 平行数组按名查值。不存在返回 null（用 arrPop([]) 造 Null 值 ——
+// 语言没有 null 字面量，这是 stdlib json.xle 里确立的唯一可靠来源）。
+fn wjLookup(names: Array, vals: Array, key: String) {
+    var i = 0
+    while i < len(names) {
+        if (toString(names[i]) == key) { return vals[i] }
+        i = i + 1
+    }
+    return arrPop([])
+}
+
+// 扁平交替数组（jsonParse 的 object 形态）按名查值。不存在返回 null。
+fn wjLookupFlat(kv: Array, key: String) {
+    var i = 0
+    while i < len(kv) {
+        if (toString(kv[i]) == key) { return kv[i + 1] }
+        i = i + 2
+    }
+    return arrPop([])
+}
+
+// JSON 值 → 可转换的字符串形态。只处理标量：String 原样、
+// Int/Float/Bool 走 toString。数组和嵌套对象没有标量形态，返回
+// null 让调用方跳过（实体字段类型不匹配时静默保持零值，和数据库
+// 行填充 fillEntity 的行为一致）。
+fn wjScalarStr(v) -> String {
+    let t = typeOf(v)
+    if (t == "String") { return v }
+    if (t == "Int" || t == "Float" || t == "Bool") { return toString(v) }
+    return arrPop([])
+}
+
+// 标量字符串 → 目标类型。返回 [ok, value] 或 [false, 错误消息]。
+//
+// 与 ioc.xle convertByType 的差别：这里带格式校验（strIsInt /
+// strIsFloat），因为配置文件里的坏值启动时就发现，而请求参数的坏
+// 值在运行时 —— 必须转成 400 而不是静默 0。
+fn wjConvertScalar(raw: String, typeName: String, pname: String) -> Array {
+    if (typeName == "Int") {
+        if (!strIsInt(raw)) {
+            return [false, "参数 `" + pname + "` 期望 Int，实际 `" + raw + "`"]
+        }
+        return [true, strParseInt(raw)]
+    }
+    if (typeName == "Float") {
+        if (!strIsFloat(raw)) {
+            return [false, "参数 `" + pname + "` 期望 Float，实际 `" + raw + "`"]
+        }
+        return [true, strParseFloat(raw)]
+    }
+    if (typeName == "Bool") {
+        let lo = strLower(strTrim(raw))
+        if (lo == "true" || lo == "1" || lo == "yes" || lo == "on") {
+            return [true, true]
+        }
+        if (lo == "false" || lo == "0" || lo == "no" || lo == "off") {
+            return [true, false]
+        }
+        return [false, "参数 `" + pname + "` 期望 Bool，实际 `" + raw + "`"]
+    }
+    if (typeName == "String") {
+        return [true, raw]
+    }
+    return [false, "参数 `" + pname + "` 的类型 `" + typeName +
+                   "` 不支持标量绑定"]
+}
+
+// JSON body 的安全预校验。
+//
+// ── 为什么这个函数必须存在 ─────────────────────────────────
+//
+// stdlib 的 jsonParse 解析失败走 fail() —— **直接退出进程**。
+// 服务进程被一个畸形请求体杀死（{"a": 就够了），等于把 DoS 的
+// 门槛降到了一行 curl。语言没有异常机制，jsonParse 没有可捕获的
+// 变体，所以在调用它之前做轻量结构校验：括号配对 + 字符串闭合。
+//
+// 这是拦截不是等价 —— 转义序列错误（"\\q"）等深层畸形仍会穿透到
+// jsonParse。彻底的解法在语言层（fail 可捕获，或 tryCall 内建），
+// 属于后续语言迭代；本函数先堵住最常见的畸形形态。
+fn wjSafeScan(src: String) -> Bool {
+    var depthSq = 0
+    var depthCu = 0
+    var inStr = false
+    var escaped = false
+    var i = 0
+    let n = len(src)
+    while i < n {
+        let ch = strAt(src, i)
+        if (inStr) {
+            if (escaped) {
+                escaped = false
+            } else if (ch == "\\") {
+                escaped = true
+            } else if (ch == "\"") {
+                inStr = false
+            }
+        } else {
+            if (ch == "\"") {
+                inStr = true
+            } else if (ch == "[") {
+                depthSq = depthSq + 1
+            } else if (ch == "]") {
+                depthSq = depthSq - 1
+                if (depthSq < 0) { return false }
+            } else if (ch == "{") {
+                depthCu = depthCu + 1
+            } else if (ch == "}") {
+                depthCu = depthCu - 1
+                if (depthCu < 0) { return false }
+            }
+        }
+        i = i + 1
+    }
+    // 字符串未闭合、括号有剩余都算畸形
+    if (inStr) { return false }
+    if (depthSq != 0 || depthCu != 0) { return false }
+    return true
+}
+
+// 实体绑定：body JSON 的顶层字段填进新实例。
+// 返回 [true, 实例] 或 [false, 错误消息]。
+fn wjBindEntity(typeName: String, bodyKV: Array) -> Array {
+    // classNew 对带参构造给出明确报错 —— 实体的构造约定是无参
+    //（字段直接写在声明上），违约在此暴露。
+    let inst = classNew(typeName, [])
+    let fields = classFields(typeName)
+    var i = 0
+    while i < len(fields) {
+        let row: Array = fields[i]
+        let fname = toString(row[0])
+        let ftype = toString(row[1])
+        let raw = wjLookupFlat(bodyKV, fname)
+        if (typeOf(raw) != "Null") {
+            let s = wjScalarStr(raw)
+            if (typeOf(s) == "String") {
+                let conv = wjConvertScalar(s, ftype, typeName + "." + fname)
+                if (conv[0] == true) {
+                    fieldSet(inst, fname, conv[1])
+                }
+                // 类型不匹配的字段静默保持零值 —— 与 fillEntity 的
+                // 数据库行填充行为一致：部分字段缺失不该让整个
+                // 请求失败，业务校验（service 层）负责兜底。
+            }
+        }
+        i = i + 1
+    }
+    return [true, inst]
+}
+
+// 绑定 handler 的全部参数。返回 [true, argsArray] 或 [false, 错误消息]。
+//
+// ── 为什么错误不直接 ctx.badRequest ─────────────────────────
+//
+// 绑定器不知道响应怎么写（它可能被非 HTTP 场景复用），把错误作为
+// 数据返回，由 dispatchRequest 决定响应形态 —— 数据流单向，绑定器
+// 保持纯函数。
+fn wbBindArgs(ctx: Context, clsName: String, methodName: String) -> Array {
+    // methodParams 返回 [[name, type], ...]，第 0 行是 self。
+    let rows = methodParams(clsName, methodName)
+
+    // 三个标量来源
+    let pathNames: Array = ctx.routing.paramNames
+    let pathVals: Array  = ctx.routing.paramValues
+    let qr = ctx.req.queryParams()
+    let qNames: Array = qr[0]
+    let qVals: Array  = qr[1]
+
+    // body JSON（Content-Type 含 json 才解析）。
+    //
+    // ── 顶层形态判定为什么用首字符 ──────────────────────
+    //
+    // jsonParse 的 object 返回**扁平交替数组**（["k1", v1, "k2", v2]，
+    // 首元素是 String 键），array 返回元素数组（首元素可能是 Int/
+    // String/Array 任意）。靠「首元素是不是 Array」区分会误判
+    // （数组 [1,2] 的首元素是 Int）。body 剥掉空白后的首字符 '{'
+    // 才是 object 的可靠标志 —— 它直接来自 JSON 语法本身。
+    var bodyKV: Array = []
+    var hasBody = false
+    let ct = strLower(ctx.req.headers.get("content-type"))
+    let bt = ctx.req.bodyText()
+    if (strFind(ct, "json") >= 0 && len(bt) > 0) {
+        if (!wjSafeScan(bt)) {
+            return [false, "请求体不是合法的 JSON（括号配对或字符串闭合检查未通过）"]
+        }
+        let trimmed = strTrim(bt)
+        if (strStarts(trimmed, "{")) {
+            let parsed = jsonParse(bt)
+            bodyKV = parsed
+            hasBody = len(parsed) > 0
+        }
+        // 顶层数组 / 标量：标量绑定取不到字段，实体绑定没有字段
+        // 来源 —— 按「无可用 body」处理。
+    }
+
+    var args: Array = []
+    var i = 1          // 跳过 self
+    while i < len(rows) {
+        let row: Array = rows[i]
+        let pname = toString(row[0])
+        let ptype = toString(row[1])
+
+        // Context 注入：逃逸舱口
+        if (ptype == "Context") {
+            arrPush(args, ctx)
+            i = i + 1
+            continue
+        }
+
+        // 自定义类 → 实体绑定
+        if (ptype != "Int" && ptype != "Float" && ptype != "Bool" &&
+            ptype != "String") {
+            if (!hasBody) {
+                return [false, "参数 `" + pname + "` 类型为 `" + ptype +
+                               "`，需要 JSON 请求体（Content-Type: application/json）"]
+            }
+            let be = wjBindEntity(ptype, bodyKV)
+            if (be[0] != true) {
+                return be
+            }
+            arrPush(args, be[1])
+            i = i + 1
+            continue
+        }
+
+        // 标量：路径变量 → 查询串 → body 顶层字段
+        var raw = wjLookup(pathNames, pathVals, pname)
+        if (typeOf(raw) == "Null") {
+            raw = wjLookup(qNames, qVals, pname)
+        }
+        if (typeOf(raw) == "Null" && hasBody) {
+            raw = wjScalarStr(wjLookupFlat(bodyKV, pname))
+        }
+
+        if (typeOf(raw) == "Null") {
+            // 缺失 → 声明类型零值
+            if (ptype == "Int")    { arrPush(args, 0);        i = i + 1; continue }
+            if (ptype == "Float")  { arrPush(args, 0.0);      i = i + 1; continue }
+            if (ptype == "Bool")   { arrPush(args, false);    i = i + 1; continue }
+            arrPush(args, "")
+            i = i + 1
+            continue
+        }
+
+        let conv = wjConvertScalar(toString(raw), ptype, pname)
+        if (conv[0] != true) {
+            return [false, toString(conv[1])]
+        }
+        arrPush(args, conv[1])
+        i = i + 1
+    }
+    return [true, args]
+}
+
+// ============================================================
+// 请求分派
+// ============================================================
+
+// 把一个已路由的请求分派到 Bean 方法上。返回是否处理（false =
+// 路由未命中或不是 xboot 的路由，调用方继续走自己的逻辑）。
+//
+// ── handler 返回值的三种形态 ────────────────────────────────
+//
+//   String 以 { 开头  → 视为已是统一返回体 JSON（rOk/rFail 的产物），
+//                       原样作为 body，状态码 200（失败信息在 code 里，
+//                       HTTP 层保持 200 是国内返回体的常见约定）
+//   其他非 null 值    → 框架统一包装 rOk(value) —— controller 只
+//                       返回业务数据，包裹由框架负责
+//   null              → handler 自己写过响应（注入了 ctx 参数），
+//                       框架不再碰 ctx.resp —— 逃逸舱口的约定
+fn dispatchRequest(ctx: Context, container: Container) -> Bool {
+    if (!ctx.routing.matched) {
+        return false
+    }
+    let hn = ctx.routing.route.handlerName
+    // xboot 的路由名是 "bean::method"；非此形态的是调用方手工注册
+    // 的框架路由（如健康检查），不归本分派器管。
+    let sep = strFind(hn, "::")
+    if (sep < 0) {
+        return false
+    }
+    let beanName = strSub(hn, 0, sep)
+    let mname    = strSub(hn, sep + 2, len(hn))
+
+    // Bean 存在性由容器保证（scanRoutes 只注册容器里登记过的 Bean），
+    // container.get 对不存在的名字 fail fast。
+    let inst = container.get(beanName)
+    let clsName = container.classNameOf(beanName)
+
+    let bound = wbBindArgs(ctx, clsName, mname)
+    if (bound[0] != true) {
+        ctx.badRequest(toString(bound[1]))
+        return true
+    }
+
+    let args: Array = bound[1]
+    let result = methodCall(inst, mname, args)
+
+    if (typeOf(result) == "Null") {
+        return true
+    }
+    if (typeOf(result) == "String" && strStarts(result, "{")) {
+        ctx.json(200, result)
+        return true
+    }
+    ctx.json(200, rOk(result))
+    return true
+}

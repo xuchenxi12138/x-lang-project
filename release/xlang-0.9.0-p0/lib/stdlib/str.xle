@@ -1,0 +1,428 @@
+// ============================================================
+// std.str —— 字符串工具
+// ============================================================
+//
+// 基础操作（strAt/strSub/strFind/strSplit/strJoin/strUpper/
+// strLower/strTrim/strReplace/strStarts/strEnds/strRepeat/
+// strCode/strFromCode/strParseInt/strParseFloat）已经是内建。
+//
+// 这里补的是**组合工具**：补齐/填充、大小写变体、切分细节、
+// 逐行处理、URL/路径片段、正则无关的模式匹配等等。
+//
+// ── 全部按码点 ──────────────────────────────────────────────
+//
+// 内建已经按码点索引，这一层继续按码点，不引入字节概念。
+// 唯一需要注意：strUpper/strLower 只处理 ASCII（全角与中文
+// 原样保留），这是内建的行为，这里不再造一套 Unicode 大小写表
+// （那需要几百 KB 数据表，超出标准库的合理体积）。
+
+// ---- 判空与前后缀 ----
+
+fn strIsEmpty(s: String) -> Bool {
+    return len(s) == 0
+}
+
+fn strIsBlank(s: String) -> Bool {
+    return len(strTrim(s)) == 0
+}
+
+// 去掉所有前导空白
+fn strTrimStart(s: String) -> String {
+    var i = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+            i = i + 1
+        } else {
+            return strSub(s, i, len(s))
+        }
+    }
+    return ""
+}
+
+// 去掉所有尾随空白
+fn strTrimEnd(s: String) -> String {
+    var e = len(s)
+    while (e > 0) {
+        let c = strAt(s, e - 1)
+        if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+            e = e - 1
+        } else {
+            return strSub(s, 0, e)
+        }
+    }
+    return ""
+}
+
+// ---- 补齐与填充 ----
+//
+// 长度按码点算，不是显示宽度：中文字符占两列，但这里只管
+// 「几个字符」。要按列对齐（表格排版）得另外算宽度，见 strDisplayWidth。
+
+// 左补齐（右对齐）。padChar 应当是单个字符。
+fn strPadLeft(s: String, width: Int, padChar: String) -> String {
+    let need = width - len(s)
+    if (need <= 0) { return s }
+    return strRepeat(padChar, need) + s
+}
+
+// 右补齐（左对齐）
+fn strPadRight(s: String, width: Int, padChar: String) -> String {
+    let need = width - len(s)
+    if (need <= 0) { return s }
+    return s + strRepeat(padChar, need)
+}
+
+// 居中。多出的一个空格给右边（与 printf 的 %-*s 居中习惯一致）。
+fn strPadCenter(s: String, width: Int, padChar: String) -> String {
+    let need = width - len(s)
+    if (need <= 0) { return s }
+    let left = need / 2
+    let right = need - left
+    return strRepeat(padChar, left) + s + strRepeat(padChar, right)
+}
+
+// 显示宽度：中文/全角算 2 列，ASCII 算 1 列。
+// 用于终端表格对齐 —— 用 len 对齐会让含中文的列全部错位。
+fn strDisplayWidth(s: String) -> Int {
+    var w = 0
+    var i = 0
+    while (i < len(s)) {
+        let cp = strCode(strAt(s, i))
+        if (cp < 128) {
+            w = w + 1
+        } else if (cp >= 12288 && cp <= 12351) {
+            w = w + 2      // CJK 标点
+        } else if (cp >= 65280 && cp <= 65519) {
+            w = w + 2      // 全角字符
+        } else if (cp >= 19968 && cp <= 40959) {
+            w = w + 2      // CJK 统一表意文字
+        } else if (cp >= 12352 && cp <= 12447) {
+            w = w + 2      // 平假名
+        } else if (cp >= 12448 && cp <= 12543) {
+            w = w + 2      // 片假名
+        } else if (cp >= 44032 && cp <= 55203) {
+            w = w + 2      // 韩文
+        } else {
+            w = w + 1
+        }
+        i = i + 1
+    }
+    return w
+}
+
+// 按显示宽度补齐。终端表格专用。
+fn strPadDisplayRight(s: String, cols: Int) -> String {
+    let need = cols - strDisplayWidth(s)
+    if (need <= 0) { return s }
+    return s + strRepeat(" ", need)
+}
+
+// ---- 切分细节 ----
+
+// 只切前 n 段，剩下的整体作为最后一段。
+// 用途：拆分 "a.b.c.d" 取前两段时，不希望丢掉 ".c.d"。
+fn strSplitN(s: String, sep: String, n: Int) -> Array {
+    let out = array(0, "")
+    if (n <= 0) { return out }
+    if (sep == "") { return strSplit(s, sep) }
+    var start = 0
+    var i = 0
+    var done = 0
+    while (i + len(sep) <= len(s) && done < n - 1) {
+        if (strSub(s, i, i + len(sep)) == sep) {
+            arrPush(out, strSub(s, start, i))
+            i = i + len(sep)
+            start = i
+            done = done + 1
+        } else {
+            i = i + 1
+        }
+    }
+    arrPush(out, strSub(s, start, len(s)))
+    return out
+}
+
+// 按行切。同时接受 \r\n 与 \n（Windows 与 Unix 文本混用是常态）。
+// 末尾的空行会被去掉：文件以换行结尾是规范，不该多出一行空行。
+fn strLines(s: String) -> Array {
+    let out = array(0, "")
+    var start = 0
+    var i = 0
+    while (i < len(s)) {
+        let c = strAt(s, i)
+        if (c == "\n") {
+            var end = i
+            // 吃掉 \r\n 里的 \r
+            if (end > start && strAt(s, end - 1) == "\r") { end = end - 1 }
+            arrPush(out, strSub(s, start, end))
+            i = i + 1
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    if (start < len(s)) {
+        arrPush(out, strSub(s, start, len(s)))
+    }
+    return out
+}
+
+// 行数。空串算 0 行，与 strLines 的长度一致。
+fn strLineCount(s: String) -> Int {
+    return len(strLines(s))
+}
+
+// ---- 查找与替换的补充 ----
+
+// 替换前 n 次。strReplace 只有一个不留。
+fn strReplaceN(s: String, pat: String, to: String, n: Int) -> String {
+    if (n <= 0 || pat == "") { return s }
+    var out = ""
+    var i = 0
+    var done = 0
+    while (i < len(s)) {
+        if (done < n && i + len(pat) <= len(s) && strSub(s, i, i + len(pat)) == pat) {
+            out = out + to
+            i = i + len(pat)
+            done = done + 1
+        } else {
+            out = out + strAt(s, i)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// 查找第 n 次出现的位置（n 从 1 起）。找不到返回 -1。
+fn strFindNth(s: String, sub: String, n: Int) -> Int {
+    if (n <= 0 || sub == "") { return -1 }
+    var pos = 0
+    var k = 0
+    while (true) {
+        let at = strFindFrom(s, sub, pos)
+        if (at < 0) { return -1 }
+        k = k + 1
+        if (k == n) { return at }
+        pos = at + 1
+    }
+    return -1
+}
+
+// 出现次数（不重叠）
+fn strCount(s: String, sub: String) -> Int {
+    if (sub == "") { return 0 }
+    var n = 0
+    var pos = 0
+    while (true) {
+        let at = strFindFrom(s, sub, pos)
+        if (at < 0) { return n }
+        n = n + 1
+        pos = at + len(sub)
+    }
+    return n
+}
+
+// 反转。按码点，不是按字节 —— 按字节会把中文变成乱码。
+fn strReverse(s: String) -> String {
+    var out = ""
+    var i = len(s) - 1
+    while (i >= 0) {
+        out = out + strAt(s, i)
+        i = i - 1
+    }
+    return out
+}
+
+// ---- 实用工具 ----
+
+// 首个非空行，用于「取摘要」这类场景。
+fn strFirstLine(s: String) -> String {
+    let lines = strLines(s)
+    if (len(lines) == 0) { return "" }
+    return lines[0]
+}
+
+// 截断到 n 个码点，超出加省略号。n 已包含省略号的位置，
+// 所以结果长度不会超过 n。
+fn strEllipsis(s: String, n: Int) -> String {
+    if (n <= 0) { return "" }
+    if (len(s) <= n) { return s }
+    if (n <= 3) { return strSub(s, 0, n) }
+    return strSub(s, 0, n - 3) + "..."
+}
+
+// 是否是纯数字（可带符号，不含小数点）
+fn strIsInt(s: String) -> Bool {
+    let t = strTrim(s)
+    if (len(t) == 0) { return false }
+    var i = 0
+    let c0 = strAt(t, 0)
+    if (c0 == "+" || c0 == "-") { i = 1 }
+    if (i >= len(t)) { return false }
+    while (i < len(t)) {
+        let c = strAt(t, i)
+        let cp = strCode(c)
+        if (cp < 48 || cp > 57) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// 是否是十进制数（可带符号、小数点、指数）
+fn strIsFloat(s: String) -> Bool {
+    let t = strTrim(s)
+    if (len(t) == 0) { return false }
+    var i = 0
+    let c0 = strAt(t, 0)
+    if (c0 == "+" || c0 == "-") { i = 1 }
+    var digits = 0
+    var dots = 0
+    while (i < len(t)) {
+        let c = strAt(t, i)
+        let cp = strCode(c)
+        if (cp >= 48 && cp <= 57) {
+            digits = digits + 1
+        } else if (c == ".") {
+            dots = dots + 1
+            if (dots > 1) { return false }
+        } else if (c == "e" || c == "E") {
+            // 指数部分只允许整数
+            if (digits == 0) { return false }
+            let rest = strSub(t, i + 1, len(t))
+            return strIsInt(rest)
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return digits > 0
+}
+
+// 重复一个字符 n 次（比 strRepeat 省一次判断？不，它就是 strRepeat 的
+// 语义化别名，让「画分隔线」的代码读起来更清楚）
+fn strChar(n: Int, c: String) -> String {
+    return strRepeat(c, n)
+}
+
+// 用某个字符画一条分隔线，宽度按显示列算
+fn strRule(cols: Int, c: String) -> String {
+    return strRepeat(c, cols)
+}
+
+// ---- URL / 路径片段（不含网络 IO，只是字符串处理） ----
+
+// 取最后一段："/a/b/c.txt" → "c.txt"
+fn strBasename(p: String) -> String {
+    let parts = strSplit(p, "/")
+    let n = len(parts)
+    // 允许末尾带斜杠
+    var i = n - 1
+    while (i >= 0) {
+        if (len(parts[i]) > 0) { return parts[i] }
+        i = i - 1
+    }
+    return ""
+}
+
+// 取目录部分："/a/b/c.txt" → "/a/b"
+fn strDirname(p: String) -> String {
+    var i = len(p) - 1
+    // 去掉末尾连续的斜杠
+    while (i >= 0 && strAt(p, i) == "/") { i = i - 1 }
+    while (i >= 0) {
+        if (strAt(p, i) == "/") {
+            if (i == 0) { return "/" }
+            return strSub(p, 0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+// 取扩展名（不含点）："/a/b/c.txt" → "txt"。没有扩展名返回 ""。
+fn strExtname(p: String) -> String {
+    var i = len(p) - 1
+    var seenDot = false
+    while (i >= 0) {
+        let c = strAt(p, i)
+        if (c == "/") { return "" }
+        if (c == ".") {
+            if (!seenDot) {
+                return strSub(p, i + 1, len(p))
+            }
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// 拼接路径：自动补分隔符，不产生双斜杠。
+// 只处理 '/'，因为标准库面向的是跨平台文本，不绑定 Windows 反斜杠。
+fn strJoinPath(a: String, b: String) -> String {
+    if (a == "") { return b }
+    if (b == "") { return a }
+    if (strEnds(a, "/")) { return a + b }
+    return a + "/" + b
+}
+
+// ---- 简易模板 ----
+
+// 把 "{name}" 形式的占位符替换成对应值。keys 与 vals 等长。
+// 不用正则（语言没有），用逐字符扫描。
+//
+// 为什么这点功能值得有：日志与错误信息里拼字符串是最常见的
+// 代码，而 `"x=" + toString(x) + ", y=" + toString(y)` 这种写法
+// 在参数一多时可读性崩塌。
+//
+// ── 调用时**必须**用原始字符串 r"" ────────────────────
+//
+// 语言自 v0.17 起支持编译期插值：`"{name}"` 会把 name 当变量求值。
+// 而这里的 `{name}` 是**运行时**占位符，两者写法相同、时机不同。
+// 所以调用要写成：
+//
+//     strTemplate(r"name={name}", keys, vals)     // 对
+//     strTemplate("name={name}",  keys, vals)     // 错，报「未定义的变量 name」
+//
+// 模板若由变量拼接得到（`let tpl = base + suffix`），那它天然是
+// 普通字符串，不存在这个歧义 —— 只有**字面量**模板需要 r""。
+fn strTemplate(tpl: String, keys: Array, vals: Array) -> String {
+    if (len(keys) != len(vals)) {
+        fail("strTemplate: keys 与 vals 长度不同（" + toString(len(keys)) +
+             " vs " + toString(len(vals)) + "）")
+    }
+    var out = ""
+    var i = 0
+    while (i < len(tpl)) {
+        let c = strAt(tpl, i)
+        if (c == "{") {
+            let close = strFindFrom(tpl, "}", i + 1)
+            if (close > i) {
+                let name = strSub(tpl, i + 1, close)
+                var hit = false
+                var k = 0
+                while (k < len(keys)) {
+                    if (toString(keys[k]) == name) {
+                        out = out + toString(vals[k])
+                        hit = true
+                        k = len(keys)   // 跳出
+                    } else {
+                        k = k + 1
+                    }
+                }
+                if (!hit) {
+                    // 未命中的占位符原样保留 —— 模板可能有多轮填充
+                    out = out + strSub(tpl, i, close + 1)
+                }
+                i = close + 1
+            } else {
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}

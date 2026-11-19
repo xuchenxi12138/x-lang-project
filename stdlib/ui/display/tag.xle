@@ -1,0 +1,170 @@
+// ui/display/tag.xle — 标签（小尺寸的状态块）
+//
+// ── 为什么 Tag 的主要接口是 measure ──────────────
+//
+// 标签的宽度由内容决定（文字多长就多宽），而父容器在布局时
+// 需要先知道宽度才能排。所以 Tag 必须提供 measure()，而不是
+// 「给我一个矩形我来填」。
+//
+// 这与 Button 不同：按钮通常占满父容器分配的格子，所以它接受
+// 一个 Rect。标签则到处出现在行内（列表的行尾、表格的单元格），
+// 每个宽度都不同，所以它**报告**自己多大。
+//
+//     let tg = Tag.ok("已完成")
+//     let w = tg.measure()
+//     tg.setTo(x, y)          // 由调用方决定放哪
+//
+// ── 这一组都是「小尺寸的信息块」 ─────────────────
+//
+//   tag.xle    —— 本文件，标签（只读展示）
+//   chip.xle   —— 可移除标记（Tag + 右侧的叉）
+//   avatar.xle —— 头像（圆形 + 首字母）
+//
+// 它们共用一个高度常量 TAG_H，所以混排在一行时天然对齐。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 标签高度。
+const TAG_H = 22
+
+// 标签左右内边距。
+const TAG_PAD = 8
+
+// ── 标签语义 ────────────────────────────────────
+//
+// 语义色而不是直接给颜色值：调用方说「这是一条警告」，主题自己
+// 决定警告长什么样。这样换主题时标签自动跟着变。
+const TAG_NEUTRAL = 0
+const TAG_ACCENT  = 1
+const TAG_OK      = 2
+const TAG_WARN    = 3
+const TAG_ERR     = 4
+const TAG_DIM     = 5
+
+// ── 颜色混合 ──────────────────────────────────
+//
+// 标签的底是「主题面板色 + 少量强调色」。这个混合只在这里用，
+// 所以叫 tagBlend 而不是通用的 blend —— 避免与别处的同名函数
+// 在文本合并（import 是文本合并）后冲突。
+fn tagBlend(a: Int, b: Int, t: Float) -> Int {
+    if (t <= 0.0) { return a }
+    if (t >= 1.0) { return b }
+    let ar = (a >> 16) & 0xFF
+    let ag = (a >> 8) & 0xFF
+    let ab = a & 0xFF
+    let br = (b >> 16) & 0xFF
+    let bg = (b >> 8) & 0xFF
+    let bb = b & 0xFF
+    var r = toInt(toFloat(ar) + (toFloat(br) - toFloat(ar)) * t + 0.5)
+    var g = toInt(toFloat(ag) + (toFloat(bg) - toFloat(ag)) * t + 0.5)
+    var bl = toInt(toFloat(ab) + (toFloat(bb) - toFloat(ab)) * t + 0.5)
+    if (r < 0) { r = 0 }
+    if (r > 255) { r = 255 }
+    if (g < 0) { g = 0 }
+    if (g > 255) { g = 255 }
+    if (bl < 0) { bl = 0 }
+    if (bl > 255) { bl = 255 }
+    return (r << 16) | (g << 8) | bl
+}
+
+
+class Tag extends Widget {
+    text: String,
+    kind: Int,
+
+    // 是否画成描边样式（透明底 + 彩色边框）。比实心底更轻。
+    outline: Bool,
+
+    constructor(r: Rect, text: String, kind: Int) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.text    = text
+        self.kind    = kind
+        self.outline = false
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, s: String) -> Tag {
+        return new Tag(r, s, TAG_NEUTRAL)
+    }
+
+    static fn ok(r: Rect, s: String) -> Tag {
+        return new Tag(r, s, TAG_OK)
+    }
+
+    static fn warn(r: Rect, s: String) -> Tag {
+        return new Tag(r, s, TAG_WARN)
+    }
+
+    static fn err(r: Rect, s: String) -> Tag {
+        return new Tag(r, s, TAG_ERR)
+    }
+
+    static fn accent(r: Rect, s: String) -> Tag {
+        return new Tag(r, s, TAG_ACCENT)
+    }
+
+    fn setOutline(v: Bool) -> Tag {
+        self.outline = v
+        return self
+    }
+
+    // ── 语义色 ────────────────────────────────────
+
+    fn accentColor(th: Theme) -> Int {
+        if (self.kind == TAG_ACCENT) { return th.accent }
+        if (self.kind == TAG_OK)     { return th.ok }
+        if (self.kind == TAG_WARN)   { return th.warn }
+        if (self.kind == TAG_ERR)    { return th.err }
+        if (self.kind == TAG_DIM)    { return th.textDim }
+        return th.textDim
+    }
+
+    // ── 尺寸 ────────────────────────────────────
+    //
+    // 宽度 = 文字宽 + 左右 padding。高度固定 TAG_H。
+    fn measure() -> Rect {
+        let w = winTextWidth(self.text) + TAG_PAD * 2
+        return rectOf(0, 0, w, TAG_H)
+    }
+
+    fn setTo(x: Int, y: Int) -> Tag {
+        let s = self.measure()
+        self.r = rectOf(x, y, s.w, s.h)
+        return self
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        let ac = self.accentColor(th)
+        let rad = TAG_H / 2
+
+        if (self.outline) {
+            // 描边样式：透明底（不填），彩色边框 + 彩色文字。
+            winBorderRound(self.r.x, self.r.y, self.r.w, self.r.h,
+                           rad, 1, ac)
+            uiTextInRect(self.r, self.text, ac)
+        } else {
+            // 实心样式：低混色底 + 强调色文字。
+            //
+            // 底用 18% 混色而不是满色：满色块在界面上太吵，
+            // 而标签通常只是「标注」，不该抢过正文。
+            let bg = tagBlend(th.surface, ac, 0.18)
+            winFillRound(self.r.x, self.r.y, self.r.w, self.r.h, rad, bg)
+            uiTextInRect(self.r, self.text, ac)
+        }
+    }
+
+    // 标签不响应输入。
+    fn hit(mx: Int, my: Int) -> Bool {
+        return false
+    }
+}

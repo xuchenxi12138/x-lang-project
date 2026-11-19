@@ -1,0 +1,111 @@
+// ui/index.xle — UI 组件库聚合入口
+//
+// ── 这个文件为什么只有 import ────────────────────
+//
+// 它是**唯一的公开入口**，把散在 20 多个文件里的组件聚合成一个
+// 命名空间。使用方只写：
+//
+//     import std.ui
+//     ...
+//     let b = Button.primary(r, "保存")
+//
+// 而不需要知道 Button 在 control/button.xle 里。
+//
+// ── 为什么用「扁平 import 列表」而不是再包一层 ─────────
+//
+// 有些库会在 index 里重新导出（re-export）每个名字，或者提供
+// 一个 Ui 门面对象。但语言没有 re-export 机制（import 是文本
+// 合并），所以这里的 import 就是**全部**的导出 —— 被 import 的
+// 文件里所有公开名字都直接可见。
+//
+// 这带来一个副作用：内部实现函数（比如 lerpColor）也会进入
+// 使用方的命名空间。这在 P0 是可接受的（命名冲突会立刻报错，
+// 不会静默出错），而避免它的唯一办法是给每个内部函数加前缀，
+// 那会让内部代码变得难读。
+//
+// ── 目录结构 ─────────────────────────────────
+//
+//   core/     基础值对象：矩形、主题、样式、动画、文字、色板
+//   widget/   抽象基类：Widget
+//   control/  可交互控件：按钮、标签、输入、滑块、开关、下拉...
+//   layout/   容器与布局：游标、面板、卡片、滚动
+//   display/  数据展示：列表、表格、标签页、弹窗、提示...
+//
+// 分层的依赖方向是单向的：
+//
+//   core ← widget ← control ← layout ← display
+//
+// 每一层只依赖左边的层。这条规则让「改 display 会不会影响 core」
+// 这类问题有确定答案 —— 不会。
+
+// ── core ────────────────────────────────────────
+//
+// 必须最先 import：其他所有文件都依赖这里的类型。
+//
+// import 的展开顺序对结果无影响（所有声明在编译期合并），但按
+// 依赖顺序排布让这个文件本身成为一份架构文档。
+from "core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+from "core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "core/theme.xle" import Theme
+from "core/style.xle" import Style
+from "core/anim.xle" import Anim
+from "core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+
+// ── widget ──────────────────────────────────────
+from "widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "widget/frame.xle" import frameBegin, frameEmpty, frameHit, frameHover, frameClaim, frameClaimAll, frameTake, Frame
+
+// ── control ─────────────────────────────────────
+from "control/label.xle" import Label, TEXT_CENTER, TEXT_LEFT, TEXT_RIGHT
+from "control/button.xle" import Button, BTN_SECONDARY, BTN_PRIMARY, BTN_DANGER, BTN_GHOST
+from "control/toggle.xle" import Toggle, CK_BOX, CK_GAP
+from "control/check.xle" import Check
+from "control/radio.xle" import Radio
+from "control/radiogroup.xle" import RadioGroup
+from "control/field.xle" import Field, FIELD_PAD
+from "control/searchbox.xle" import SearchBox, SB_ICON_W, SB_CLEAR_W
+from "control/textarea.xle" import TextArea, TA_LINE_H, TA_PAD, TA_PAD_Y
+from "control/slider.xle" import Slider, SL_TRACK_H, SL_KNOB_W, SL_KNOB_H
+from "control/progress.xle" import Progress
+from "control/switch.xle" import lerpColor, Switch, SW_W, SW_H
+from "control/spinner.xle" import Spinner, SP_BTN_W
+from "control/dropdown.xle" import Dropdown, DD_ROW_H, DD_MAX_ROWS
+from "control/datefield.xle" import dateIsLeap, dateDaysIn, dateValid, datePad2, dateFormat, dateParse, DateField, DF_MIN_YEAR, DF_MAX_YEAR
+from "control/colorpicker.xle" import colorGraySwatches, colorHueSwatches, hex2, ColorPicker, CP_SWATCH, CP_GAP
+
+// ── layout ──────────────────────────────────────
+from "layout/layout.xle" import layoutFrame, layoutRaw, layoutColumn, layoutRow, layoutNext, layoutAdvance, layoutNextCol, layoutAdvanceCol, layoutSplit, layoutSplitV, layoutAt, layoutPlace, layoutCenter, layoutHCenter, layoutInset, layoutPadLeft, layoutPadRight, layoutPadTop, layoutPadBottom, layoutPadH, layoutPadV, layoutRemainder, layoutSpacer, Cursor, ALIGN_START, ALIGN_CENTER, ALIGN_END, ALIGN_STRETCH
+from "layout/panel.xle" import Panel, PANEL_TITLE_H
+from "layout/card.xle" import Card
+from "layout/group.xle" import Group
+from "layout/divider.xle" import Divider
+from "layout/scrollview.xle" import ScrollView
+from "layout/spacer.xle" import Spacer
+from "layout/stack.xle" import Stack
+from "layout/splitter.xle" import Splitter, SP_BAR_W, SP_SCALE, SP_MIN
+from "layout/toolbar.xle" import Toolbar, TBAR_H, TBAR_GAP, TBAR_PAD
+from "layout/statusbar.xle" import arrJoinStrings, StatusBar, SBAR_H, SBAR_SEP
+
+// ── display ─────────────────────────────────────
+from "display/listbase.xle" import ListBase, LIST_ROW_H
+from "display/list.xle" import List
+from "display/table.xle" import Table
+from "display/tree.xle" import Tree, TREE_ROW_H, TREE_INDENT, TREE_ARROW_W
+from "display/tabs.xle" import Tabs, TAB_UNDERLINE, TAB_SEGMENT, TABS_BAR_H
+from "display/modal.xle" import Modal, MD_FOOTER_H, MD_PAD
+from "display/dialog.xle" import Dialog, DLG_ROW_H, DLG_LABEL_W, DLG_TOP_PAD
+from "display/toastitem.xle" import ToastItem, TOAST_INFO, TOAST_SUCCESS, TOAST_WARN, TOAST_ERROR, TOAST_H, TOAST_MAX, TOAST_DUR
+from "display/toast.xle" import Toaster
+from "display/badge.xle" import badgeBlend, Badge, BADGE_MAX, DOT_ONLINE, DOT_BUSY, DOT_AWAY, DOT_OFFLINE
+from "display/tooltip.xle" import Tooltip, TIP_DELAY, TIP_PAD, TIP_GAP, TIP_MAX_W
+from "display/alert.xle" import alertBlend, Alert, ALERT_INFO, ALERT_SUCCESS, ALERT_WARN, ALERT_ERROR, ALERT_MIN_H, ALERT_PAD, ALERT_ICON
+from "display/pagination.xle" import Pagination, PG_SIZE, PG_GAP, PG_SIMPLE_MAX
+from "display/breadcrumb.xle" import Breadcrumb, BC_SEP_PAD
+from "display/menuitem.xle" import menuIsSep, menuIsDisabled, menuLabel, menuShortcut
+from "display/menubar.xle" import MenuBar, MENUBAR_H, MENU_ITEM_PAD
+from "display/menu.xle" import Menu, MENU_ROW_H, MENU_POPUP_W
+from "display/tag.xle" import tagBlend, Tag, TAG_H, TAG_PAD, TAG_NEUTRAL, TAG_ACCENT, TAG_OK, TAG_WARN, TAG_ERR, TAG_DIM
+from "display/chip.xle" import Chip
+from "display/avatar.xle" import Avatar, AVATAR_SM, AVATAR_MD, AVATAR_LG
+from "display/stepper.xle" import Stepper, STEP_DONE, STEP_CURRENT, STEP_TODO, STEP_ERROR, STEP_DOT, STEP_LABEL_GAP
+from "display/filepicker.xle" import FilePicker, FP_PATH_H, FP_ROW_H

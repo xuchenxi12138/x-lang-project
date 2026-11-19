@@ -1,0 +1,185 @@
+// ui/core/theme.xle — 主题（一套可替换的配色）
+//
+// ── 为什么需要 Theme 而不是一堆常量 ─────────────────────
+//
+// 常量只能有一份。想同时支持深色/浅色、或者让某个面板用强调色，
+// 就只能「换个常量名再写一遍全部控件」。而 Theme 是一个值：
+// 可以在运行时选、可以按窗口传、可以派生。
+//
+// 默认值就是原来那套深色配色，所以 `Theme.dark()` 与旧行为一致。
+
+from "palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+struct Theme {
+    bg: Int,
+    surface: Int,
+    surfaceHover: Int,
+    surfaceActive: Int,
+    border: Int,
+    text: Int,
+    textDim: Int,
+    accent: Int,
+    accentDark: Int,
+    ok: Int,
+    warn: Int,
+    err: Int,
+    track: Int,
+    onAccent: Int,   // 画在主色块上的文字颜色
+    // v0.18 补充三个语义色。
+    //
+    // 加字段是破坏性改动（所有构造点都要补），但这三个必须加：
+    // 焦点环和遮罩是「能用」与「好用」的分界，而禁用态此前是用
+    // textDim 顶替，导致「次要文字」和「不可用」看起来一样。
+    focus: Int,
+    scrim: Int,
+    disabled: Int,
+}
+
+// ── 预设主题 ──────────────────────────────────────
+
+fn Theme.dark() -> Theme {
+    return Theme {
+        bg: UI_BG,
+        surface: UI_SURFACE,
+        surfaceHover: UI_SURFACE_H,
+        surfaceActive: UI_SURFACE_A,
+        border: UI_BORDER,
+        text: UI_TEXT,
+        textDim: UI_TEXT_DIM,
+        accent: UI_ACCENT,
+        accentDark: UI_ACCENT_D,
+        ok: UI_OK,
+        warn: UI_WARN,
+        err: UI_ERR,
+        track: UI_TRACK,
+        onAccent: 0xFFFFFF,
+        focus: UI_FOCUS,
+        scrim: UI_SCRIM,
+        disabled: UI_DISABLED,
+    }
+}
+
+// 浅色主题。存在的意义是证明 Theme 真的是个**值**：换一套配色
+// 不需要改任何控件代码，只换传进来的那个对象。
+fn Theme.light() -> Theme {
+    return Theme {
+        bg: 0xF2F2F5,
+        surface: 0xFFFFFF,
+        surfaceHover: 0xE8E8EE,
+        surfaceActive: 0xD8D8E2,
+        border: 0xC8C8D2,
+        text: 0x1C1C22,
+        textDim: 0x5E5E6C,
+        accent: 0x2563EB,
+        accentDark: 0x1D4ED8,
+        ok: 0x16A34A,
+        warn: 0xB45309,
+        err: 0xDC2626,
+        track: 0xDDDDE6,
+        onAccent: 0xFFFFFF,
+        focus: 0x3B82F6,
+        scrim: 0x000000,
+        disabled: 0x9A9AA8,
+    }
+}
+
+// 高对比度。给「必须看清」的场景（演示、投影、无障碍）。
+// 特点：纯黑底 + 纯白字 + 高饱和主色，边框加亮。
+fn Theme.highContrast() -> Theme {
+    return Theme {
+        bg: 0x000000,
+        surface: 0x111111,
+        surfaceHover: 0x222222,
+        surfaceActive: 0x333333,
+        border: 0xFFFFFF,
+        text: 0xFFFFFF,
+        textDim: 0xCCCCCC,
+        accent: 0x00AAFF,
+        accentDark: 0x0088CC,
+        ok: 0x00FF66,
+        warn: 0xFFCC00,
+        err: 0xFF3333,
+        track: 0x333333,
+        onAccent: 0x000000,
+        focus: 0xFFFF00,
+        scrim: 0x000000,
+        disabled: 0x888888,
+    }
+}
+
+// ── 派生（值语义，不改原对象）──────────────────────────
+//
+// 这是「值」相对「常量」的核心优势 —— 13 个 const 要做同样的事，
+// 只能再写 13 行赋值，而且每加一个主题就多 13 行。
+//
+// 敏感度：改任何一处都要把全部字段列一遍。这是 struct 没有
+// 字段级更新语法的代价。好处是编译器会检查遗漏 —— 少写一个字段
+// 就是语法错误，不会静默变成 0（那会变成「黑色背景」这种难查症状）。
+
+fn Theme.withAccent(self: Theme, c: Int) -> Theme {
+    return Theme {
+        bg: self.bg, surface: self.surface,
+        surfaceHover: self.surfaceHover, surfaceActive: self.surfaceActive,
+        border: self.border, text: self.text, textDim: self.textDim,
+        accent: c, accentDark: self.accentDark,
+        ok: self.ok, warn: self.warn, err: self.err, track: self.track,
+        onAccent: self.onAccent,
+        focus: self.focus, scrim: self.scrim, disabled: self.disabled,
+    }
+}
+
+fn Theme.withBackground(self: Theme, bg: Int, surface: Int) -> Theme {
+    return Theme {
+        bg: bg, surface: surface,
+        surfaceHover: self.surfaceHover, surfaceActive: self.surfaceActive,
+        border: self.border, text: self.text, textDim: self.textDim,
+        accent: self.accent, accentDark: self.accentDark,
+        ok: self.ok, warn: self.warn, err: self.err, track: self.track,
+        onAccent: self.onAccent,
+        focus: self.focus, scrim: self.scrim, disabled: self.disabled,
+    }
+}
+
+// 整体亮度反转。不做色彩学上的精确反相（那会把蓝色变成橙色，
+// 语义全错），只反转「底色与文字」，保留语义色 —— 这是浅色/深色
+// 切换时人真正期待的行为。
+fn Theme.invert(self: Theme) -> Theme {
+    return Theme {
+        bg: self.surface,
+        surface: self.bg,
+        surfaceHover: self.surfaceActive,
+        surfaceActive: self.surfaceHover,
+        border: self.border,
+        text: self.text,
+        textDim: self.textDim,
+        accent: self.accent, accentDark: self.accentDark,
+        ok: self.ok, warn: self.warn, err: self.err,
+        track: self.track,
+        onAccent: self.onAccent,
+        focus: self.focus, scrim: self.scrim, disabled: self.disabled,
+    }
+}
+
+// ── 查询辅助 ──────────────────────────────────────
+
+// 按语义名取色。组件里有时需要「按状态取色」，用字符串查比
+// 在每组绘制代码里写 if-else 链更短。
+//
+//   byName("ok") / byName("warn") / byName("err") / byName("accent")
+//   未知名 → 正文色（不返回 -1，避免误用成「无颜色」）
+fn Theme.byName(self: Theme, name: String) -> Int {
+    if (name == "ok")     { return self.ok }
+    if (name == "warn")   { return self.warn }
+    if (name == "err")    { return self.err }
+    if (name == "accent") { return self.accent }
+    if (name == "dim")    { return self.textDim }
+    if (name == "border") { return self.border }
+    if (name == "surface") { return self.surface }
+    if (name == "disabled") { return self.disabled }
+    return self.text
+}
+
+fn Theme.okColor(self: Theme) -> Int { return self.ok }
+fn Theme.warnColor(self: Theme) -> Int { return self.warn }
+fn Theme.errColor(self: Theme) -> Int { return self.err }
+fn Theme.accentColor(self: Theme) -> Int { return self.accent }

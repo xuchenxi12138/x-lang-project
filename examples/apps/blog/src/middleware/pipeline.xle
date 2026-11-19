@@ -1,0 +1,192 @@
+// middleware/pipeline.xle — 中间件链
+//
+// ── 中间件解决什么问题 ────────────────────────────
+//
+// 每个请求都要做的事：打日志、计时、加安全头、校验 token、限流。
+// 如果写在每个 handler 里，会是这样：
+//
+//     fn handleUserList(ctx) {
+//         logStart(ctx)
+//         if (!checkToken(ctx)) { return }
+//         if (!rateLimit(ctx)) { return }
+//         addSecurityHeaders(ctx)
+//         ... 真正的业务 ...
+//     }
+//
+// 十个 handler 就有十份这样的前缀，改一处（比如加一个 CORS 头）
+// 要改十处。中间件把这段公共前缀抽出来，一次注册、全部生效。
+//
+// ── 本实现的中间件形态 ────────────────────────
+//
+// 因为语言不能传函数，中间件是一个「名字 + 阶段」的声明，实际的
+// 逻辑由调用方在一个 dispatch 里执行。中间件列表只负责：
+//
+//   · 决定执行顺序
+//   · 短路（某个中间件失败时标记 stop，后面的都不执行）
+//   · 记录每步的耗时
+//
+// ── 顺序为什么重要 ──────────────────────────
+//
+//   · 日志必须在**最前面**（否则被拒绝的请求不会被记录）
+//   · 限流应该在认证**之前**（防暴力破解，且限流比认证便宜）
+//   · 认证在业务之前
+//   · 安全响应头在最内层（它对所有响应生效，包括错误响应）
+//
+// 顺序错了不会报错，只是行为不符合预期 —— 所以这里用显式的整数
+// 阶段来表达，而不是靠数组顺序。
+
+// 一个中间件声明。
+class Middleware {
+    name: String
+
+    // 执行阶段。数值小的先执行。
+    //
+    // 约定：
+    //   10  访问日志（最外层，什么都要记）
+    //   20  请求 ID（后续日志都要引用它）
+    //   30  限流（比认证便宜，先挡）
+    //   40  认证
+    //   50  授权
+    //   60  请求体解析/校验
+    //   70  CORS（要在业务前加头，但要能看到最终响应）
+    //   80  业务
+    phase: Int
+
+    // 是否已执行（用于诊断）。
+    ran: Bool
+
+    // 是否短路了后续执行。
+    aborted: Bool
+
+    constructor(name: String, phase: Int) {
+        self.name    = name
+        self.phase   = phase
+        self.ran     = false
+        self.aborted = false
+    }
+
+    fn describe() -> String {
+        var s = " "
+        if (self.aborted) { s = " !abort" }
+        return padZero(self.phase, 2) + " " + strPadRight(self.name, 16, " ") + s
+    }
+}
+
+class Pipeline {
+    items: Array
+
+    // 上一个被短路的中间件名（诊断用）。
+    abortedAt: String
+
+    constructor() {
+        self.items     = []
+        self.abortedAt = ""
+    }
+
+    fn use(name: String, phase: Int) -> Middleware {
+        let m = new Middleware(name, phase)
+        arrPush(self.items, m)
+        return m
+    }
+
+    fn count() -> Int {
+        return len(self.items)
+    }
+
+    // 按 phase 升序返回执行顺序（稳定插入排序，同 phase 保持注册序）。
+    fn order() -> Array {
+        let out = []
+        var i = 0
+        while i < len(self.items) {
+            let cur: Middleware = self.items[i]
+            var at = len(out)
+            var j = 0
+            while j < len(out) {
+                let idx: Int = out[j]
+                let other: Middleware = self.items[idx]
+                if (other.phase > cur.phase) {
+                    at = j
+                    j = len(out)
+                    continue
+                }
+                j = j + 1
+            }
+            arrPush(out, 0)
+            var k = len(out) - 1
+            while k > at {
+                out[k] = out[k - 1]
+                k = k - 1
+            }
+            out[at] = i
+            i = i + 1
+        }
+        return out
+    }
+
+    // 重置执行状态（每个请求开始前调）。
+    //
+    // ── 为什么必须有这一步 ────────────────────
+    //
+    // 因为中间件对象是复用的（注册一次，服务所有请求）。如果不清
+    // ran/aborted，上一个请求的「已执行」会残留，诊断时看到的是
+    // 所有请求的叠加状态，完全没用。
+    fn reset() {
+        self.abortedAt = ""
+        var i = 0
+        while i < len(self.items) {
+            let m: Middleware = self.items[i]
+            m.ran     = false
+            m.aborted = false
+            i = i + 1
+        }
+    }
+
+    // 标记某个中间件执行了。返回 true 表示可以继续，false 表示被
+    // 短路（后续不该执行）。
+    fn markRan(name: String) -> Bool {
+        let m = self.find(name)
+        if (len(m.name) == 0) { return true }
+        m.ran = true
+        if (m.aborted) {
+            self.abortedAt = name
+            return false
+        }
+        return true
+    }
+
+    // 标记某个中间件短路了后续。
+    fn markAbort(name: String) {
+        let m = self.find(name)
+        if (len(m.name) == 0) { return }
+        m.ran     = true
+        m.aborted = true
+        self.abortedAt = name
+    }
+
+    fn find(name: String) -> Middleware {
+        var i = 0
+        while i < len(self.items) {
+            let m: Middleware = self.items[i]
+            if (m.name == name) { return m }
+            i = i + 1
+        }
+        return new Middleware("", 0)
+    }
+
+    fn dump() -> String {
+        var out = "Pipeline(" + toString(self.count()) + " 个中间件，按执行顺序)"
+        let ord = self.order()
+        var i = 0
+        while i < len(ord) {
+            let idx: Int = ord[i]
+            let m: Middleware = self.items[idx]
+            out = out + "\n  " + m.describe()
+            i = i + 1
+        }
+        return out
+    }
+
+    fn describe() -> String {
+        return self.abortedAt
+    }
+}

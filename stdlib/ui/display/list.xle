@@ -1,0 +1,98 @@
+// ui/display/list.xle — 简单列表
+//
+// 一行一个字符串。调用方不关心内部结构 —— 这正是它和 Table 的
+// 分工：列表用来「选一个」，表格用来「看多个字段」。
+//
+// 滚动、选中、命中、行背景全部继承自 ListBase（见 listbase.xle），
+// 这个文件只实现「一行怎么画」。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../control/label.xle" import Label, TEXT_CENTER, TEXT_LEFT, TEXT_RIGHT
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+from "listbase.xle" import ListBase, LIST_ROW_H
+
+class List extends ListBase {
+    items: Array,
+
+    // 每行左侧的可选图标文字（短字符，比如 ">"、"*"）。
+    // 空字符串表示不画。
+    marker: String,
+
+    // 行内文字的左侧内边距。
+    pad: Int,
+
+    constructor(r: Rect, items: Array) {
+        self.r          = r
+        self.vis        = true
+        self.enabled    = true
+        self.focused    = false
+        self.hovered    = false
+        self.rowCount   = len(items)
+        self.selected   = 0 - 1
+        self.offset     = 0
+        self.rowH       = LIST_ROW_H
+        self.selectable = true
+        self.items      = items
+        self.marker     = ""
+        self.pad        = 12
+        self.style      = Style.plain()
+    }
+
+    static fn of(r: Rect, items: Array) -> List {
+        return new List(r, items)
+    }
+
+    // 换数据。保留选中行但夹紧到新范围。
+    //
+    // ── 为什么不重置选中 ────────────────────────
+    //
+    // 因为最常见的场景是「刷新列表内容」，用户希望选中项还在。
+    // 只有选中项超出新范围时才不得不清掉 —— 那时夹紧到最后一
+    // 行比清成 -1 更符合「我还在这个列表里」的直觉。
+    fn setItems(arr: Array) -> List {
+        self.items = arr
+        self.rowCount = len(arr)
+        if (self.selected >= self.rowCount) {
+            self.selected = self.rowCount - 1
+        }
+        self.clampOffset()
+        return self
+    }
+
+    fn currentText() -> String {
+        if (self.selected < 0 || self.selected >= self.rowCount) { return "" }
+        return toString(self.items[self.selected])
+    }
+
+    fn drawRowContent(th: Theme, i: Int, r: Rect) {
+        let rr = Rect.inset(r, 0)
+        var x = rr.x + self.pad
+
+        // 标记。
+        if (len(self.marker) > 0) {
+            let mw = winTextWidth(self.marker) + 8
+            uiTextLeft(rr, self.marker, self.pad, th.textDim)
+            x = x + mw
+        }
+
+        let s = toString(self.items[i])
+        var avail = rr.x + rr.w - x - self.pad
+        if (avail < 0) { avail = 0 }
+        var shown = s
+        if (winTextWidth(shown) > avail) {
+            shown = uiEllipsize(shown, avail)
+        }
+
+        var tc = th.text
+        if (i == self.selected) { tc = th.accent }
+        if (!self.enabled) { tc = th.disabled }
+
+        let ty = rr.y + (rr.h - winTextHeight()) / 2
+        winText(x, ty, shown, tc)
+    }
+}

@@ -1,0 +1,289 @@
+// db/mysql/packet.xle — MySQL 报文帧
+//
+// ── MySQL 的报文格式 ────────────────────────────
+//
+// 每个报文（packet）有一个 4 字节头：
+//
+//   [0..2]  负载长度（小端 3 字节）
+//   [3]     序号（sequence id，每个命令从 0 开始递增）
+//   [4..]   负载
+//
+// ── 为什么序号是必要的 ──────────────────────────
+//
+// 因为一个逻辑响应可能被拆成多个报文（超过 16MB 的结果集，或者
+// 「字段定义 + EOF + 数据行 + EOF」这种多段响应）。服务端靠序号
+// 让客户端能检测「丢包/乱序」，而客户端也必须**回显**正确的序号，
+// 否则服务端拒绝。
+//
+// 序号规则：一个命令内从 0 开始，每发/收一个报文 +1，命令结束后
+// 归零。
+//
+// ── 单包上限 ────────────────────────────────
+//
+// 3 字节长度 → 单包最多 16777215 字节。超过要拆包，且最后一片的
+// 长度恰好等于 16777215 表示「后面还有」。
+
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// 单包负载上限（2^24 - 1）。
+const MY_MAX_PAYLOAD = 16777215
+
+// 读一个报文，返回 [ok, 序号, 负载(字节数组), 错误]。
+//
+// ── 为什么负载必须是字节数组 ────────────────────────
+//
+// 报文里可能是任意二进制（认证盐、几何数据、压缩块）。用 String
+// 承载时 strSub 会按码点切，边界必然漂移（见 bytes.xle 的说明）。
+fn myReadPacket(c: Conn) -> Array {
+    var payload = []
+    var seq = 0
+    var guard = 0
+    while true {
+        let r = c.readN(4)
+        if (!myArrBool(r, 0)) {
+            return [false, 0, [], "读取报文头失败（要 4 字节，缓冲里 "
+                 + toString(c.avail()) + "）"]
+        }
+        let head = r[1]
+        let len = (bbAt(head, 0) & 0xFF)
+                | ((bbAt(head, 1) & 0xFF) << 8)
+                | ((bbAt(head, 2) & 0xFF) << 16)
+        seq = bbAt(head, 3) & 0xFF
+
+        if (len > 0) {
+            let rb = c.readN(len)
+            if (!myArrBool(rb, 0)) {
+                return [false, seq, [], "读取报文体失败（声明 " + toString(len)
+                     + " 字节，缓冲里 " + toString(c.avail()) + "）"]
+            }
+            bbPutBytes(payload, rb[1])
+        }
+
+        // 未满上限说明这是最后一片。
+        if (len < MY_MAX_PAYLOAD) { break }
+        guard = guard + 1
+        if (guard > 4096) { return [false, seq, [], "报文分片过多（>4096 片）"] }
+    }
+    return [true, seq, payload, ""]
+}
+
+// 写一个报文。
+//
+// ── 为什么 seq 要由调用方传入 ────────────────────
+//
+// 因为它在**一个命令的多次收发之间**必须连续。放在 Conn 里会让
+// 「连接」和「命令」两个生命周期纠缠（连接可以活很久，命令只有
+// 几毫秒），放在这里由命令层自己管最清楚。
+fn myWritePacket(c: Conn, seq: Int, payload: Array) -> Bool {
+    let n = len(payload)
+    var off = 0
+    var sq = seq & 0xFF
+    var guard = 0
+    while true {
+        let left = n - off
+        var thisLen = left
+        if (thisLen > MY_MAX_PAYLOAD) { thisLen = MY_MAX_PAYLOAD }
+
+        let buf = []
+        // 3 字节小端长度 + 1 字节序号
+        bbPutU24LE(buf, thisLen)
+        bbPutU8(buf, sq)
+        bbPutBytes(buf, bbSlice(payload, off, off + thisLen))
+
+        if (c.sendBytes(buf) < 0) { return false }
+
+        off = off + thisLen
+        sq  = (sq + 1) & 0xFF
+        // 恰好整片时要再发一个空包表示结束
+        if (thisLen < MY_MAX_PAYLOAD) { break }
+        guard = guard + 1
+        if (guard > 4096) { return false }
+    }
+    return true
+}
+
+// ── 长度编码整数（length-encoded integer）──────────────
+//
+//   < 0xFB      单字节，值就是它
+//   0xFB        NULL
+//   0xFC + 2字节 小端
+//   0xFD + 3字节 小端
+//   0xFE + 8字节 小端
+//   0xFF        错误包标记（不作长度用）
+//
+// ── 为什么用变长 ──────────────────────────────
+//
+// 协议里大量字段是「长度」或「受影响行数」，绝大多数很小。固定
+// 8 字节会让每个结果集头膨胀几倍；变长后 90% 只花 1 字节。
+
+// 从 pos 读一个变长整数，返回 [值, 新位置]。数据不够返回 [-1, pos]，
+// NULL 返回 [-2, pos+1]。
+fn myReadLenEnc(b: Array, pos: Int) -> Array {
+    if (pos >= len(b)) { return [0 - 1, pos] }
+    let first = bbAt(b, pos)
+    if (first < 0xFB) {
+        return [first, pos + 1]
+    }
+    if (first == 0xFB) {
+        return [0 - 2, pos + 1]
+    }
+    if (first == 0xFC) {
+        if (pos + 3 > len(b)) { return [0 - 1, pos] }
+        return [bbU16LE(b, pos + 1), pos + 3]
+    }
+    if (first == 0xFD) {
+        if (pos + 4 > len(b)) { return [0 - 1, pos] }
+        return [bbU24LE(b, pos + 1), pos + 4]
+    }
+    if (first == 0xFE) {
+        if (pos + 9 > len(b)) { return [0 - 1, pos] }
+        return [bbU64LE(b, pos + 1), pos + 9]
+    }
+    return [0 - 1, pos]
+}
+
+// 写一个变长整数。
+fn myWriteLenEnc(buf: Array, v: Int) -> Array {
+    if (v < 0) {
+        // NULL 哨兵
+        bbPut(buf, 0xFB)
+    } else if (v < 0xFB) {
+        bbPut(buf, v)
+    } else if (v < 0x10000) {
+        bbPut(buf, 0xFC)
+        bbPutU16LE(buf, v)
+    } else if (v < 0x1000000) {
+        bbPut(buf, 0xFD)
+        bbPutU24LE(buf, v)
+    } else {
+        bbPut(buf, 0xFE)
+        bbPutU64LE(buf, v)
+    }
+    return buf
+}
+
+// 写「长度前缀字符串」（长度 + 内容）。s 是文本，按 UTF-8 编码。
+fn myWriteLenEncStr(buf: Array, s: String) -> Array {
+    let bytes = bbFromUtf8(s)
+    myWriteLenEnc(buf, len(bytes))
+    bbPutBytes(buf, bytes)
+    return buf
+}
+
+// 写「长度前缀的字节串」。用于列值这类已经是字节的数据。
+fn myWriteLenEncBytes(buf: Array, bytes: Array) -> Array {
+    myWriteLenEnc(buf, len(bytes))
+    bbPutBytes(buf, bytes)
+    return buf
+}
+
+// 读一个「长度前缀字符串」，返回 [字节数组, 新位置]。NULL 时为空数组。
+fn myReadLenEncBytes(b: Array, pos: Int) -> Array {
+    let r = myReadLenEnc(b, pos)
+    let n = toInt(r[0])
+    let p = toInt(r[1])
+    if (n < 0) { return [[], p] }
+    if (p + n > len(b)) { return [[], len(b)] }
+    return [bbSlice(b, p, p + n), p + n]
+}
+
+// 读一个「长度前缀字符串」并解码成文本。
+fn myReadLenEncStr(b: Array, pos: Int) -> Array {
+    let r = myReadLenEncBytes(b, pos)
+    return [bbToText(r[0]), r[1]]
+}
+
+// 读一个 NUL 结尾字符串（握手包里的版本号、插件名用它）。
+fn myReadNulStr(b: Array, pos: Int) -> Array {
+    let k = bbIndexOf(b, 0, pos)
+    if (k < 0) { return [bbToText(bbSlice(b, pos, len(b))), len(b)] }
+    return [bbToText(bbSlice(b, pos, k)), k + 1]
+}
+
+// 读一个 NUL 结尾字符串的**字节**形式（盐的第二段用它）。
+fn myReadNulBytes(b: Array, pos: Int) -> Array {
+    let k = bbIndexOf(b, 0, pos)
+    if (k < 0) { return [bbSlice(b, pos, len(b)), len(b)] }
+    return [bbSlice(b, pos, k), k + 1]
+}
+
+// ── 通用响应包判定 ────────────────────────────────
+//
+// 服务端对任何命令的响应都以第 1 字节区分类型。所有驱动都要用，
+// 所以放在最底层。
+
+fn myIsErrPacket(p: Array) -> Bool {
+    return len(p) > 0 && bbAt(p, 0) == 0xFF
+}
+
+fn myIsOkPacket(p: Array) -> Bool {
+    return len(p) > 0 && bbAt(p, 0) == 0x00
+}
+
+fn myIsEofPacket(p: Array) -> Bool {
+    // EOF 包是 0xFE 且长度 < 9。长度 >= 9 的 0xFE 是 8 字节长度的
+    // 数据行（两者首字节撞了，靠长度区分，这是协议的一处历史包袱）。
+    return len(p) > 0 && bbAt(p, 0) == 0xFE && len(p) < 9
+}
+
+// 解析 ERR 包为可读文本：错误码 + SQLSTATE + 消息。
+fn myParseErrPacket(p: Array) -> String {
+    if (!myIsErrPacket(p)) { return "（不是错误包）" }
+    let code = bbU16LE(p, 1)
+    var pos = 3
+    let stateMarker = bbAt(p, pos)
+    var state = ""
+    if (stateMarker == 0x23 && len(p) >= pos + 6) {
+        // '#' + 5 字节 SQLSTATE
+        state = bbToText(bbSlice(p, pos + 1, pos + 6))
+        pos = pos + 6
+    }
+    let msg = bbToText(bbSlice(p, pos, len(p)))
+    if (len(state) > 0) {
+        return toString(code) + " (" + state + "): " + msg
+    }
+    return toString(code) + ": " + msg
+}
+
+// 解析 OK 包的受影响行数与自增 ID。
+//
+// ── 为什么这两个值要专门取 ────────────────────────
+//
+// 它们是 execute() 唯一有意义的返回（INSERT 拿到 lastInsertId，
+// UPDATE/DELETE 拿到 affected）。其余字段（status flags、warning
+// 数量）对应用层没用。
+fn myParseOkPacket(p: Array) -> Array {
+    // 返回 [affected, lastInsertId, statusFlags]
+    var pos = 1
+    let a = myReadLenEnc(p, pos)
+    pos = toInt(a[1])
+    let b = myReadLenEnc(p, pos)
+    pos = toInt(b[1])
+    var status = 0
+    if (pos + 2 <= len(p)) { status = bbU16LE(p, pos) }
+    return [toInt(a[0]), toInt(b[0]), status]
+}
+
+// ── 小工具 ────────────────────────────────────────
+//
+// 从 [Bool, payload] 形状的返回里安全读第 idx 项为 Bool。
+//
+// ── 为什么不能直接 `if (r[0])` ──────────────────────
+//
+// 语言对数组元素不做静态类型追踪，r[0] 的静态类型是未知的，直接
+// 当条件用会报「无法确定宿主类型」或误当成值。这里显式比较 true，
+// 让类型推断能落地。
+fn myArrBool(r: Array, idx: Int) -> Bool {
+    if (idx < 0 || idx >= len(r)) { return false }
+    if (r[idx] == true) { return true }
+    return false
+}
+
+// 从 [Bool, bytes] 形状的返回里安全读第 idx 项为字节数组。
+fn myArrBytes(r: Array, idx: Int) -> Array {
+    if (idx < 0 || idx >= len(r)) { return [] }
+    let v = r[idx]
+    if (typeOf(v) == "Array") { return v }
+    return []
+}

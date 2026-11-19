@@ -1,0 +1,576 @@
+// db/es/driver.xle — Elasticsearch 数据源
+//
+// ── ES 为什么最容易接 ────────────────────────────
+//
+// 因为它的协议就是 **HTTP + JSON**，没有任何私有二进制编码。
+//
+//   GET  /index/_search?q=xxx     查询
+//   POST /index/_doc              写入单条
+//   POST /index/_bulk             批量写入（NDJSON）
+//   DELETE /index                 删除索引
+//   GET  /_cat/indices?format=json 索引列表
+//
+// 所以这个驱动几乎是「HTTP 客户端 + JSON 解析」的一层薄包装，
+// 不需要像 MySQL/PG/Mongo 那样手写报文和认证。
+//
+// ── 为什么不能直接用 SQL 语义 ────────────────────
+//
+// ES 没有表、没有列、没有事务。DataSource 的映射：
+//
+//   query("index/_search {...}")  → hits 摊平成行
+//   execute("index/_doc {...}")   → 写入，affected=1
+//
+// ── 版本差异 ──────────────────────────────────
+//
+//   ES 6.x 类型（type）必填，文档路径 /index/type/id
+//   ES 7.x 类型废弃，固定 _doc
+//   ES 8.x 默认开启安全（HTTPS + 认证）
+//
+// 本驱动按 7.x 的路径规则：/index/_doc/id。连 6.x 时如果报错，
+// 错误信息里会明确指出路径，便于加 type。
+
+from "../core/datasource.xle" import sqlBind, execAll, DataSource
+from "../core/result.xle" import ResultSet
+from "../core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "../../http.xle" import httpServer, httpServerOn, httpPort, httpRoute, httpMatch, httpPump, netSleep, httpParse, httpSplitLines, httpHeader, httpHeaderInt, httpDechunk, httpPair, httpHexToInt, httpHexDigit, httpBadRequest, httpStatusText, httpRespond, httpRespondWith, httpRespondJson, httpRespondHtml, httpRespondText, httpNotFound, httpClose, httpServerClose, httpParseQuery, httpQueryGet, httpQueryInt, httpUrlDecode, httpUrlEncode, httpHex2, httpHexChar, httpUrlDecodeBytes, httpGet, httpPost, httpRequest, httpParseResponse, httpRespStatus, httpRespHeader, httpRespBody, HTTP_METHOD, HTTP_PATH, HTTP_QUERY, HTTP_VERSION, HTTP_HEADERS, HTTP_BODY, HTTP_MAX_BODY, HTTP_MAX_HEADER, SRV_LISTENER, SRV_CLIENTS, SRV_BUFS, SRV_ROUTES, SRV_PORT, HTTP_CONN, RESP_STATUS, RESP_HEADERS, RESP_BODY
+from "../../json.xle" import jsonParse, jsonParseScalar, jsonInt, jsonSetInt, jsonCur, jsonSkipWs, jsonFail, jsonParseValue, jsonExpect, jsonParseNumber, jsonParseString, jsonParseEscape, jsonHex4, jsonParseArray, jsonParseObject, jsonIsObject, jsonTypeOf, jsonGet, jsonGetOr, jsonHas, jsonKeys, jsonValues, jsonStringify, jsonArrayAny, jsonQuote, jsonHex, jsonNull, jsonNullValue, jsonBool, jsonNumber, jsonIntLit, jsonArrayOfStrings, jsonObject
+from "jsonpath.xle" import esGetValue, esLookup, jsonHasKey, jsonGetText, jsonGetInt, jsonGetArray, jsonGetObject, jsonLookup, jsonLookupText, jsonIsArray, jsonScalarText, jsonScalarInt, jsonCell
+
+class EsDataSource extends DataSource {
+    // 认证（HTTP Basic）。ES 8 默认开启。
+    // P0 的 http 客户端不支持自定义请求头，所以这里只能记录，
+    // 实际发送时无法带上 —— 明确记录这个边界。
+    user: String,
+    password: String,
+
+    // 默认索引（可空）。
+    defaultIndex: String,
+
+    constructor(ep: Endpoint, user: String, password: String, defaultIndex: String) {
+        self.ep           = ep
+        self.user         = user
+        self.password     = password
+        self.defaultIndex = defaultIndex
+        self.dialect      = dialectOf(DB_ES)
+        self.connected    = false
+        self.lastError    = ""
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    // http://host:9200/index
+    //
+    // 签名与其它驱动对齐（见 postgres/driver.xle 里 ofUrl 的说明）。
+    static fn ofUrl(url: String, user: String, password: String) -> EsDataSource {
+        let u = esParseUrl(url)
+        var usr = toString(u[3])
+        var pwd = toString(u[4])
+        if (len(usr) == 0) { usr = user }
+        if (len(pwd) == 0) { pwd = password }
+        return new EsDataSource(endpointOf(toString(u[1]), toInt(u[2])),
+                                usr, pwd, toString(u[5]))
+    }
+
+    // ── 生命周期 ────────────────────────────────
+    //
+    // ES 是无状态的 HTTP 服务，没有「连接」这个概念。connect 的含义
+    // 是「探活」：发一个 GET / 看是否返回 200。
+    //
+    // ── 为什么不能省掉探活 ────────────────────────
+    //
+    // 因为 Pool 会用 connect() 的返回值决定是否把连接放进池里。
+    // 如果 connect 永远返回 true，池里会塞满连不上的对象，直到
+    // 第一次查询才暴露 —— 那时错误现场已经和根因分离了。
+
+    fn connect() -> Bool {
+        self.lastError = ""
+        let base = "http://" + endpointString(self.ep)
+        let r = httpGet(base + "/")
+        let status = toInt(r[0])
+        if (status <= 0) {
+            self.lastError = "连接 " + endpointString(self.ep) + " 失败：" + toString(r[2])
+            return false
+        }
+        // 200 = 正常；401 = 需要认证（服务活着但拒绝）
+        if (status == 401 || status == 403) {
+            self.lastError = "Elasticsearch 要求认证（HTTP " + toString(status) + "）。\n"
+                           + "  P0 的 http 客户端不支持自定义请求头，无法发送 Authorization。\n"
+                           + "  help: 在 elasticsearch.yml 里设置 xpack.security.enabled: false，\n"
+                           + "        或通过反向代理剥离认证后访问。"
+            return false
+        }
+        if (status != 200) {
+            self.lastError = "Elasticsearch 返回 HTTP " + toString(status) + "：" + toString(r[2])
+            return false
+        }
+        self.connected = true
+        return true
+    }
+
+    fn close() {
+        // 无连接可关。标记状态即可。
+        self.connected = false
+    }
+
+    fn ping() -> Bool {
+        let r = httpGet("http://" + endpointString(self.ep) + "/")
+        return toInt(r[0]) == 200
+    }
+
+    // ── HTTP 封装 ────────────────────────────────
+
+    // 发一个请求，返回 [status, jsonText, error]。
+    //
+    // ── 为什么统一到 JSON 文本再解析 ────────────────
+    //
+    // 因为 ES 的成功和失败响应都是 JSON，只是内容不同。统一先取到
+    // 文本，再按需要解析成数组或直接当消息用，比在每个调用点分别
+    // 处理两种情况清晰。
+    fn request(method: String, path: String, body: String) -> Array {
+        let url = "http://" + endpointString(self.ep) + path
+        let r = httpRequest(method, url, "application/json", body)
+        let status = toInt(r[0])
+        if (status <= 0) {
+            return [0 - 1, "", toString(r[2])]
+        }
+        return [status, toString(r[2]), ""]
+    }
+
+    // ── 执行 ────────────────────────────────────
+
+    fn query(sql: String) -> ResultSet {
+        return self.run(sql)
+    }
+
+    fn execute(sql: String) -> ResultSet {
+        return self.run(sql)
+    }
+
+    // 解析简写命令。
+    //
+    // 语法：
+    //   <路径> <JSON>          原样发 GET（有 JSON 时发 POST）
+    //   POST <路径> <JSON>
+    //   PUT <路径> <JSON>
+    //   DELETE <路径>
+    //   search <索引> [查询JSON]   等价于 POST /<索引>/_search
+    //   indices                    列出索引
+    //
+    // ── 为什么默认动词是 POST ────────────────────
+    //
+    // 因为 ES 的检索接口要求 body（查询 DSL），而带 body 的 GET 在
+    // 部分代理/负载均衡上会被直接丢弃（历史上很多网关不转发 GET 的
+    // body）。ES 官方也建议用 POST 做检索。
+    fn run(sql: String) -> ResultSet {
+        let t = strTrim(sql)
+        if (len(t) == 0) { return ResultSet.fail("空命令") }
+
+        let parts = esSplit(t)
+        if (len(parts) == 0) { return ResultSet.fail("空命令") }
+        let first = strUpper(toString(parts[0]))
+
+        if (first == "INDICES") {
+            return self.listIndices()
+        }
+        if (first == "SEARCH") {
+            let idx = esArg(parts, 1)
+            var body = ""
+            if (len(parts) > 2) { body = toString(parts[2]) }
+            return self.search(idx, body)
+        }
+        if (first == "POST" || first == "PUT" || first == "DELETE" || first == "GET") {
+            let path = esArg(parts, 1)
+            var body = ""
+            if (len(parts) > 2) { body = toString(parts[2]) }
+            return self.requestResult(first, path, body)
+        }
+
+        // 默认：第一段是路径，其余当 body
+        var body = ""
+        if (len(parts) > 1) { body = toString(parts[1]) }
+        let method = "POST"
+        if (len(body) == 0) { method = "GET" }
+        return self.requestResult(method, t, "")
+    }
+
+    // 发请求并把结果转成 ResultSet。
+    fn requestResult(method: String, path: String, body: String) -> ResultSet {
+        let t0 = monoMillis()
+        var p = path
+        if (!strStarts(p, "/")) { p = "/" + p }
+
+        let r = self.request(method, p, body)
+        let status = toInt(r[0])
+        let elapsed = monoMillis() - t0
+
+        if (status < 0) {
+            self.lastError = "请求失败：" + toString(r[2])
+            return ResultSet.fail(self.lastError)
+        }
+        let text = toString(r[1])
+        if (status >= 400) {
+            self.lastError = "HTTP " + toString(status) + "：" + esExtractError(text)
+            let rs = ResultSet.fail(self.lastError)
+            rs.elapsedMs = elapsed
+            return rs
+        }
+
+        let rs = esToResultSet(text)
+        rs.elapsedMs = elapsed
+        rs.raw = method + " " + p
+        return rs
+    }
+
+    // 检索一个索引。
+    fn search(index: String, body: String) -> ResultSet {
+        var idx = index
+        if (len(idx) == 0) { idx = self.defaultIndex }
+        if (len(idx) == 0) {
+            return ResultSet.fail("未指定索引")
+        }
+        var b = body
+        if (len(b) == 0) { b = "{\"query\":{\"match_all\":{}}}" }
+        return self.requestResult("POST", "/" + idx + "/_search", b)
+    }
+
+    // 索引列表（用 _cat/indices 的 JSON 格式，比 _cluster/state 轻）。
+    fn listIndices() -> ResultSet {
+        return self.requestResult("GET", "/_cat/indices?format=json&h=index,docs.count,store.size", "")
+    }
+
+    // 写入一条文档。
+    fn indexDoc(index: String, id: String, json: String) -> ResultSet {
+        var path = "/" + index + "/_doc"
+        if (len(id) > 0) { path = path + "/" + id }
+        return self.requestResult("POST", path, json)
+    }
+
+    // 按 id 取一条。
+    fn getDoc(index: String, id: String) -> ResultSet {
+        return self.requestResult("GET", "/" + index + "/_doc/" + id, "")
+    }
+
+    // 删除一条。
+    fn deleteDoc(index: String, id: String) -> ResultSet {
+        return self.requestResult("DELETE", "/" + index + "/_doc/" + id, "")
+    }
+
+    // ── 诊断 ────────────────────────────────────
+
+    fn clusterInfo() -> String {
+        let r = self.request("GET", "/", "")
+        if (toInt(r[0]) != 200) { return toString(r[2]) }
+        let doc = jsonParse(toString(r[1]))
+        let v = jsonGetText(doc, "version.number")
+        let cn = jsonGetText(doc, "cluster_name")
+        return cn + " / ES " + v
+    }
+
+    fn describe() -> String {
+        var state = "未连接"
+        if (self.connected) { state = "已连接" }
+        var s = "Elasticsearch @http://" + endpointString(self.ep)
+        if (len(self.defaultIndex) > 0) { s = s + " index=" + self.defaultIndex }
+        s = s + " [" + state + "]"
+        return s
+    }
+}
+
+// ── 结果转换 ──────────────────────────────────────
+//
+// ES 的检索响应结构：
+//
+//   {
+//     "took": 3,
+//     "hits": {
+//       "total": {"value": 2, "relation": "eq"},
+//       "hits": [
+//         {"_index": "x", "_id": "1", "_score": 1.0, "_source": {...}},
+//         ...
+//       ]
+//     }
+//   }
+//
+// 摊平规则：每个 hit 一行，列是 _id/_score + _source 的所有字段。
+//
+// ── 为什么要按 _source 的字段收集列名 ────────────────
+//
+// 因为 ES 是 schemaless，不同文档的字段可能完全不同。先扫一遍
+// 所有 hit 收集全部字段名，缺失的填 NULL —— 否则列会随文档漂移。
+fn esToResultSet(text: String) -> ResultSet {
+    let t = strTrim(text)
+    if (len(t) == 0) { return ResultSet.empty() }
+
+    let doc = jsonParse(t)
+    if (len(doc) == 0) {
+        // 不是 JSON（可能是 _cat 的纯文本）：整段作为单行单列
+        let rs = ResultSet.make(["value"], [[t]])
+        return rs
+    }
+
+    // ① 找 hits.hits
+    let hits = jsonGetArray(doc, "hits.hits")
+    if (len(hits) == 0) {
+        // 可能是写入/删除的响应，或 _cat/indices（顶层是数组）
+        let top = jsonIsArray(t)
+        if (top) {
+            return esCatResult(t)
+        }
+        let rs = ResultSet.empty()
+        // ── 单文档响应（GET /idx/_doc/id）的 _source 要摊平 ────
+        //
+        // 这条分支原来只看 `_id` 和 `result`，把 `_source` 整个丢掉了。
+        // 症状是 getDoc("blog", "a1") 返回一行两列，`title` / `views`
+        // 这些真正想要的数据全是空的 —— 而响应里明明有，只是没被读。
+        //
+        // 修复顺序很关键：**先判 _source**。因为搜索/取单文档都有 _id，
+        // 而写文档的响应有 _id 但没有 _source；靠 _source 是否存在
+        // 才能把两者分开，否则 getDoc 永远走不到摊平分支。
+        let src = jsonGetObject(doc, "_source")
+        if (len(src) > 0) {
+            let dcols = []
+            arrPush(dcols, "_id")
+            let dkeys = jsonKeys(src)
+            var dk = 0
+            while dk < len(dkeys) {
+                arrPush(dcols, toString(dkeys[dk]))
+                dk = dk + 1
+            }
+            let drow = []
+            let dnf = []
+            arrPush(drow, jsonGetText(doc, "_id"))
+            arrPush(dnf, false)
+            var dc = 1
+            while dc < len(dcols) {
+                let cell = jsonCell(src, toString(dcols[dc]))
+                arrPush(drow, cell[0])
+                // cell[1] 是「字段存在」，nulls 要的是「字段缺失」
+                // —— 两者相反。这里取反，见下方 ③ 的详细说明。
+                if (cell[1] == true) { arrPush(dnf, false) }
+                else { arrPush(dnf, true) }
+                dc = dc + 1
+            }
+            // make 的第 2 个参数是「行的数组」，每行本身是值数组。
+            // 这里只有一行，所以是 [drow] 而不是 [[drow]] —— 多套一层
+            // 会让 data[0] 变成 [drow]，整行被当成一个单元格，
+            // 打印出来就是 `[a1, 第一篇, 100] |  | `。
+            let r3 = ResultSet.make(dcols, [drow])
+            r3.nulls = [dnf]
+            let found = jsonGetText(doc, "found")
+            if (found == "true") { r3.affected = 1 }
+            return r3
+        }
+
+        // 写 / 删 文档的响应：只有 _id + result
+        let id = jsonGetText(doc, "_id")
+        let result = jsonGetText(doc, "result")
+        if (len(id) > 0) {
+            let r2 = ResultSet.make(["_id", "result"], [[id, result]])
+            r2.affected = 1
+            r2.raw = result
+            return r2
+        }
+        let took = jsonGetInt(doc, "took")
+        if (took > 0) { rs.elapsedMs = took }
+        return rs
+    }
+
+    // ② 收集列名
+    let cols = ["_id"]
+    var i = 0
+    while i < len(hits) {
+        let src = jsonGetObject(hits[i], "_source")
+        let keys = jsonKeys(src)
+        var k = 0
+        while k < len(keys) {
+            let key = toString(keys[k])
+            if (!esContains(cols, key)) { arrPush(cols, key) }
+            k = k + 1
+        }
+        i = i + 1
+    }
+
+    // ③ 逐 hit 取值
+    //
+    // ── nulls 的语义必须取反（这里错过一次） ──────────────
+    //
+    // jsonCell 返回 [值, 字段是否存在]：
+    //   字段存在 → [值, true]
+    //   字段缺失 → ["", false]
+    //
+    // 而 ResultSet.nulls 要的是「是否为 NULL」：
+    //   字段缺失 → true（是 NULL）
+    //   字段存在 → false
+    //
+    // 两者**正好相反**。原来直接 `arrPush(nf, cell[1])`，于是「字段
+    // 存在」被标记成了 NULL —— 表格里每个本该有值的格子都显示 NULL，
+    // 而数据其实安静地躺在 data 里。
+    //
+    // 这个 bug 的隐蔽之处在于它不影响 data，只影响 nulls，所以
+    // `rs.cell()` 拿到的是对的、`rs.isNull()` 拿到的是反的。只有
+    // 同时打印两者（或者按 isNull 决定是否显示）才会暴露。
+    let rows = []
+    let nulls = []
+    i = 0
+    while i < len(hits) {
+        let hit = hits[i]
+        let src = jsonGetObject(hit, "_source")
+        let row = []
+        let nf = []
+        var c = 0
+        while c < len(cols) {
+            let cn = toString(cols[c])
+            if (cn == "_id") {
+                arrPush(row, jsonGetText(hit, "_id"))
+                arrPush(nf, false)
+            } else {
+                let cell = jsonCell(src, cn)
+                arrPush(row, cell[0])
+                if (cell[1] == true) { arrPush(nf, false) }
+                else { arrPush(nf, true) }
+            }
+            c = c + 1
+        }
+        arrPush(rows, row)
+        arrPush(nulls, nf)
+        i = i + 1
+    }
+
+    let rs = ResultSet.make(cols, rows)
+    rs.nulls = nulls
+    let took = jsonGetInt(doc, "took")
+    if (took > 0) { rs.elapsedMs = took }
+    return rs
+}
+
+// _cat/indices 的响应是顶层数组：[{index, docs.count, store.size}, …]
+fn esCatResult(text: String) -> ResultSet {
+    let arr = jsonParse(text)
+    if (len(arr) == 0) { return ResultSet.empty() }
+
+    // 顶层数组的元素是对象（键值交错的数组）
+    let first = arr[0]
+    if (typeOf(first) != "Array") {
+        return ResultSet.make(["value"], [[text]])
+    }
+
+    let cols = jsonKeys(first)
+    let rows = []
+    var i = 0
+    while i < len(arr) {
+        let obj = arr[i]
+        let row = []
+        var c = 0
+        while c < len(cols) {
+            let cell = jsonCell(obj, toString(cols[c]))
+            arrPush(row, cell[0])
+            c = c + 1
+        }
+        arrPush(rows, row)
+        i = i + 1
+    }
+    return ResultSet.make(cols, rows)
+}
+
+// 从 ES 的错误响应里提取可读消息。
+//
+//   {"error":{"type":"index_not_found_exception","reason":"no such index [x]"},"status":404}
+fn esExtractError(text: String) -> String {
+    let doc = jsonParse(strTrim(text))
+    if (len(doc) == 0) { return text }
+    let typ = jsonGetText(doc, "error.type")
+    let reason = jsonGetText(doc, "error.reason")
+    if (len(reason) > 0) {
+        if (len(typ) > 0) { return typ + ": " + reason }
+        return reason
+    }
+    // error 可能直接是字符串
+    let s = jsonGetText(doc, "error")
+    if (len(s) > 0) { return s }
+    return text
+}
+
+fn esContains(arr: Array, s: String) -> Bool {
+    var i = 0
+    while i < len(arr) {
+        if (toString(arr[i]) == s) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── 命令拆分（保留 JSON 内的空格）────────────────────
+fn esSplit(s: String) -> Array {
+    let out = []
+    var cur = ""
+    var i = 0
+    let n = len(s)
+    var depth = 0
+    var inStr = false
+    while i < n {
+        let c = strSub(s, i, i + 1)
+        if (c == "\"") { inStr = !inStr }
+        if (!inStr) {
+            if (c == "{" || c == "[") { depth = depth + 1 }
+            if (c == "}" || c == "]") { depth = depth - 1 }
+            if ((c == " " || c == "\t") && depth == 0) {
+                if (len(cur) > 0) {
+                    arrPush(out, cur)
+                    cur = ""
+                }
+                i = i + 1
+                continue
+            }
+        }
+        cur = cur + c
+        i = i + 1
+    }
+    if (len(cur) > 0) { arrPush(out, cur) }
+    return out
+}
+
+fn esArg(parts: Array, i: Int) -> String {
+    if (i < 0 || i >= len(parts)) { return "" }
+    return toString(parts[i])
+}
+
+// ── URL 解析 ──────────────────────────────────────
+//
+// 返回 [scheme, host, port, user, password, index]
+fn esParseUrl(url: String) -> Array {
+    var rest = url
+    let k = strFind(url, "://")
+    if (k >= 0) { rest = strSub(url, k + 3, len(url)) }
+
+    var user = ""
+    var password = ""
+    let at = strFind(rest, "@")
+    if (at >= 0) {
+        let cred = strSub(rest, 0, at)
+        rest = strSub(rest, at + 1, len(rest))
+        let colon = strFind(cred, ":")
+        if (colon >= 0) {
+            user = strSub(cred, 0, colon)
+            password = strSub(cred, colon + 1, len(cred))
+        } else {
+            user = cred
+        }
+    }
+
+    var host = rest
+    var port = 9200
+    var idx = ""
+    let slash = strFind(rest, "/")
+    if (slash >= 0) {
+        host = strSub(rest, 0, slash)
+        idx = strSub(rest, slash + 1, len(rest))
+    }
+    let colon2 = strFind(host, ":")
+    if (colon2 >= 0) {
+        port = strParseInt(strSub(host, colon2 + 1, len(host)))
+        host = strSub(host, 0, colon2)
+    }
+    if (len(host) == 0) { host = "127.0.0.1" }
+    return ["http", host, port, user, password, idx]
+}

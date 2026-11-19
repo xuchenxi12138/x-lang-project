@@ -1,0 +1,223 @@
+// ui/widget/frame.xle — 帧：点击归属
+//
+// ── 这一层解决的真正问题 ─────────────────────────
+//
+// 即时模式 UI 里，每一帧都要问「这次点击归谁」。朴素做法是让每个
+// 控件自己去 `winPollClick()` 取事件 —— 但那个事件队列是**有顺序**
+// 的：第一个取走的拿到，后面的什么都拿不到。
+//
+// 于是「点击归属」变成了「绘制顺序的副产品」：
+//
+//     uiCheck(...背景音乐...)     // 先调，抢走这次点击
+//     uiCheck(...音效...)         // 永远收不到
+//     uiSlider(...)               // 根本不进队列，完全不受影响
+//
+// 三处都不报错，行为却是错的。而且调换两行代码的顺序就会改变结果。
+// 这种耦合不能靠注释挡住，只能靠**类型**挡住。
+//
+// ── Frame 的做法 ─────────────────────────────
+//
+// 一帧开始取**一次**快照，之后所有控件查同一份数据：
+//
+//     var f = Frame.begin()
+//     if (btn.hit(f)) { ... }          // 纯查询
+//     f = f.claim(btn.r)               // 显式声明归属
+//
+// hit 是纯查询：画多少次、按什么顺序画都不影响结果。
+// claim 显式声明「这次点击归我」，之后的控件 hit 一律为假。
+//
+// 想改归属顺序，改 claim 的顺序就行，不必动绘制代码。
+//
+// ── 为什么 Frame 是值而不是可变对象 ────────────────
+//
+// claim 返回新的 Frame，调用方必须写 `f = f.claim(r)`。字段
+// 不可变的约束让这里必须显式回写 —— 看起来不如 `f.claim(r)`
+// 简洁，但它顺带保证了一件事：忘了回写就是忘了，hit 必然为假，
+// 不会出现「状态悄悄改了但没人知道」。
+//
+// ── 为什么只处理「一次点击」而不是多点触控 ─────────────
+//
+// 因为窗口层只提供 winPollClick（单点）和 winMouseDown（单键状态）。
+// 多点要窗口层先支持，届时 Frame 需要改成「点击数组 + 归属表」。
+
+from "widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+
+// ── 帧状态 ──────────────────────────────────────
+
+struct Frame {
+    // 本次点击的坐标。没有点击时 used 为真而 cx/cy 无意义。
+    cx: Int,
+    cy: Int,
+
+    // 是否被某个控件认领了。一旦为真，后续所有 hit 返回假。
+    taken: Bool,
+
+    // 这一帧是否有过点击事件。
+    clicked: Bool,
+
+    // 鼠标当前是否按下（用于拖动，与 clicked 不同：
+    // clicked 是「这一帧发生了一次按下」，pressed 是「现在按住」）。
+    pressed: Bool,
+
+    // 鼠标当前坐标。用于悬停判定 —— 悬停需要「现在在哪」，
+    // 不需要「点击在哪」。
+    mx: Int,
+    my: Int,
+}
+
+// ── 开始一帧 ────────────────────────────────────
+//
+// 从窗口层取一次状态。这是整个模块**唯一**读取输入的地方 ——
+// 这一条如果被破坏（有人绕过 Frame 直接调 winPollClick），
+// 归谁的问题就回来了。
+fn frameBegin() -> Frame {
+    // ── 为什么要「先取全部原始值，再一次构造」────────────
+    //
+    // 结构体字段不可赋值（P0.5 的值语义约束）。所以不能
+    // `var f = Frame {...}; f.mx = winMouseX()` —— 必须把所有
+    // 值都取好，然后用一次字面量构造。
+    //
+    // 这实际上是好事：它保证了一个 Frame 一旦造出来就完全不变，
+    // 「读到的 f.mx 在函数中途被谁改了」这种问题不可能发生。
+    let mx = winMouseX()
+    let my = winMouseY()
+    let pressed = winMouseDown(0)
+
+    // 弹一次点击事件。队列里可能有多个，但一帧只处理一个 ——
+    // 同一帧里两次物理点击不可能（60fps 下间隔至少 16ms，
+    // 人手按不了那么快）。
+    let ev = winPollClick()
+
+    // 无点击时 winPollClick 返回 null，len(null) 是 0。
+    let has = len(ev) >= 2
+    var cx = 0
+    var cy = 0
+    var left = false
+    if (has) {
+        cx = toInt(ev[0])
+        cy = toInt(ev[1])
+        // 第三个元素是按键编号。没有第三项时按左键处理 ——
+        // 因为窗口层在只有一个按钮的场景下不填这一项。
+        if (len(ev) >= 3) {
+            left = toInt(ev[2]) == 0
+        } else {
+            left = true
+        }
+    }
+
+    return Frame {
+        cx: cx,
+        cy: cy,
+        taken: false,
+        clicked: has && left,
+        pressed: pressed,
+        mx: mx,
+        my: my,
+    }
+}
+
+// 无输入的帧（用于测试、或纯展示界面）。
+fn frameEmpty() -> Frame {
+    return Frame {
+        cx: 0, cy: 0,
+        taken: false,
+        clicked: false,
+        pressed: false,
+        mx: 0, my: 0,
+    }
+}
+
+// ── 查询 ────────────────────────────────────────
+
+// 这个矩形是否被点击了。
+//
+// ── 三个条件 ─────────────────────────────────
+//
+//   1. 这一帧有点击
+//   2. 还没有别的控件认领
+//   3. 点击坐标落在矩形内
+//
+// 注意**不**包含「鼠标现在仍在此矩形内」：点击的定义是「按下时
+// 在哪」，按下之后拖走不影响归属。这与所有平台的按钮行为一致。
+fn frameHit(f: Frame, r: Rect) -> Bool {
+    if (!f.clicked) { return false }
+    if (f.taken) { return false }
+    return r.contains(f.cx, f.cy)
+}
+
+// 鼠标现在是否悬停在这个矩形上。
+//
+// 与 frameHit 分开：悬停看的是 mx/my（现在），点击看的是 cx/cy
+// （按下那一刻）。混用会导致「按下后拖出按钮，按钮仍显示悬停」。
+fn frameHover(f: Frame, r: Rect) -> Bool {
+    return r.contains(f.mx, f.my)
+}
+
+// ── 认领 ────────────────────────────────────────
+
+// 声明「这次点击归这块矩形」。返回新 Frame。
+//
+// 调用方必须回写：`f = frameClaim(f, r)`。
+fn frameClaim(f: Frame, r: Rect) -> Frame {
+    if (!frameHit(f, r)) { return f }
+    return Frame {
+        cx: f.cx, cy: f.cy,
+        taken: true,
+        clicked: f.clicked,
+        pressed: f.pressed,
+        mx: f.mx, my: f.my,
+    }
+}
+
+// 无条件认领（不看命中）。用于「浮层已经吃掉这次点击」的场景 ——
+// 比如模态框的遮罩：它不属于任何矩形，但必须阻止所有后续控件
+// 收到这次点击。
+fn frameClaimAll(f: Frame) -> Frame {
+    if (!f.clicked) { return f }
+    return Frame {
+        cx: f.cx, cy: f.cy,
+        taken: true,
+        clicked: f.clicked,
+        pressed: f.pressed,
+        mx: f.mx, my: f.my,
+    }
+}
+
+// 命中并认领，一步完成。返回「是否归我了」。
+//
+// ── 为什么不直接返回 Frame ─────────────────────
+//
+// 因为最常见的用法是：
+//
+//     if (frameTake(f, btn.r)) { doIt() }
+//
+// 而 f 是局部的，调完就不用了 —— 不需要把新 Frame 传出去。
+// 需要继续给别人判的场合（多个控件依次判）才用 frameClaim。
+//
+// ── 这个函数有个陷阱 ────────────────────────
+//
+// 它返回 Bool，而 Frame 是按值传的 —— 所以认领的副作用**不会**
+// 传回调用方的 f。这意味着 frameTake 只能用于「最后一个/唯一
+// 一个」控件：后面的控件仍会收到这次点击。
+//
+// 为了不让这个陷阱伤人，这个函数叫 take 而不是 hitAndClaim ——
+// 「take」暗示「独占地拿走」，而它确实独占（因为后面的控件本来
+// 就不该再判了）。要在链条里用，用 frameClaim。
+fn frameTake(f: Frame, r: Rect) -> Bool {
+    return frameHit(f, r)
+}
+
+// ── 键盘：当前的能力边界 ─────────────────────────
+//
+// 窗口层目前**没有**键盘事件接口 —— 既没有「取按键事件」，也没有
+// 「某个键是否按下」。所以这个模块无法提供 KeyState。
+//
+// 这不是偷懒，是能力边界。写一个假的键盘抽象比不写更糟：它会让
+// 使用方以为键盘能用，然后在运行时发现永远收不到事件。
+//
+// 需要键盘的组件（输入框的打字、列表的上下键）目前通过
+// 「方法 + 参数」暴露逻辑（`field.typeKey("a")`、`list.keyMove(
+// "ArrowDown")`），由调用方在拿到键盘能力后转发进来。这个分界
+// 的好处是：等窗口层加了键盘接口，只需要在应用层加十几行转发，
+// 库里的组件一行都不用改。

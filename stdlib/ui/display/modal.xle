@@ -1,0 +1,324 @@
+// ui/display/modal.xle — 模态对话框
+//
+// ── 模态的本质是「抢走注意力」 ──────────────────────
+//
+// 它不是「居中显示一个框」，而是「在用户处理完之前，其它一切都
+// 不可用」。所以一个真正的模态必须做到四件事：
+//
+//   1. 全屏遮罩（挡住后面的内容）
+//   2. 吃掉所有落在遮罩上的点击（防止点到后面的控件）
+//   3. 遮罩每秒变暗的过程可选（不重要，但能强化「你被挡住了」）
+//   4. 关闭时按相反顺序撤销
+//
+// 第 2 点最容易被漏掉。如果遮罩只是「画了一层半透明黑色」而
+// 不拦截点击，用户点空白处就会意外触发后面的按钮 —— 这是模态
+// 实现里最经典的 bug，而且只在特定布局下出现。
+//
+// ── 为什么遮罩不做半透明 ─────────────────────────
+//
+// 因为窗口层没有「alpha 混合填充矩形」这个原语（只有 winAlpha
+// 推栈，但那是作用于之后的绘制，且窗口层的实现是破坏性的）。
+//
+// 所以这里的遮罩是一个**不透明的深色**。视觉上不如半透明好看，
+// 但功能上是正确的，而且「深色遮罩 + 居中亮框」的对比度其实
+// 比半透明更强，用户的注意力更容易被引导过去。这是能力边界下
+// 的取舍，不是设计缺陷。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../layout/layout.xle" import layoutFrame, layoutRaw, layoutColumn, layoutRow, layoutNext, layoutAdvance, layoutNextCol, layoutAdvanceCol, layoutSplit, layoutSplitV, layoutAt, layoutPlace, layoutCenter, layoutHCenter, layoutInset, layoutPadLeft, layoutPadRight, layoutPadTop, layoutPadBottom, layoutPadH, layoutPadV, layoutRemainder, layoutSpacer, Cursor, ALIGN_START, ALIGN_CENTER, ALIGN_END, ALIGN_STRETCH
+from "../layout/panel.xle" import Panel, PANEL_TITLE_H
+from "../control/button.xle" import Button, BTN_SECONDARY, BTN_PRIMARY, BTN_DANGER, BTN_GHOST
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 对话框按钮栏高度。
+const MD_FOOTER_H = 52
+
+// 对话框内边距。
+const MD_PAD = 20
+
+class Modal extends Widget {
+    title: String,
+    message: String,
+
+    // 是否显示。
+    //
+    // ── 为什么 open 是字段而不是「存在即显示」 ─────────
+    //
+    // 因为对话框通常在程序启动时就创建好（布局不随开关变化），
+    // 反复 open/close。如果靠「创建/销毁」控制，就要每次重新
+    // 排版，而即时模式下那是每帧的开销。
+    open: Bool,
+
+    // 底部按钮文字。空数组表示只有关闭按钮（X）。
+    buttons: Array,
+
+    // 用户点了哪个按钮。-1 表示还没点 / 已关闭。
+    //
+    // ── 为什么用「索引」而不是回调 ────────────────
+    //
+    // 因为语言没有闭包，无法给每个按钮挂一个不同的回调。用索引
+    // 让调用方在 close 之后自己 switch —— 虽然啰嗦，但它是
+    // 唯一可行的做法，而且比「一个回调 + 自己判断是哪个按钮」
+    // 更清楚。
+    result: Int,
+
+    constructor(r: Rect, title: String, message: String) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.title   = title
+        self.message = message
+        self.open    = false
+        self.buttons = ["确定"]
+        self.result  = 0 - 1
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, title: String, message: String) -> Modal {
+        return new Modal(r, title, message)
+    }
+
+    // 确认框：两个按钮。
+    static fn confirm(r: Rect, title: String, message: String) -> Modal {
+        let m = new Modal(r, title, message)
+        m.buttons = ["取消", "确定"]
+        return m
+    }
+
+    fn show() -> Modal {
+        self.open = true
+        self.result = 0 - 1
+        return self
+    }
+
+    fn hide() -> Modal {
+        self.open = false
+        return self
+    }
+
+    fn setMessage(s: String) -> Modal {
+        self.message = s
+        return self
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    // 对话框本体矩形。调用方传的 r 是「期望的大小与位置」。
+    //
+    // ── 为什么不让 Modal 自己居中 ─────────────────
+    //
+    // 因为它不知道屏幕尺寸。窗口尺寸在即时模式里每帧可能变，
+    // 而 Modal 拿不到可靠值。调用方用 layoutCenter(screen, w, h)
+    // 算好再传进来更可靠 —— 而且调用方本来就知道窗口多大。
+    fn box() -> Rect {
+        return self.r
+    }
+
+    fn titleRect() -> Rect {
+        return rectOf(self.r.x + MD_PAD, self.r.y + 14,
+                      self.r.w - MD_PAD * 2 - 28, 24)
+    }
+
+    fn bodyRect() -> Rect {
+        let top = self.r.y + 46
+        let h = self.r.h - 46 - MD_FOOTER_H
+        return rectOf(self.r.x + MD_PAD, top, self.r.w - MD_PAD * 2, h)
+    }
+
+    fn footerRect() -> Rect {
+        return rectOf(self.r.x, self.r.y + self.r.h - MD_FOOTER_H,
+                      self.r.w, MD_FOOTER_H)
+    }
+
+    // 第 i 个按钮的矩形。从右往左排 —— 主按钮在最右，这是
+    // 桌面端的惯例（Windows/macOS 都是）。
+    fn buttonRect(i: Int) -> Rect {
+        let bw = 84
+        let bh = 32
+        let gap = 10
+        let n = len(self.buttons)
+        let right = self.r.x + self.r.w - MD_PAD
+        let x = right - (n - i) * (bw + gap) + gap
+        let y = self.r.y + self.r.h - MD_FOOTER_H + (MD_FOOTER_H - bh) / 2
+        return rectOf(x, y, bw, bh)
+    }
+
+    // 关闭按钮（右上角 X）矩形。
+    fn closeRect() -> Rect {
+        let s = 24
+        return rectOf(self.r.x + self.r.w - MD_PAD - s, self.r.y + 12, s, s)
+    }
+
+    // ── 交互 ────────────────────────────────────
+    //
+    // 返回被点中的按钮索引。-2 表示点了遮罩（什么都没做），
+    // -1 表示没有有效交互。
+    fn click(mx: Int, my: Int) -> Int {
+        if (!self.open) { return 0 - 1 }
+
+        // 先判对话框本体 —— 点在里面不算「点遮罩」。
+        if (self.r.contains(mx, my)) {
+            // 关闭按钮。
+            if (self.closeRect().contains(mx, my)) {
+                self.result = 0 - 1
+                self.open = false
+                return 0 - 1
+            }
+            // 底部按钮。
+            var i = 0
+            while i < len(self.buttons) {
+                let br: Rect = self.buttonRect(i)
+                if (br.contains(mx, my)) {
+                    self.result = i
+                    self.open = false
+                    return i
+                }
+                i = i + 1
+            }
+            // 点在框内空白：吞掉，不穿透到后面。
+            return 0 - 2
+        }
+
+        // 点在遮罩上。
+        //
+        // ── 是否应该关掉 ──────────────────────────
+        //
+        // 分两种流派：点遮罩关闭（移动端常见）、点遮罩不关闭
+        // （桌面端常见，防止误触丢失输入）。
+        //
+        // 这里选择**不关闭**，因为误触的代价太大（用户填了一半
+        // 的表单没了）。想关闭的调用方可以看返回值自己处理。
+        return 0 - 2
+    }
+
+    // 键盘。Esc 关闭（等价于点 X，result 不变）。
+    fn keyDown(key: String) -> Bool {
+        if (!self.open) { return false }
+        if (key == "Escape") {
+            self.open = false
+            return true
+        }
+        if (key == "Enter") {
+            // 回车 = 点最后一个按钮（通常是「确定」）。
+            let n = len(self.buttons)
+            if (n > 0) {
+                self.result = n - 1
+                self.open = false
+                return true
+            }
+        }
+        return false
+    }
+
+    // ── 绘制 ────────────────────────────────────
+    //
+    // 必须在**所有其它控件之后**调用。
+
+    fn draw(th: Theme) {
+        if (!self.open) { return }
+
+        // ── 1. 全屏遮罩 ──
+        //
+        // 尺寸用「足够大」而不是「精确屏幕尺寸」：窗口层会裁剪，
+        // 多画出去的部分不会显示，而拿不到屏幕尺寸时这是唯一
+        // 可行的办法。用 8000 是因为它一定大于任何窗口。
+        winFillRect(0 - 4000, 0 - 4000, 8000, 8000, th.scrim)
+
+        // ── 2. 对话框本体 ──
+        let s = self.r
+
+        // 阴影（比 Body 大一圈，做出浮起感）。
+        winFillRound(s.x - 2, s.y + 2, s.w + 4, s.h + 6, 12, th.bg)
+
+        winFillRound(s.x, s.y, s.w, s.h, 10, th.surface)
+        winBorderRound(s.x, s.y, s.w, s.h, 10, 1, th.border)
+
+        // ── 3. 标题 ──
+        if (len(self.title) > 0) {
+            let tr = self.titleRect()
+            var title = self.title
+            if (winTextWidth(title) > tr.w) {
+                title = uiEllipsize(title, tr.w)
+            }
+            uiTextLeft(tr, title, 0, th.text)
+        }
+
+        // ── 4. 关闭按钮（X）──
+        //
+        // 两条对角线。用线段而不是字符 "×"，因为字符的粗细和
+        // 位置随字体变。
+        let cr = self.closeRect()
+        let cx = cr.x + cr.w / 2
+        let cy = cr.y + cr.h / 2
+        let d = 5
+        let c1 = [cx - d, cy - d, cx - d + 1, cy - d, cx + d, cy + d, cx + d - 1, cy + d]
+        // 用两条细矩形代替斜线（winPath 画的是填充多边形，
+        // 细长的四边形就是一条线）。
+        self.drawX(cx, cy, d, th.textDim)
+
+        // ── 5. 正文 ──
+        let br = self.bodyRect()
+        if (len(self.message) > 0) {
+            let lines = uiWrapLines(self.message, br.w)
+            uiTextBlock(br, lines, 20, 0, th.textDim)
+        }
+
+        // ── 6. 按钮栏 ──
+        let fr = self.footerRect()
+        winFillRect(fr.x, fr.y, fr.w, 1, th.border)
+
+        var i = 0
+        while i < len(self.buttons) {
+            let br2: Rect = self.buttonRect(i)
+            // 最后一个按钮是主按钮。
+            let isPrimary = i == len(self.buttons) - 1
+
+            // 悬停判定。
+            var hov = false
+            let mxx = winMouseX()
+            let myy = winMouseY()
+            if (br2.contains(mxx, myy)) { hov = true }
+
+            var bg = th.surface
+            var fg = th.text
+            if (isPrimary) {
+                bg = th.accent
+                fg = th.onAccent
+                if (hov) { bg = th.accentDark }
+            } else if (hov) {
+                bg = th.surfaceHover
+            }
+
+            winFillRound(br2.x, br2.y, br2.w, br2.h, 4, bg)
+            if (!isPrimary) {
+                winBorderRound(br2.x, br2.y, br2.w, br2.h, 4, 1, th.border)
+            }
+            uiTextInRect(br2, toString(self.buttons[i]), fg)
+
+            i = i + 1
+        }
+    }
+
+    // 画一个 X。用四条细矩形拼（两条斜线各用两段近似）。
+    //
+    // ── 为什么不用 winPath 画细线 ────────────────────
+    //
+    // winPath 画填充多边形，一条 1px 宽的斜线需要算出法向偏移，
+    // 而对角线的法向是 (1,-1)/√2 —— 要开方。用「沿对角线方向
+    // 逐像素画小方点」更简单，代价是 20 次 winFillRect 调用，
+    // 而对一个 24px 的按钮来说完全可接受。
+    fn drawX(cx: Int, cy: Int, d: Int, c: Int) {
+        var i = 0 - d
+        while i <= d {
+            winFillRect(cx + i, cy + i, 1, 1, c)
+            winFillRect(cx + i, cy - i, 1, 1, c)
+            i = i + 1
+        }
+    }
+}

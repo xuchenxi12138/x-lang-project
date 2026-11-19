@@ -1,0 +1,158 @@
+// ui/layout/scrollview.xle — 滚动容器
+//
+// ── 滚动在即时模式里为什么需要状态 ──────────────────
+//
+// 因为「滚动位置」跨帧保持，而输入是「滚轮 delta」这种增量。
+// 这是即时 UI 里少数必须有可变状态的地方（与滑块同理）。
+//
+// ── 为什么不支持拖拽滚动条 ───────────────────────
+//
+// 拖拽需要额外的状态机（按下位置、抓取点偏移、越界回弹），而
+// 这个库的目标是「够用的滚动」—— 滚轮能用、位置可见、内容不
+// 溢出，就已经覆盖 95% 的场景。拖拽留作后续。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// ── 滚动在即时模式里为什么需要状态 ──────────────────
+//
+// 因为「滚动位置」跨帧保持，而输入是「滚轮 delta」这种增量。
+// 这是即时 UI 里少数必须有可变状态的地方（与滑块同理）。
+//
+// ── 为什么不画滚动条 ─────────────────────────────
+//
+// 画了。但滚动条的交互（拖动滑块）需要额外的状态机，而这个库
+// 的目标是「够用的滚动」—— 滚轮能用、位置可见、内容不溢出，
+// 就已经覆盖 95% 的场景。拖动滚动条留作后续。
+class ScrollView extends Widget {
+    // 内容总高度（由调用方在布局后告知）。
+    contentH: Int,
+
+    // 滚动偏移（像素，从内容顶部算起）。
+    offset: Int,
+
+    // 每格滚轮滚动多少像素。
+    wheelStep: Int,
+
+    constructor(r: Rect) {
+        self.r        = r
+        self.vis      = true
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.contentH = 0
+        self.offset   = 0
+        self.wheelStep = 40
+        self.style    = Style.plain()
+    }
+
+    static fn of(r: Rect) -> ScrollView {
+        return new ScrollView(r)
+    }
+
+    // 可见区域。扣掉 1px 边框。
+    fn viewport() -> Rect {
+        return Rect.inset(self.r, 1)
+    }
+
+    // 最大滚动量。内容比视口矮时是 0。
+    fn maxOffset() -> Int {
+        let vh = self.viewport().h
+        let over = self.contentH - vh
+        if (over < 0) { return 0 }
+        return over
+    }
+
+    // 内容区的完整矩形（虚拟的，未裁剪）。
+    //
+    // y 减去 offset：内容是往上移的，而调用方拿到的坐标已经是
+    // 「屏幕坐标」，可以直接拿去画。
+    fn contentArea() -> Rect {
+        let vp = self.viewport()
+        return rectOf(vp.x, vp.y - self.offset, vp.w, self.contentH)
+    }
+
+    // 滚轮。delta 为正是向上滚（内容下移）。
+    fn scroll(delta: Int) -> ScrollView {
+        self.offset = self.offset - delta * self.wheelStep
+        self.clamp()
+        return self
+    }
+
+    fn scrollTo(y: Int) -> ScrollView {
+        self.offset = y
+        self.clamp()
+        return self
+    }
+
+    fn clamp() {
+        let mx = self.maxOffset()
+        if (self.offset > mx) { self.offset = mx }
+        if (self.offset < 0) { self.offset = 0 }
+    }
+
+    // 把内容里的一块区域滚动到可见。
+    fn ensureVisible(top: Int, h: Int) {
+        let vh = self.viewport().h
+        if (top < self.offset) {
+            self.offset = top
+        }
+        if (top + h > self.offset + vh) {
+            self.offset = top + h - vh
+        }
+        self.clamp()
+    }
+
+    // 滚动条几何。
+    fn thumbRect() -> Rect {
+        let vp = self.viewport()
+        let mx = self.maxOffset()
+        let barW = 6
+
+        if (mx <= 0) {
+            // 不需要滚动：返回零宽矩形，调用方判宽度为 0 就不画。
+            return rectOf(vp.x + vp.w - barW, vp.y, 0, vp.h)
+        }
+
+        // 滑块高度按「视口/内容」比例，最小 24px —— 太小抓不住
+        // 也看不清，而最小值的代价只是比例失真（可接受）。
+        var th = vp.h * vp.h / self.contentH
+        if (th < 24) { th = 24 }
+        if (th > vp.h) { th = vp.h }
+
+        // 位置按 offset / maxOffset 映射到 (vp.h - th)。
+        let travel = vp.h - th
+        let ty = vp.y + self.offset * travel / mx
+
+        return rectOf(vp.x + vp.w - barW, ty, barW, th)
+    }
+
+    // 开始绘制：推裁剪区。调用方画完内容后必须调 endDraw()。
+    //
+    // ── 为什么是 begin/end 而不是 draw(内容回调) ──────
+    //
+    // 语言没有闭包，传不了「画什么」的回调。所以只能：
+    //   sv.beginDraw()
+    //   ... 画内容 ...
+    //   sv.endDraw()
+    // 这个约定靠纪律维持 —— 但忘了 endDraw 的症状很明确（后续
+    // 所有绘制都被裁掉），排查不难。
+    fn beginDraw() {
+        let vp = self.viewport()
+        winClip(vp.x, vp.y, vp.w, vp.h)
+    }
+
+    fn endDraw(th: Theme) {
+        winUnclip()
+
+        // 滚动条画在裁剪之后（不然会被裁掉）。
+        let tr = self.thumbRect()
+        if (tr.w > 0) {
+            winFillRound(tr.x, tr.y, tr.w, tr.h, tr.w / 2, th.border)
+        }
+    }
+}

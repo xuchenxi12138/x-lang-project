@@ -1,0 +1,321 @@
+// db/sqlite/record.xle — 记录（行）的编码与解码
+//
+// ── 一条记录在文件里长什么样 ─────────────────────────
+//
+// 表 B-tree 的叶子 cell 里，一条记录（除 rowid 外）就是：
+//
+//   [header 长度(varint)] [header ...] [body ...]
+//
+// header 本身是一串 varint：**第 1 个是 header 的总字节数（含自己）**，
+// 后面每个是「对应列在 body 里占多少字节」。所以
+//
+//   header 的 varint 个数 = 1 + 列数
+//
+// body 是各列的值按类型顺序紧凑排列，**没有分隔符** —— 这要求
+// 解码方严格按 header 里的长度切。少切一位就整行错乱，且不会报错。
+//
+// ── 类型怎么表示（这是 SQLite 最巧妙也最容易看错的地方） ────
+//
+// header 里每个「列长度」varint 的**数值本身**同时编码了类型：
+//
+//   0                → NULL（body 里占 0 字节）
+//   1..4             → 整数，1/2/3/4 字节大端有符号
+//   5                → 整数，6 字节
+//   6                → 整数，8 字节
+//   7                → Float（8 字节 IEEE 754 大端）
+//   8                → 整数 0（特例，body 占 0 字节）
+//   9                → 整数 1（特例，body 占 0 字节）
+//   10 / 11          → 保留（内部用，不允许出现在文件里）
+//   n >= 12 且 n 偶数 → BLOB，长度 (n-12)/2
+//   n >= 13 且 n 奇数 → TEXT，长度 (n-13)/2
+//
+// ── 为什么 8 和 9 要特例 ─────────────────────────────
+//
+// 因为 0 和 1 是最常见的整数值（布尔值、计数、标志位），而 1..2 字节
+// 的整数已经只要 1 个 header 字节 + 1 个 body 字节 = 2 字节了。特例化
+// 之后 0 和 1 只需要 header 的 1 个字节，body 不占空间 —— 对「几亿行
+// 的布尔列」是实打实的节省。
+//
+// ── 为什么文本长度是 (n-13)/2 ───────────────────────
+//
+// 因为 n 既要编码类型又要编码长度，用「奇偶」区分 TEXT/BLOB，用
+// 「除以 2」让一字节的空间表示两字节的长度。所以 TEXT 最大长度
+// 受限于 n 是 varint（可到 2^56），实际早被 32/64KB 的 payload
+// 上限约束，不是瓶颈。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "varint.xle" import svReadInt, svWriteInt, svWriteInt64, svPutInt, svReadMany
+
+// 列类型。
+const SV_NULL   = 0
+const SV_INT    = 1
+const SV_FLOAT  = 2
+const SV_TEXT   = 3
+const SV_BLOB   = 4
+
+// SQLite 内部「serial type」→ 我们这一层的列类型。
+//
+// serial type 就是 header 里那个 varint 的原始值。
+fn svSerialKind(serial: Int) -> Int {
+    if (serial == 0) { return SV_NULL }
+    if (serial >= 1 && serial <= 6) { return SV_INT }
+    if (serial == 7) { return SV_FLOAT }
+    if (serial == 8 || serial == 9) { return SV_INT }
+    // 10、11 是保留值。当成非法，返回 NULL 让上层能继续而不崩 ——
+    // 解析一个坏文件时「跳过坏列」比「整行失败」更有用。
+    if (serial == 10 || serial == 11) { return SV_NULL }
+    if (serial % 2 == 0) { return SV_BLOB }
+    return SV_TEXT
+}
+
+// serial type → body 里占的字节数。
+fn svSerialBytes(serial: Int) -> Int {
+    if (serial == 0) { return 0 }
+    if (serial == 1) { return 1 }
+    if (serial == 2) { return 2 }
+    if (serial == 3) { return 3 }
+    if (serial == 4) { return 4 }
+    if (serial == 5) { return 6 }
+    if (serial == 6) { return 8 }
+    if (serial == 7) { return 8 }
+    if (serial == 8 || serial == 9) { return 0 }
+    if (serial == 10 || serial == 11) { return 0 }
+    if (serial % 2 == 0) { return (serial - 12) / 2 }
+    return (serial - 13) / 2
+}
+
+// 解出的一列。
+class SvValue {
+    // SV_NULL / SV_INT / SV_FLOAT / SV_TEXT / SV_BLOB
+    kind: Int,
+
+    // 整数值（kind == SV_INT 时有效）。
+    i: Int,
+
+    // 浮点值（kind == SV_FLOAT 时有效）。
+    f: Float,
+
+    // 文本（kind == SV_TEXT 时有效）。
+    s: String,
+
+    // 二进制（kind == SV_BLOB 时有效）。
+    b: Array,
+
+    constructor() {
+        self.kind = SV_NULL
+        self.i    = 0
+        self.f    = 0.0
+        self.s    = ""
+        self.b    = []
+    }
+
+    fn isNull() -> Bool {
+        return self.kind == SV_NULL
+    }
+
+    // 统一转文本。表格展示与比较都用它。
+    fn text() -> String {
+        if (self.kind == SV_NULL)  { return "" }
+        if (self.kind == SV_INT)   { return toString(self.i) }
+        if (self.kind == SV_FLOAT) { return toString(self.f) }
+        if (self.kind == SV_TEXT)  { return self.s }
+        // BLOB：用十六进制表示，长度受限（避免一个 1MB 的 BLOB
+        // 把日志刷满）。完整内容仍在 self.b 里。
+        return "x'" + bbHex(self.b, 32) + "'"
+    }
+
+    fn typeName() -> String {
+        if (self.kind == SV_NULL)  { return "null" }
+        if (self.kind == SV_INT)   { return "integer" }
+        if (self.kind == SV_FLOAT) { return "real" }
+        if (self.kind == SV_TEXT)  { return "text" }
+        return "blob"
+    }
+}
+
+// 解一条记录。返回 [值数组, 消耗的总字节数]。
+//
+// 失败返回 [[], 0]。
+fn svReadRecord(b: Array, pos: Int) -> Array {
+    if (pos < 0 || pos >= len(b)) { return [[], 0] }
+
+    // ① header 总长
+    let hl = svReadInt(b, pos)
+    let hdrLen = toInt(hl[0])
+    let hdrLenBytes = toInt(hl[1])
+    if (hdrLenBytes == 0 || hdrLen < hdrLenBytes) { return [[], 0] }
+    if (pos + hdrLen > len(b)) { return [[], 0] }
+
+    // ② header 里的 serial type 序列（跳过第 1 个，它是总长）
+    //
+    // 逐个读，直到 header 读完 —— 不能预先知道列数，因为列数就是
+    // 「header 长度减去第一个 varint 自己」这段里能塞几个 varint。
+    // 这正是为什么 header 第 1 个字段是「含自己的总长」：它让解码
+    // 方知道何时停。
+    let serials = []
+    var p = pos + hdrLenBytes
+    let hdrEnd = pos + hdrLen
+    while (p < hdrEnd) {
+        let r = svReadInt(b, p)
+        let n = toInt(r[1])
+        if (n == 0) { break }
+        arrPush(serials, r[0])
+        p = p + n
+    }
+
+    // ③ 按 serial 切 body
+    let bodyPos = pos + hdrLen
+    let vals = []
+    var bp = bodyPos
+    var k = 0
+    while (k < len(serials)) {
+        let serial = toInt(serials[k])
+        let nb = svSerialBytes(serial)
+        let v = new SvValue()
+
+        if (svSerialKind(serial) == SV_NULL) {
+            // NULL，body 不占字节
+            v.kind = SV_NULL
+        } else if (svSerialKind(serial) == SV_INT) {
+            v.kind = SV_INT
+            // 8 / 9 是「值就是 0 / 1」的特例，body 里没有数据。
+            if (serial == 8) { v.i = 0 }
+            else if (serial == 9) { v.i = 1 }
+            else if (bp + nb <= len(b)) { v.i = svReadSignedBE(b, bp, nb) }
+            else { v.kind = SV_NULL }
+        } else if (svSerialKind(serial) == SV_FLOAT) {
+            v.kind = SV_FLOAT
+            if (bp + 8 <= len(b)) { v.f = svReadDoubleBE(b, bp) }
+            else { v.kind = SV_NULL }
+        } else if (svSerialKind(serial) == SV_TEXT) {
+            v.kind = SV_TEXT
+            if (bp + nb <= len(b)) { v.s = bbToText(bbSlice(b, bp, bp + nb)) }
+            else { v.kind = SV_NULL }
+        } else {
+            v.kind = SV_BLOB
+            if (bp + nb <= len(b)) { v.b = bbSlice(b, bp, bp + nb) }
+            else { v.kind = SV_NULL }
+        }
+
+        arrPush(vals, v)
+        bp = bp + nb
+        k = k + 1
+    }
+
+    return [vals, bp - pos]
+}
+
+// 读 nb 字节的大端**有符号**整数（1/2/3/4/6/8 字节）。
+//
+// ── 为什么必须做符号扩展 ──────────────────────────────
+//
+// 因为 SQLite 的 INTEGER 是 64 位有符号，而 1 字节的整数在文件里
+// 只占 1 个字节。如果按无符号读，`-1`（存储为 0xFF）会解成 255。
+//
+// 反过来的错误更常见：先把所有小整数按无符号读，然后测「负数怎么
+// 不对」—— 而性能测试、行数统计这些全是正数，所以这条 bug 很容易
+// 活很久。实测症状：0xFF 解出 255、0xFFFF 解出 65535、
+// 0x80000000 解出 2147483648，全是「正数但数值不对」。
+//
+// ── 掩码为什么写 `0 - (1 << bits)` 而不是 `(0-1) << bits` ─────
+//
+// 因为本语言的左移是**定义良好的、溢出即为 0**（01 §4.3，实现见
+// interp.c 的 BC_SHL_I64）：只要有效位被推出 64 位，结果就是 0，
+// 不回绕。所以 `(0-1) << 8` 不是 -256，而是 **0** —— 用它做掩码，
+// `v | 0` 保持原值，符号扩展**静默失效**，得到的就是上面那串正数。
+//
+// `0 - (1 << bits)` 绕过了这个约束：先算 `1 << bits`（在 bits ≤ 56
+// 时不会溢出），再做减法得到负的 2 的幂。两个 2 的幂相减是在
+// 有符号整数的正常范围里，不触发「移出即 0」。
+fn svReadSignedBE(b: Array, pos: Int, nb: Int) -> Int {
+    if (nb <= 0 || pos + nb > len(b)) { return 0 }
+    var v = 0
+    var i = 0
+    while (i < nb) {
+        v = v << 8
+        v = v | bbU8(b, pos + i)
+        i = i + 1
+    }
+    // 符号扩展：若最高位是 1，把上面空出来的高位全填 1。
+    //
+    // nb=8 时本来就是完整 int64，不需要扩展，而且 bits=64 会让
+    // `1 << 64` 走进「移位超出范围 → 0」的分支，掩码退化成 0。
+    if (nb < 8) {
+        let bits = nb * 8
+        let signBit = 1 << (bits - 1)
+        if ((v & signBit) != 0) {
+            // -2^bits，即「低 bits 位全 0、其余全 1」的掩码。
+            let mask = 0 - (1 << bits)
+            v = v | mask
+        }
+    }
+    return v
+}
+
+// 读 8 字节大端 IEEE 754 double。
+//
+// 语言没有「位模式 → 浮点」的转换内建，所以手算：
+//   符号 1 位、指数 11 位、尾数 52 位，值 = (-1)^s × 1.m × 2^(e-1023)
+//
+// ── 为什么不复用 BSON 那个 bsonReadDoubleLE ──────────────
+//
+// 因为那是**小端**（MongoDB 用 LE），SQLite 用**大端**。共用会把
+// 两处都搞错。而两端各写一份的好处是：字节序错误在各自的测试里
+// 立刻暴露，不会互相掩盖。
+fn svReadDoubleBE(b: Array, pos: Int) -> Float {
+    if (pos + 8 > len(b)) { return 0.0 }
+    let hi = bbU32BE(b, pos)
+    let lo = bbU32BE(b, pos + 4)
+
+    let sign = 0
+    if ((hi & 0x80000000) != 0) { sign = 1 }
+    let exp = (hi >> 20) & 0x7FF
+    let mHi = hi & 0xFFFFF
+
+    // 零（含 +/-0）：指数与尾数全 0。
+    if (exp == 0 && mHi == 0 && lo == 0) {
+        return 0.0
+    }
+
+    // 指数全 1：Inf / NaN。SQLite 不会存这两个（它的 REAL 是有限
+    // 的 IEEE 754 double），但坏文件可能有，返回 0 而不是崩。
+    if (exp == 0x7FF) { return 0.0 }
+
+    // 尾数拆成整数部分与小数部分。
+    //
+    // mHi 是高 20 位（对应 2^-1 .. 2^-20），lo 是低 32 位
+    // （2^-21 .. 2^-52）。
+    var mant = 1.0
+    var bitVal = 0.5
+    var i = 0
+    while (i < 20) {
+        let bit = (mHi >> (19 - i)) & 1
+        if (bit == 1) { mant = mant + bitVal }
+        bitVal = bitVal / 2.0
+        i = i + 1
+    }
+    i = 0
+    while (i < 32) {
+        let bit = (lo >> (31 - i)) & 1
+        if (bit == 1) { mant = mant + bitVal }
+        bitVal = bitVal / 2.0
+        i = i + 1
+    }
+
+    // 规格化（exp != 0 时尾数有隐含的 1.，上面已从 1.0 起算）。
+    if (exp == 0) {
+        // 非规格化数：没有隐含位。P0 遇到就返回近似的 0 —— 这类
+        // 值只在「极小到 1e-308」时出现，业务数据里不会遇到。
+        return 0.0
+    }
+
+    var result = mant * math(pow, 2.0, toFloat(exp - 1023))
+    if (sign == 1) { result = 0.0 - result }
+    return result
+}
+
+// 记录列数。
+fn svRecordColCount(b: Array, pos: Int) -> Int {
+    let r = svReadRecord(b, pos)
+    return len(r[0])
+}

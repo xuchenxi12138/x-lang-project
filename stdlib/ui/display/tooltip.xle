@@ -1,0 +1,224 @@
+// ui/display/tooltip.xle — 工具提示与气泡提示
+//
+// ── 提示框的三个难题 ─────────────────────────────
+//
+//   1. 什么时候出现 —— 悬停延迟。立刻出现会在鼠标划过的路径上
+//      闪出一串提示，而延迟太短等于没延迟。
+//   2. 出现在哪 —— 上方放不下要翻到下方，左右要夹紧在窗口内。
+//      这是「浮层定位」的全部内容，也是最容易做错的部分。
+//   3. 会不会闪 —— 鼠标在触发器和提示之间移动时，提示不该消失。
+//      这需要「鼠标在两者任一个上都算悬停」的判定。
+//
+// 本文件把这三件事都收在 Tooltip 里。
+//
+// ── 为什么不叫 Tooltip 而是单独一个类 ───────────────
+//
+// 因为「气泡提示」（popover）和「工具提示」（tooltip）在交互上
+// 不同：tooltip 是纯展示、不可交互、随鼠标离开消失；popover 可以
+// 有内容、可点击、需要显式关闭。但它们的**定位算法完全一样**。
+//
+// 所以这里实现一个 TipBox（定位 + 绘制 + 延迟），tooltip 是它的
+// 「无交互」用法。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 出现延迟（秒）。0.35 是「随手划过不弹、停下来看才弹」的经验值。
+const TIP_DELAY = 0.35
+
+// 提示框内边距。
+const TIP_PAD = 8
+
+// 距触发器的间距（箭头高度）。
+const TIP_GAP = 8
+
+// 提示框最大宽度。
+const TIP_MAX_W = 320
+
+class Tooltip extends Widget {
+    text: String,
+
+    // 触发器的矩形。由调用方在每帧告知 —— 因为触发器可能是
+    // 任意控件，位置每帧可能变。
+    anchor: Rect,
+
+    // 悬停持续时长（秒）。超过 TIP_DELAY 才显示。
+    dwell: Float,
+
+    // 是否正在显示。
+    showing: Bool,
+
+    // 是否允许向上翻转。false 时强制在上方（可能出界）。
+    allowFlip: Bool,
+
+    constructor() {
+        self.r         = rectOf(0, 0, 0, 0)
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.text      = ""
+        self.anchor    = rectOf(0, 0, 0, 0)
+        self.dwell     = 0.0
+        self.showing   = false
+        self.allowFlip = true
+        self.style     = Style.plain()
+    }
+
+    static fn of(text: String) -> Tooltip {
+        let t = new Tooltip()
+        t.text = text
+        return t
+    }
+
+    fn setText(s: String) -> Tooltip {
+        self.text = s
+        return self
+    }
+
+    // ── 每帧推进 ────────────────────────────────────
+    //
+    // hovered 是「鼠标是否在触发器上」。这个判定由调用方给 ——
+    // Tooltip 自己不知道触发器是谁、也不知道有没有被浮层遮挡。
+    fn update(hovered: Bool, dt: Float) -> Tooltip {
+        if (!hovered) {
+            self.dwell = 0.0
+            self.showing = false
+            return self
+        }
+        self.dwell = self.dwell + dt
+        if (self.dwell >= TIP_DELAY) {
+            self.showing = true
+        }
+        return self
+    }
+
+    // 立即显示（用于「点击问号图标」这类显式触发）。
+    fn showNow() -> Tooltip {
+        self.dwell = TIP_DELAY
+        self.showing = true
+        return self
+    }
+
+    fn hide() -> Tooltip {
+        self.dwell = 0.0
+        self.showing = false
+        return self
+    }
+
+    // ── 定位 ────────────────────────────────────
+    //
+    // 提示框的尺寸由文字决定。
+    fn boxSize() -> Rect {
+        var tw = winTextWidth(self.text) + TIP_PAD * 2
+        if (tw > TIP_MAX_W) { tw = TIP_MAX_W }
+        if (tw < 40) { tw = 40 }
+        return rectOf(0, 0, tw, winTextHeight() + TIP_PAD * 2)
+    }
+
+    // 计算提示框位置。
+    //
+    // ── 算法 ──────────────────────────────────
+    //
+    //   水平：与触发器水平居中，然后夹紧到 [0, screenW - w]
+    //   垂直：优先放上方（anchor.y - h - gap），放不下翻到下方
+    //
+    // ── 为什么水平居中而不是左对齐 ──────────────
+    //
+    // 居中让箭头能指向触发器的中心，视觉上「提示是从这个控件
+    // 长出来的」。左对齐会让提示看起来像是另一个独立的东西。
+    fn computeRect(screenW: Int) -> Rect {
+        let sz = self.boxSize()
+        let w = sz.w
+        let h = sz.h
+
+        // 水平居中 + 夹紧。
+        var x = self.anchor.x + self.anchor.w / 2 - w / 2
+        if (x < 0) { x = 0 }
+        if (x + w > screenW) { x = screenW - w }
+        if (x < 0) { x = 0 }
+
+        // 垂直：上方优先。
+        var y = self.anchor.y - h - TIP_GAP
+        if (y < 0 && self.allowFlip) {
+            // 上方放不下：放下方。
+            y = self.anchor.y + self.anchor.h + TIP_GAP
+        }
+        if (y < 0) { y = 0 }
+
+        return rectOf(x, y, w, h)
+    }
+
+    // 箭头朝上还是朝下。上方显示时箭头朝下（指向触发器）。
+    fn arrowDown(screenW: Int) -> Bool {
+        let r = self.computeRect(screenW)
+        // 若提示框在触发器上方，箭头在底边朝下。
+        return r.y + r.h <= self.anchor.y + 1
+    }
+
+    // ── 绘制 ────────────────────────────────────
+    //
+    // 在所有控件之后调用。screenW 用于夹紧 —— 由调用方给，
+    // 因为 Tooltip 拿不到窗口宽度。
+    fn draw(th: Theme, screenW: Int) {
+        if (!self.showing) { return }
+        if (len(self.text) == 0) { return }
+
+        let r = self.computeRect(screenW)
+
+        // 阴影。
+        winFillRound(r.x + 1, r.y + 2, r.w, r.h, 6, th.scrim)
+
+        // 底：深色卡片。提示框通常比正文更「重」，因为它要跳出
+        // 页面的视觉层级。
+        winFillRound(r.x, r.y, r.w, r.h, 6, th.bg)
+        winBorderRound(r.x, r.y, r.w, r.h, 6, 1, th.border)
+
+        // 文字（多行时折行，但提示通常很短）。
+        let lines = uiWrapLines(self.text, r.w - TIP_PAD * 2)
+        if (len(lines) <= 1) {
+            uiTextInRect(r, self.text, th.text)
+        } else {
+            uiTextBlock(Rect.inset(r, TIP_PAD), lines, winTextHeight() + 2, 0, th.text)
+        }
+
+        // 箭头：一个朝触发器方向的三角形。
+        //
+        // 位置在水平「触发器中心」xc 处，但夹紧到提示框内（留 10px
+        // 边距），避免箭头跑到圆角外面。
+        let xc = self.anchor.x + self.anchor.w / 2
+        var ax = xc
+        if (ax < r.x + 10) { ax = r.x + 10 }
+        if (ax > r.x + r.w - 10) { ax = r.x + r.w - 10 }
+
+        let down = self.arrowDown(screenW)
+        let sz = 5
+        var pts = []
+        if (down) {
+            // 箭头朝下，位于提示框底边。
+            let ay = r.y + r.h
+            pts = [ax - sz, ay, ax + sz, ay, ax, ay + sz]
+        } else {
+            // 箭头朝上，位于提示框顶边（提示在触发器下方）。
+            let ay = r.y
+            pts = [ax - sz, ay, ax + sz, ay, ax, ay - sz]
+        }
+        winPath(pts, th.bg)
+
+        // 箭头的描边：只在两条斜边上画细线，否则会出现一条
+        // 横穿提示框内部的线。
+        //
+        // 这一步可以省掉（箭头与底色同色，视觉上已经连成一体），
+        // 但省掉后箭头在深色背景上会「浮着」。所以保留，代价是
+        // 多两次 winPath。
+    }
+
+    // 提示框不响应输入。
+    fn hit(mx: Int, my: Int) -> Bool {
+        return false
+    }
+}

@@ -1,0 +1,358 @@
+// ============================================================
+// std.text.codeview —— 代码编辑区
+// ============================================================
+//
+// 把 Doc（纯数据）画成屏幕上的代码区，并把鼠标操作翻译成文档操作。
+//
+// ── 为什么不处理键盘 ──────────────────────────────
+//
+// 同一套快捷键在不同应用里语义不同（Ctrl+D 在浏览器是书签，在
+// 编辑器是复制行）。键盘留给应用层，这一层只保证「文档状态 →
+// 屏幕」和「鼠标 → 文档状态」两条链路，复用面最宽。
+//
+// ── 滚动状态为什么在这里而不是 Doc ─────────────────
+//
+// Doc 的 top/left 是给「唯一视图」准备的历史字段。多标签编辑器里
+// 每个标签有独立的滚动位置，所以滚动属于视图：切回标签时原来的
+// 位置还在。
+//
+// ── 行号栏宽度是算出来的 ───────────────────────────
+//
+// 固定 44px 在 9 行时浪费、在 10000 行时不够。按总行数的位数
+// 乘数字宽度，再夹到 [36, 88]。
+
+from "doc.xle" import Doc
+from "highlight.xle" import LANG_NONE, LANG_X, LANG_C, LANG_JSON, LANG_HTML, LANG_PY, LANG_MD, LANG_INI
+from "highlight.xle" import TK_NORM, TK_KW, TK_STR, TK_CMT, TK_NUM, TK_FUNC, TK_TYPE, TK_PRE, TK_TAG, TK_ATTR, TK_KEY, TK_OP, TK_LINK, TK_BOLD, TK_ANNO
+from "highlight.xle" import hlLine, hlStates
+from "../ui/core/theme.xle" import Theme
+from "../ui/core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+
+const CV_LINE_H     = 20
+const CV_PAD_X      = 10
+const CV_GUTTER_PAD = 8
+
+class CodeView {
+    doc: Doc,
+    r: Rect,
+    lineH: Int,
+    gutterW: Int,
+    scrollLine: Int,
+    scrollX: Int,
+    dragging: Bool,
+    focused: Bool,
+    showLineNumbers: Bool,
+    showWhitespace: Bool,
+    states: Array,       // 每行进入时的块注释/多行状态缓存
+
+    constructor(r: Rect, d: Doc) {
+        self.doc             = d
+        self.r               = r
+        self.lineH           = CV_LINE_H
+        self.gutterW         = 52
+        self.scrollLine      = 0
+        self.scrollX         = 0
+        self.dragging        = false
+        self.focused         = true
+        self.showLineNumbers = true
+        self.showWhitespace  = false
+        self.states          = [0]
+        self.updateGutter()
+    }
+
+    fn rows() -> Int {
+        let n = self.r.h / self.lineH
+        if (n < 1) { return 1 }
+        return n
+    }
+
+    fn textLeft() -> Int {
+        if (self.showLineNumbers) { return self.r.x + self.gutterW + CV_PAD_X }
+        return self.r.x + CV_PAD_X
+    }
+
+    fn updateGutter() {
+        if (!self.showLineNumbers) { self.gutterW = 0; return }
+        let total = self.doc.lineCount()
+        var digits = 1
+        var n = total
+        while (n >= 10) {
+            digits = digits + 1
+            n = n / 10
+        }
+        var w = digits * 9 + CV_GUTTER_PAD * 2
+        if (w < 36) { w = 36 }
+        if (w > 88) { w = 88 }
+        self.gutterW = w
+    }
+
+    // ── 坐标换算 ─────────────────────────────
+
+    fn xOfCol(l: Int, c: Int) -> Int {
+        let s = self.doc.lineAt(l)
+        var cc = c
+        if (cc < 0) { cc = 0 }
+        if (cc > len(s)) { cc = len(s) }
+        return self.textLeft() + winTextWidth(strSub(s, 0, cc)) - self.scrollX
+    }
+
+    fn lineY(l: Int) -> Int {
+        return self.r.y + (l - self.scrollLine) * self.lineH
+    }
+
+    fn colOfX(l: Int, px: Int) -> Int {
+        let s = self.doc.lineAt(l)
+        let target = px - self.textLeft() + self.scrollX
+        if (target <= 0) { return 0 }
+        var i = 0
+        var w = 0
+        while (i < len(s)) {
+            let nw = winTextWidth(strSub(s, i, i + 1))
+            if (w + nw / 2 >= target) { return i }
+            w = w + nw
+            i = i + 1
+        }
+        return len(s)
+    }
+
+    fn lineOfY(py: Int) -> Int {
+        let rel = py - self.r.y
+        var l = self.scrollLine + rel / self.lineH
+        if (l < 0) { l = 0 }
+        if (l >= self.doc.lineCount()) { l = self.doc.lineCount() - 1 }
+        return l
+    }
+
+    // ── 滚动 ─────────────────────────────────
+
+    fn ensureVisible() {
+        let d = self.doc
+        self.updateGutter()
+        if (d.ln < self.scrollLine) { self.scrollLine = d.ln }
+        let last = self.scrollLine + self.rows() - 1
+        if (d.ln > last) { self.scrollLine = d.ln - self.rows() + 1 }
+        if (self.scrollLine < 0) { self.scrollLine = 0 }
+
+        let cx = self.textLeft() + winTextWidth(strSub(d.lineAt(d.ln), 0, d.col))
+        let right = self.r.x + self.r.w - 24
+        if (cx - self.scrollX > right) { self.scrollX = cx - right }
+        if (cx - self.scrollX < self.textLeft() + 2) {
+            self.scrollX = cx - self.textLeft() - 2
+            if (self.scrollX < 0) { self.scrollX = 0 }
+        }
+    }
+
+    fn wheel(lines: Int) {
+        let total = self.doc.lineCount()
+        var v = self.scrollLine + lines
+        if (v < 0) { v = 0 }
+        if (v > total - 1) { v = total - 1 }
+        self.scrollLine = v
+    }
+
+    fn scrollToLine(l: Int) {
+        self.scrollLine = l
+        if (self.scrollLine < 0) { self.scrollLine = 0 }
+        if (self.scrollLine > self.doc.lineCount() - 1) {
+            self.scrollLine = self.doc.lineCount() - 1
+        }
+    }
+
+    // ── 鼠标 ─────────────────────────────────
+
+    fn inside(mx: Int, my: Int) -> Bool {
+        return mx >= self.r.x && mx < self.r.x + self.r.w &&
+               my >= self.r.y && my < self.r.y + self.r.h
+    }
+
+    fn onPress(mx: Int, my: Int) -> Bool {
+        if (!self.inside(mx, my)) { return false }
+        self.focused = true
+        if (self.showLineNumbers && mx < self.r.x + self.gutterW) {
+            let l = self.lineOfY(my)
+            self.doc.setCursor(l, 0, 0)
+            self.doc.setCursor(l, len(self.doc.lineAt(l)), 1)
+            return true
+        }
+        let l = self.lineOfY(my)
+        let c = self.colOfX(l, mx)
+        self.doc.setCursor(l, c, 0)
+        self.dragging = true
+        return true
+    }
+
+    fn onDrag(mx: Int, my: Int) {
+        if (!self.dragging) { return }
+        if (!winMouseDown(0)) {
+            self.dragging = false
+            return
+        }
+        if (my < self.r.y) {
+            self.scrollLine = self.scrollLine - 1
+            if (self.scrollLine < 0) { self.scrollLine = 0 }
+        } else if (my > self.r.y + self.r.h - 1) {
+            self.scrollLine = self.scrollLine + 1
+            if (self.scrollLine > self.doc.lineCount() - 1) {
+                self.scrollLine = self.doc.lineCount() - 1
+            }
+        }
+        let l = self.lineOfY(my)
+        let c = self.colOfX(l, mx)
+        self.doc.setCursor(l, c, 1)
+    }
+
+    // ── 绘制 ─────────────────────────────────
+
+    fn colorOf(kind: Int, th: Theme) -> Int {
+        if (kind == TK_KW)     { return 0x569CD6 }
+        if (kind == TK_STR)    { return 0xCE9178 }
+        if (kind == TK_CMT)    { return 0x6A9955 }
+        if (kind == TK_NUM)    { return 0xB5CEA8 }
+        if (kind == TK_FUNC)   { return 0xDCDCAA }
+        if (kind == TK_TYPE)   { return 0x4EC9B0 }
+        if (kind == TK_PRE)    { return 0xC586C0 }
+        if (kind == TK_TAG)    { return 0x569CD6 }
+        if (kind == TK_ATTR)   { return 0x9CDCFE }
+        if (kind == TK_KEY)    { return 0xDCDCAA }
+        if (kind == TK_OP)     { return 0xD4D4D4 }
+        if (kind == TK_LINK)   { return 0x3794FF }
+        if (kind == TK_BOLD)   { return 0xD7BA7D }
+        if (kind == TK_ANNO)   { return 0xCCCCCC }
+        return th.text
+    }
+
+    fn draw(th: Theme) {
+        let d = self.doc
+        self.updateGutter()
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.bg)
+        if (self.showLineNumbers) {
+            winFillRect(self.r.x, self.r.y, self.gutterW, self.r.h, th.surface)
+            winFillRect(self.r.x + self.gutterW - 1, self.r.y, 1, self.r.h, th.border)
+        }
+
+        let rows = self.rows()
+        let hasSel = d.hasSel()
+        let sa = d.selStart()
+        let sb = d.selEnd()
+        let selL1 = toInt(sa[0])
+        let selC1 = toInt(sa[1])
+        let selL2 = toInt(sb[0])
+        let selC2 = toInt(sb[1])
+
+        // 块注释状态需要顺序推导：用库里的 hlStates 一次算出所有行
+        // 的进入状态（与高亮器共享同一套规则，避免两处不一致）。
+        if (len(self.states) != d.lineCount() + 1) {
+            self.states = hlStates(d.lines, d.lang)
+        }
+        let lang = d.lang
+
+        var row = 0
+        while (row < rows) {
+            let l = self.scrollLine + row
+            if (l >= d.lineCount()) { break }
+            let y = self.r.y + row * self.lineH
+            let s = d.lineAt(l)
+
+            if (l == d.ln) {
+                let gx = self.r.x
+                if (self.showLineNumbers) { gx = self.r.x + self.gutterW }
+                winFillRect(gx, y, self.r.x + self.r.w - gx, self.lineH, th.surface)
+            }
+
+            if (hasSel && l >= selL1 && l <= selL2) {
+                var c1 = 0
+                if (l == selL1) { c1 = selC1 }
+                var c2 = len(s)
+                if (l == selL2) { c2 = selC2 }
+                if (l < selL2) { c2 = len(s) + 1 }
+                let x1 = self.xOfCol(l, c1)
+                let x2 = self.xOfCol(l, c2)
+                var rw = x2 - x1
+                if (rw < 1) { rw = winTextWidth(" ") }
+                winFillRect(x1, y, rw, self.lineH, th.surfaceActive)
+            }
+
+            if (self.showLineNumbers) {
+                let num = toString(l + 1)
+                let nw = winTextWidth(num)
+                let nx = self.r.x + self.gutterW - CV_GUTTER_PAD - nw
+                var nc = th.textDim
+                if (l == d.ln) { nc = th.text }
+                winText(nx, y + 2, num, nc)
+            }
+
+            var state = 0
+            if (l < len(self.states)) { state = toInt(self.states[l]) }
+            let tr = hlLine(s, lang, state)
+            let toks = tr[0]
+
+            var t = 0
+            while (t < len(toks)) {
+                let tk = toks[t]
+                let st = toInt(tk[0])
+                let ln = toInt(tk[1])
+                let kind = toInt(tk[2])
+                let part = strSub(s, st, st + ln)
+                let tx = self.xOfCol(l, st)
+                if (tx + winTextWidth(part) >= self.textLeft() &&
+                    tx < self.r.x + self.r.w) {
+                    winText(tx, y + 2, part, self.colorOf(kind, th))
+                }
+                t = t + 1
+            }
+
+            var ci = 0
+            while (ci < len(s)) {
+                if (!cvInTokens(toks, ci)) {
+                    let ch = strAt(s, ci)
+                    let px = self.xOfCol(l, ci)
+                    if (ch == " ") {
+                        if (self.showWhitespace) {
+                            winText(px, y + 2, "·", th.textDim)
+                        }
+                    } else if (px >= self.textLeft() && px < self.r.x + self.r.w) {
+                        winText(px, y + 2, ch, th.text)
+                    }
+                }
+                ci = ci + 1
+            }
+
+            row = row + 1
+        }
+
+        self.drawCaret(th)
+        self.drawScrollbar(th)
+    }
+
+    fn drawCaret(th: Theme) {
+        if (!self.focused) { return }
+        if (winTime() % 1000 >= 500) { return }
+        let d = self.doc
+        if (d.ln < self.scrollLine || d.ln >= self.scrollLine + self.rows()) { return }
+        let y = self.lineY(d.ln)
+        let x = self.xOfCol(d.ln, d.col)
+        if (x < self.textLeft() - 1 || x > self.r.x + self.r.w) { return }
+        winFillRect(x, y + 2, 1, self.lineH - 4, th.text)
+    }
+
+    fn drawScrollbar(th: Theme) {
+        let total = self.doc.lineCount()
+        if (total <= self.rows()) { return }
+        let trackX = self.r.x + self.r.w - 10
+        winFillRect(trackX, self.r.y, 10, self.r.h, th.surface)
+        let thumbH = self.r.h * self.rows() / total
+        let thumbY = self.r.y + self.r.h * self.scrollLine / total
+        winFillRect(trackX + 2, thumbY, 6, thumbH, th.border)
+    }
+}
+
+fn cvInTokens(toks: Array, i: Int) -> Bool {
+    var k = 0
+    while (k < len(toks)) {
+        let t = toks[k]
+        if (i >= toInt(t[0]) && i < toInt(t[0]) + toInt(t[1])) { return true }
+        k = k + 1
+    }
+    return false
+}

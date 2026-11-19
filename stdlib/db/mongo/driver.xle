@@ -1,0 +1,803 @@
+// db/mongo/driver.xle — MongoDB 数据源
+//
+// ── MongoDB 和关系库的接口映射 ─────────────────────
+//
+// MongoDB 没有 SQL、没有表、没有列。所以 DataSource 的五个方法这样
+// 映射：
+//
+//   query(cmd)   cmd 是「集合.方法 参数...」的简写，见下
+//   execute()    同 query（MongoDB 不区分读写，找不到文档也是成功）
+//
+// 简写语法（由本驱动自己解析，不是 MongoDB 的语法）：
+//
+//   find <集合> <查询JSON>          → {"find": 集合, "filter": ...}
+//   insert <集合> <文档JSON>        → {"insert": 集合, "documents": [...]}
+//   update <集合> <查询> <更新JSON>  → {"update": ...}
+//   delete <集合> <查询>            → {"delete": ...}
+//   count <集合>                    → {"count": 集合}
+//   drop <集合>                     → {"drop": 集合}
+//   <其他> ...                      → 原样作为命令名
+//
+// ── 为什么不直接用 JSON 字符串 ────────────────────
+//
+// 因为 std.json 的解析结果是「键值数组」而不是 BSON 值类型，每次
+// 都要转换。而这个驱动需要 BSON（二进制），所以提供两条路：
+//
+//   * 简写命令（上面那套）—— 覆盖 90% 的场景，写起来短
+//   * rawCommand(文档字段) —— 直接用 bson 构造函数，完全控制
+//
+// ── P0 边界 ────────────────────────────────────
+//
+// 认证只支持 SCRAM-SHA-1 和 SCRAM-SHA-256 的**明文**路径（即
+// authMechanism 未启用时的 SASL 流程），且需要先实现 MongoDB 专用的
+// 认证命令。大多数本地开发库不开认证，所以先支持无认证连接，
+// 有认证时明确报错。这是诚实的边界，不是假装支持。
+
+from "../core/datasource.xle" import sqlBind, execAll, DataSource
+from "../core/result.xle" import ResultSet
+from "../core/endpoint.xle" import endpointOf, endpointWithTimeout, endpointString, Endpoint, PORT_MYSQL, PORT_POSTGRES, PORT_ORACLE, PORT_REDIS, PORT_MONGO, PORT_ES
+from "../core/socket.xle" import sockProbe, sockProbeRetry, Conn, SOCK_READ_CAP, SOCK_COMPACT_AT, SOCK_POLL_MS, SOCK_DEFAULT_WAIT_MS
+from "../core/dialect.xle" import dialectOf, dialectName, dialectQuoteIdent, dialectLimit, dialectNow, dialectConcat, dialectAutoIncrement, dialectBool, sqlEscape, sqlLiteral, Dialect, DB_MYSQL, DB_POSTGRES, DB_ORACLE, DB_SQLITE, DB_MONGO, DB_REDIS, DB_ES
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "bson.xle" import bsonStr, bsonInt, bsonLong, bsonDouble, bsonBool, bsonNull, bsonDoc, bsonArr, bsonOid, bsonBin, bsonWriteDoc, bsonWriteElem, bbPutDoubleLE, hexToBytes12, hexVal, bsonReadDoc, bsonReadValue, bsonReadDoubleLE, bsonReadCStr, bsonGet, bsonGetText, bsonGetInt, bsonToJson, bsonValueText, bsonDocText, BSON_DOUBLE, BSON_STRING, BSON_DOCUMENT, BSON_ARRAY, BSON_BINARY, BSON_UNDEFINED, BSON_OBJECTID, BSON_BOOL, BSON_DATETIME, BSON_NULL, BSON_REGEX, BSON_DBPOINTER, BSON_JSCODE, BSON_SYMBOL, BSON_JSCODEWS, BSON_INT32, BSON_TIMESTAMP, BSON_INT64, BSON_DECIMAL128, BSON_MINKEY, BSON_MAXKEY
+from "wire.xle" import mongoReqId, mongoReadMsg, mongoBuildMsg, mongoBuildQuery, mongoParseMsgBody, mongoParseReplyBody, mongoReplyOk, mongoReplyError, mongoBool, MONGO_OP_REPLY, MONGO_OP_QUERY, MONGO_OP_MSG
+
+class MongoDataSource extends DataSource {
+    user: String,
+    password: String,
+    dbName: String,
+
+    conn: Conn,
+
+    // 握手得到的信息（maxWireVersion、是否支持 OP_MSG 等）。
+    hello: Array,
+
+    constructor(ep: Endpoint, user: String, password: String, dbName: String) {
+        self.ep        = ep
+        self.user      = user
+        self.password  = password
+        self.dbName    = dbName
+        self.dialect   = dialectOf(DB_MONGO)
+        self.connected = false
+        self.lastError = ""
+        self.conn      = new Conn(0 - 1, ep.host, ep.port)
+        self.hello     = []
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    // mongodb://[user:pwd@]host[:port]/dbname
+    //
+    // 签名与其它驱动对齐（见 postgres/driver.xle 里 ofUrl 的说明）。
+    static fn ofUrl(url: String, user: String, password: String) -> MongoDataSource {
+        let u = mongoParseUrl(url)
+        var usr = toString(u[3])
+        var pwd = toString(u[4])
+        if (len(usr) == 0) { usr = user }
+        if (len(pwd) == 0) { pwd = password }
+        return new MongoDataSource(endpointOf(toString(u[1]), toInt(u[2])),
+                                   usr, pwd, toString(u[5]))
+    }
+
+    // ── 连接 ────────────────────────────────────
+
+    fn connect() -> Bool {
+        self.lastError = ""
+        let c = Conn.dial(self.ep)
+        if (!c.isOpen()) {
+            self.lastError = "连接 " + endpointString(self.ep) + " 失败：" + c.lastError
+            return false
+        }
+        self.conn = c
+
+        // ① 握手：OP_QUERY 发 isMaster 到 admin.$cmd
+        //
+        // ── 为什么第一条命令必须是 isMaster ───────────
+        //
+        // 因为此时不知道服务端版本，无法确定该用 OP_MSG 还是老格式。
+        // isMaster 是唯一「任何版本都认」的命令。
+        //
+        // ── 为什么这里不能带 $db ────────────────────
+        //
+        // OP_QUERY 是老格式，它用**命名空间**（"admin.$cmd"）表示目标
+        // 库，而不是命令文档里的 $db 字段。带上 $db 会被服务端拒绝：
+        //
+        //   isMaster 失败：$db is not allowed in OP_QUERY requests
+        //
+        // 只有 OP_MSG（新版）才需要 $db。这是两代格式的一处关键差异。
+        let q = bsonWriteDoc(["isMaster", bsonInt(1)])
+        let msg = mongoBuildQuery("admin.$cmd", q)
+        if (c.sendBytes(msg) < 0) {
+            self.lastError = "发送 isMaster 失败"
+            c.close()
+            return false
+        }
+
+        let r = mongoReadMsg(c)
+        if (!mongoBool(r, 0)) {
+            self.lastError = "读取 isMaster 回复失败：" + toString(r[4])
+            c.close()
+            return false
+        }
+        let op = toInt(r[1])
+        let payload = r[3]
+        var hello = []
+        if (op == MONGO_OP_REPLY) {
+            hello = mongoParseReplyBody(payload)
+        } else {
+            hello = mongoParseMsgBody(payload)
+        }
+        if (!mongoReplyOk(hello)) {
+            self.lastError = "isMaster 失败：" + mongoReplyError(hello)
+            c.close()
+            return false
+        }
+        self.hello = hello
+
+        // ② 认证（如果给了账号）
+        //
+        // ── 为什么这里明确拒绝而不是尝试 ──────────────
+        //
+        // MongoDB 的 SCRAM 流程和 PG 的 SCRAM 协议层完全不同（它是
+        // 在命令消息里交换 payload 字符串），需要单独的 saslStart /
+        // saslContinue 实现与 MongoDB 的即用即弃密钥派生。P0 先支持
+        // 无认证连接（本地开发库默认不开认证），有认证时给出明确
+        // 提示而不是让用户面对一个「连接超时」。
+        if (len(self.user) > 0) {
+            self.lastError = "MongoDB 认证（SCRAM-SHA-1 / SCRAM-SHA-256）在 P0 未实现。\n"
+                           + "  help: 本地开发库默认不启用认证，去掉用户名/密码即可连接；\n"
+                           + "        生产环境请用 mongosh 或官方驱动访问受保护的实例。"
+            c.close()
+            return false
+        }
+
+        self.connected = true
+        return true
+    }
+
+    fn close() {
+        if (self.conn != null && self.conn.isOpen()) {
+            self.conn.close()
+        }
+        self.connected = false
+    }
+
+    fn ping() -> Bool {
+        if (!self.connected || self.conn == null) { return false }
+        if (!self.conn.isOpen()) {
+            self.connected = false
+            return false
+        }
+        let rs = self.runCommand("ping", ["ping", bsonInt(1),
+                                          "$db", bsonStr(self.dbName)])
+        return rs.ok
+    }
+
+    // ── 命令执行 ────────────────────────────────
+
+    // 发一条命令，返回 ResultSet。
+    //
+    // ── 参数契约：fields 是**字段交替数组**，不是已编码的字节 ────
+    //
+    // 即 `["ping", bsonInt(1), "$db", bsonStr("db")]`。编码成 BSON
+    // 字节的工作在这里做。
+    //
+    // ── 为什么这个契约必须写清楚 ──────────────────────
+    //
+    // 曾经这里两处调用传了不同的东西：`connect()` 传的是
+    // bsonWriteDoc() 的输出（已编码字节），而 dispatch/insertOne
+    // 传的是字段数组。两者都是 Array，编译器无法区分，于是已编码
+    // 的字节被当成「字段名 = 0x2a、值 = 0x00…」重新编码 —— 服务端
+    // 收到畸形 BSON，回的错误是：
+    //
+    //   BSON data has to be at least 5 bytes in element with field
+    //   name '?' in object with unknown _id
+    //
+    // 那个错误指向服务端解析失败，与真正出错的客户端代码相距极远。
+    // 统一契约后只有一个入口，不会再分叉。
+    fn runCommand(name: String, fields: Array) -> ResultSet {
+        if (!self.connected || self.conn == null) {
+            if (!self.connect()) { return ResultSet.fail("未连接：" + self.lastError) }
+        }
+        let t0 = monoMillis()
+
+        let doc = bsonWriteDoc(fields)
+        if (self.conn.sendBytes(mongoBuildMsg(doc)) < 0) {
+            self.lastError = "发送命令失败：" + self.conn.lastError
+            self.connected = false
+            return ResultSet.fail(self.lastError)
+        }
+
+        let r = mongoReadMsg(self.conn)
+        if (!mongoBool(r, 0)) {
+            self.lastError = "读取回复失败：" + toString(r[4])
+            self.connected = false
+            return ResultSet.fail(self.lastError)
+        }
+
+        let op = toInt(r[1])
+        let payload = r[3]
+        var fields = []
+        if (op == MONGO_OP_MSG) {
+            fields = mongoParseMsgBody(payload)
+        } else if (op == MONGO_OP_REPLY) {
+            fields = mongoParseReplyBody(payload)
+        } else {
+            self.lastError = "不支持的回复操作码 " + toString(op)
+            return ResultSet.fail(self.lastError)
+        }
+
+        let elapsed = monoMillis() - t0
+        if (!mongoReplyOk(fields)) {
+            self.lastError = name + " 失败：" + mongoReplyError(fields)
+            let rs = ResultSet.fail(self.lastError)
+            rs.elapsedMs = elapsed
+            return rs
+        }
+
+        let rs = mongoToResultSet(fields)
+        rs.elapsedMs = elapsed
+        rs.raw = name
+        return rs
+    }
+
+    // 简写命令解析 + 执行。
+    //
+    // 语法见文件头。无法识别时按「整条当命令名」处理。
+    fn query(sql: String) -> ResultSet {
+        return self.dispatch(sql)
+    }
+
+    fn execute(sql: String) -> ResultSet {
+        return self.dispatch(sql)
+    }
+
+    fn dispatch(sql: String) -> ResultSet {
+        let parts = mongoSplit(sql)
+        if (len(parts) == 0) {
+            return ResultSet.fail("空命令")
+        }
+        let verb = strLower(toString(parts[0]))
+
+        if (verb == "find") {
+            let coll = mongoArg(parts, 1)
+            var filter: Array = []
+            if (len(parts) > 2) {
+                filter = mongoJsonToBson(toString(parts[2]))
+            }
+            let doc = []
+            arrPush(doc, "find")
+            arrPush(doc, bsonStr(coll))
+            if (len(filter) > 0) {
+                arrPush(doc, "filter")
+                arrPush(doc, bsonDoc(filter))
+            }
+            arrPush(doc, "$db")
+            arrPush(doc, bsonStr(self.dbName))
+            return self.runCommand("find " + coll, doc)
+        }
+
+        if (verb == "count") {
+            let coll = mongoArg(parts, 1)
+            let doc = []
+            arrPush(doc, "count")
+            arrPush(doc, bsonStr(coll))
+            arrPush(doc, "$db")
+            arrPush(doc, bsonStr(self.dbName))
+            return self.runCommand("count " + coll, doc)
+        }
+
+        if (verb == "drop") {
+            let coll = mongoArg(parts, 1)
+            let doc = []
+            arrPush(doc, "drop")
+            arrPush(doc, bsonStr(coll))
+            arrPush(doc, "$db")
+            arrPush(doc, bsonStr(self.dbName))
+            return self.runCommand("drop " + coll, doc)
+        }
+
+        if (verb == "insert") {
+            let coll = mongoArg(parts, 1)
+            let doc = []
+            arrPush(doc, "insert")
+            arrPush(doc, bsonStr(coll))
+            arrPush(doc, "documents")
+            if (len(parts) > 2) {
+                arrPush(doc, bsonArr([bsonDoc(mongoJsonToBson(toString(parts[2])))]))
+            } else {
+                arrPush(doc, bsonArr([]))
+            }
+            arrPush(doc, "$db")
+            arrPush(doc, bsonStr(self.dbName))
+            return self.runCommand("insert " + coll, doc)
+        }
+
+        if (verb == "delete") {
+            let coll = mongoArg(parts, 1)
+            let doc = []
+            arrPush(doc, "delete")
+            arrPush(doc, bsonStr(coll))
+            arrPush(doc, "deletes")
+            let one = []
+            arrPush(one, "q")
+            if (len(parts) > 2) {
+                arrPush(one, bsonDoc(mongoJsonToBson(toString(parts[2]))))
+            } else {
+                arrPush(one, bsonDoc([]))
+            }
+            arrPush(one, "limit")
+            arrPush(one, bsonInt(0))
+            arrPush(doc, bsonArr([bsonDoc(one)]))
+            arrPush(doc, "$db")
+            arrPush(doc, bsonStr(self.dbName))
+            return self.runCommand("delete " + coll, doc)
+        }
+
+        // 未识别的动词：整条当命令名，只带 $db
+        let doc2 = []
+        arrPush(doc2, toString(parts[0]))
+        arrPush(doc2, bsonInt(1))
+        arrPush(doc2, "$db")
+        arrPush(doc2, bsonStr(self.dbName))
+        return self.runCommand(toString(parts[0]), doc2)
+    }
+
+    // ── 便捷方法 ────────────────────────────────
+
+    // 直接插入一个文档（字段交替数组）。
+    fn insertOne(coll: String, fields: Array) -> ResultSet {
+        let doc = []
+        arrPush(doc, "insert")
+        arrPush(doc, bsonStr(coll))
+        arrPush(doc, "documents")
+        arrPush(doc, bsonArr([bsonDoc(fields)]))
+        arrPush(doc, "$db")
+        arrPush(doc, bsonStr(self.dbName))
+        return self.runCommand("insert " + coll, doc)
+    }
+
+    // 查询文档。
+    fn find(coll: String, filter: Array) -> ResultSet {
+        let doc = []
+        arrPush(doc, "find")
+        arrPush(doc, bsonStr(coll))
+        if (len(filter) > 0) {
+            arrPush(doc, "filter")
+            arrPush(doc, bsonDoc(filter))
+        }
+        arrPush(doc, "$db")
+        arrPush(doc, bsonStr(self.dbName))
+        return self.runCommand("find " + coll, doc)
+    }
+
+    // 集合列表。
+    fn listCollections() -> ResultSet {
+        let doc = []
+        arrPush(doc, "listCollections")
+        arrPush(doc, bsonInt(1))
+        arrPush(doc, "$db")
+        arrPush(doc, bsonStr(self.dbName))
+        return self.runCommand("listCollections", doc)
+    }
+
+    // ── 诊断 ────────────────────────────────────
+
+    fn serverVersion() -> String {
+        return bsonGetText(self.hello, "version")
+    }
+
+    fn maxWireVersion() -> Int {
+        return bsonGetInt(self.hello, "maxWireVersion")
+    }
+
+    fn describe() -> String {
+        var state = "未连接"
+        if (self.connected) { state = "已连接" }
+        var s = "MongoDB @" + endpointString(self.ep) + " db=" + self.dbName
+        if (len(self.user) > 0) { s = s + " user=" + self.user }
+        s = s + " [" + state + "]"
+        let v = self.serverVersion()
+        if (len(v) > 0) { s = s + " " + v }
+        return s
+    }
+}
+
+// ── 结果转换 ──────────────────────────────────────
+//
+// MongoDB 的回复是一个文档，里面可能有：
+//   cursor.firstBatch  → find 的结果（数组）
+//   n                  → 受影响文档数
+//   nInserted/nUpdated/nDeleted
+//   ok
+//
+// ── 为什么转成「行 × 列」而不是保留文档 ─────────────
+//
+// 因为 DataSource 的统一契约是 ResultSet。文档的字段名作为列名，
+// 每个文档一行。缺失的字段填 NULL —— 这需要先扫一遍所有文档收集
+// 全部字段名，否则列会错位。
+fn mongoToResultSet(fields: Array) -> ResultSet {
+    // ① 找 cursor.firstBatch
+    let batch = mongoFindBatch(fields)
+
+    if (len(batch) == 0) {
+        // 没有游标：写命令或计数命令的回复。
+        //
+        // ── 为什么要把 n 也作为一行返回 ──────────────────
+        //
+        // 因为 `count` 命令的回复是 {"n": 3, "ok": 1}，调用方用
+        // rs.scalar() 取值时必须能取到 3。如果只设 affected 而不
+        // 建行，scalar() 会返回空串 —— 实测症状是「count 得到空值」。
+        //
+        // 而 DELETE/UPDATE 的 n 是受影响行数，两者都用 affected 表达
+        // 更自然。所以两处都给：affected 用于写入语义，行用于查询语义。
+        let n = bsonGetInt(fields, "n")
+        let ni = bsonGetInt(fields, "nInserted")
+        let nd = bsonGetInt(fields, "nDeleted")
+        let nu = bsonGetInt(fields, "nUpdated")
+        let nups = bsonGetInt(fields, "nUpserted")
+        let total = n + ni + nd + nu + nups
+
+        if (total > 0) {
+            let rs = ResultSet.make(["n"], [[toString(n)]])
+            rs.affected = total
+            rs.raw = bsonDocText(fields)
+            return rs
+        }
+
+        let rs = ResultSet.empty()
+        rs.raw = bsonDocText(fields)
+        return rs
+    }
+
+    // ② 收集全部字段名（按首次出现顺序，保证列稳定）
+    let colNames = []
+    var i = 0
+    while i < len(batch) {
+        let d = mongoBatchDoc(batch, i)
+        var k = 0
+        while k + 1 < len(d) {
+            let name = toString(d[k])
+            if (!mongoHasString(colNames, name)) {
+                arrPush(colNames, name)
+            }
+            k = k + 2
+        }
+        i = i + 1
+    }
+
+    // ③ 逐文档取值，缺失填 "" + null 标记
+    let rows = []
+    let nulls = []
+    i = 0
+    while i < len(batch) {
+        let d = mongoBatchDoc(batch, i)
+        let row = []
+        let nf = []
+        var c = 0
+        while c < len(colNames) {
+            let cn = toString(colNames[c])
+            let v = bsonGet(d, cn)
+            if (len(v) < 2) {
+                arrPush(row, "")
+                arrPush(nf, true)
+            } else {
+                // ── 列值必须是裸值，不是 JSON 表示 ────────────
+                //
+                // bsonValueText 是给「打印整个文档」用的，它给字符串
+                // 加引号、给 ObjectId 加 ObjectId("...") 包装。作为
+                // 列值这些包装都是污染：
+                //   · 引号让 `WHERE name = '张三'` 式的比较全部失效
+                //   · ObjectId(...) 让调用方无法直接当 24 位十六进制用
+                // 所以这里按类型直接取值。
+                let tag = toInt(v[0])
+                if (tag == BSON_STRING) {
+                    arrPush(row, toString(v[1]))
+                } else if (tag == BSON_DOCUMENT || tag == BSON_ARRAY) {
+                    arrPush(row, bsonToJson(v[1], tag))
+                } else if (tag == BSON_BINARY) {
+                    arrPush(row, "<binary " + toString(len(v[1])) + "B>")
+                } else {
+                    arrPush(row, toString(v[1]))
+                }
+                arrPush(nf, false)
+            }
+            c = c + 1
+        }
+        arrPush(rows, row)
+        arrPush(nulls, nf)
+        i = i + 1
+    }
+
+    let rs = ResultSet.make(colNames, rows)
+    rs.nulls = nulls
+    // 带 _id 的集合把 _id 也作为一列（已在 colNames 里）
+    return rs
+}
+
+// 从回复文档里取 cursor.firstBatch 的数组内容。
+fn mongoFindBatch(fields: Array) -> Array {
+    let cv = bsonGet(fields, "cursor")
+    if (len(cv) < 2) { return [] }
+    if (toInt(cv[0]) != BSON_DOCUMENT) { return [] }
+    let cursorDoc = cv[1]
+    let bv = bsonGet(cursorDoc, "firstBatch")
+    if (len(bv) < 2) { return [] }
+    if (toInt(bv[0]) != BSON_ARRAY) { return [] }
+    return bv[1]
+}
+
+// 取第 i 个文档的字段（batch 里每项都是 [BSON_DOCUMENT, 字段数组]）。
+fn mongoBatchDoc(batch: Array, i: Int) -> Array {
+    if (i < 0 || i >= len(batch)) { return [] }
+    let v = batch[i]
+    if (len(v) < 2) { return [] }
+    if (toInt(v[0]) != BSON_DOCUMENT) { return [] }
+    return v[1]
+}
+
+fn mongoHasString(arr: Array, s: String) -> Bool {
+    var i = 0
+    while i < len(arr) {
+        if (toString(arr[i]) == s) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── 极简 JSON → BSON ─────────────────────────────
+//
+// ── 为什么不用 std.json ──────────────────────────
+//
+// 因为 std.json 的解析结果是一个通用的「键值数组」，值的类型是
+// 语言原生类型（String/Int/Float/Bool/Array）。而这里需要知道
+// 「这个数字该编成 int32 还是 double」「这个空是 null 还是空串」。
+// 自己扫一遍能精确控制。
+//
+// 支持的语法（够用于查询过滤器）：
+//   {"a": 1, "b": "x", "c": true, "d": null, "e": [1,2], "f": {"g":1}}
+//
+// 不支持：不以引号包围的键、单引号、注释、转义序列（\u 等）。
+// 这些在「手写测试数据」里都很少出现，而需要时可以用 bson 构造函数。
+fn mongoJsonToBson(s: String) -> Array {
+    let parts = mongoJsonParse(s)
+    return parts
+}
+
+fn mongoJsonParse(s: String) -> Array {
+    let t = strTrim(s)
+    if (len(t) == 0) { return [] }
+    if (strStarts(t, "{")) {
+        return mongoJsonParseObj(t)
+    }
+    return []
+}
+
+fn mongoJsonParseObj(s: String) -> Array {
+    let fields = []
+    var i = 1     // 跳过 '{'
+    let n = len(s)
+    while i < n {
+        // 跳空白
+        while i < n && mongoIsSpace(strSub(s, i, i + 1)) { i = i + 1 }
+        if (i >= n) { break }
+        if (strSub(s, i, i + 1) == "}") { break }
+        if (strSub(s, i, i + 1) == ",") { i = i + 1; continue }
+
+        // 键：必须由引号或裸字符到冒号
+        var key = ""
+        if (strSub(s, i, i + 1) == "\"") {
+            i = i + 1
+            while i < n && strSub(s, i, i + 1) != "\"" {
+                key = key + strSub(s, i, i + 1)
+                i = i + 1
+            }
+            i = i + 1     // 跳过收尾引号
+        } else {
+            while i < n && strSub(s, i, i + 1) != ":" {
+                key = key + strSub(s, i, i + 1)
+                i = i + 1
+            }
+            key = strTrim(key)
+        }
+        // 跳到冒号后
+        while i < n && strSub(s, i, i + 1) != ":" { i = i + 1 }
+        if (i < n) { i = i + 1 }
+        while i < n && mongoIsSpace(strSub(s, i, i + 1)) { i = i + 1 }
+
+        // 值
+        let vr = mongoJsonParseValue(s, i)
+        arrPush(fields, key)
+        arrPush(fields, vr[0])
+        i = toInt(vr[1])
+    }
+    return fields
+}
+
+// 解析一个值，返回 [bson 值, 新位置]。
+fn mongoJsonParseValue(s: String, pos: Int) -> Array {
+    let n = len(s)
+    var i = pos
+    if (i >= n) { return [bsonNull(), i] }
+    let ch = strSub(s, i, i + 1)
+
+    // 字符串
+    if (ch == "\"") {
+        i = i + 1
+        var out = ""
+        while i < n && strSub(s, i, i + 1) != "\"" {
+            out = out + strSub(s, i, i + 1)
+            i = i + 1
+        }
+        return [bsonStr(out), i + 1]
+    }
+
+    // 对象
+    if (ch == "{") {
+        // 找到配对的右括号（简单计数，不支持嵌套字符串里的括号）
+        var depth = 0
+        var j = i
+        while j < n {
+            let c = strSub(s, j, j + 1)
+            if (c == "{") { depth = depth + 1 }
+            if (c == "}") {
+                depth = depth - 1
+                if (depth == 0) { break }
+            }
+            j = j + 1
+        }
+        let sub = strSub(s, i, j + 1)
+        return [bsonDoc(mongoJsonParseObj(sub)), j + 1]
+    }
+
+    // 数组
+    if (ch == "[") {
+        var depth = 0
+        var j = i
+        var inStr = false
+        while j < n {
+            let c = strSub(s, j, j + 1)
+            if (c == "\"") { inStr = !inStr }
+            if (!inStr) {
+                if (c == "[") { depth = depth + 1 }
+                if (c == "]") {
+                    depth = depth - 1
+                    if (depth == 0) { break }
+                }
+            }
+            j = j + 1
+        }
+        let inner = strSub(s, i + 1, j)
+        let items = []
+        // 按逗号切（简化：不处理嵌套数组）
+        var cur = ""
+        var k = 0
+        var d2 = 0
+        while k < len(inner) {
+            let c = strSub(inner, k, k + 1)
+            if (c == "{" || c == "[") { d2 = d2 + 1 }
+            if (c == "}" || c == "]") { d2 = d2 - 1 }
+            if (c == "," && d2 == 0) {
+                arrPush(items, mongoJsonParseValue(strTrim(cur), 0)[0])
+                cur = ""
+            } else {
+                cur = cur + c
+            }
+            k = k + 1
+        }
+        if (len(strTrim(cur)) > 0) {
+            arrPush(items, mongoJsonParseValue(strTrim(cur), 0)[0])
+        }
+        return [bsonArr(items), j + 1]
+    }
+
+    // 字面量 / 数字
+    var tok = ""
+    while i < n {
+        let c = strSub(s, i, i + 1)
+        if (c == "," || c == "}" || c == "]" || mongoIsSpace(c)) { break }
+        tok = tok + c
+        i = i + 1
+    }
+    if (tok == "true")  { return [bsonBool(true), i] }
+    if (tok == "false") { return [bsonBool(false), i] }
+    if (tok == "null")  { return [bsonNull(), i] }
+    // 数字：有小数点就是 double，否则 int32（超范围用 int64）
+    if (strFind(tok, ".") >= 0) {
+        return [bsonDouble(strParseFloat(tok)), i]
+    }
+    let iv = strParseInt(tok)
+    if (iv > 2147483647 || iv < 0 - 2147483648) {
+        return [bsonLong(iv), i]
+    }
+    return [bsonInt(iv), i]
+}
+
+fn mongoIsSpace(c: String) -> Bool {
+    return c == " " || c == "\t" || c == "\r" || c == "\n"
+}
+
+// ── 命令拆分（保留引号内的空格）──────────────────────
+//
+// ── 为什么不用 redisSplit 那种简版 ─────────────────
+//
+// 因为 MongoDB 的命令参数是 JSON，里面必然有空格（`{"a": 1}`）。
+// 按空白切会把一个 JSON 切成碎片。所以这里按「引号和括号深度」
+// 跟踪，只在顶层空白处分段。
+fn mongoSplit(s: String) -> Array {
+    let out = []
+    var cur = ""
+    var i = 0
+    let n = len(s)
+    var depth = 0
+    var inStr = false
+    while i < n {
+        let c = strSub(s, i, i + 1)
+        if (c == "\"") { inStr = !inStr }
+        if (!inStr) {
+            if (c == "{" || c == "[") { depth = depth + 1 }
+            if (c == "}" || c == "]") { depth = depth - 1 }
+            if ((c == " " || c == "\t") && depth == 0) {
+                if (len(cur) > 0) {
+                    arrPush(out, cur)
+                    cur = ""
+                }
+                i = i + 1
+                continue
+            }
+        }
+        cur = cur + c
+        i = i + 1
+    }
+    if (len(cur) > 0) { arrPush(out, cur) }
+    return out
+}
+
+fn mongoArg(parts: Array, i: Int) -> String {
+    if (i < 0 || i >= len(parts)) { return "" }
+    return toString(parts[i])
+}
+
+// ── URL 解析 ──────────────────────────────────────
+//
+// 返回 [scheme, host, port, user, password, database]
+fn mongoParseUrl(url: String) -> Array {
+    var rest = url
+    let k = strFind(url, "://")
+    if (k >= 0) { rest = strSub(url, k + 3, len(url)) }
+
+    var user = ""
+    var password = ""
+    let at = strFind(rest, "@")
+    if (at >= 0) {
+        let cred = strSub(rest, 0, at)
+        rest = strSub(rest, at + 1, len(rest))
+        let colon = strFind(cred, ":")
+        if (colon >= 0) {
+            user = strSub(cred, 0, colon)
+            password = strSub(cred, colon + 1, len(cred))
+        } else {
+            user = cred
+        }
+    }
+
+    var host = rest
+    var port = 27017
+    var db = "test"
+    let slash = strFind(rest, "/")
+    if (slash >= 0) {
+        host = strSub(rest, 0, slash)
+        db = strSub(rest, slash + 1, len(rest))
+        // 去掉 ?options
+        let q = strFind(db, "?")
+        if (q >= 0) { db = strSub(db, 0, q) }
+    }
+    let colon2 = strFind(host, ":")
+    if (colon2 >= 0) {
+        port = strParseInt(strSub(host, colon2 + 1, len(host)))
+        host = strSub(host, 0, colon2)
+    }
+    if (len(host) == 0) { host = "127.0.0.1" }
+    if (len(db) == 0) { db = "test" }
+    return ["mongodb", host, port, user, password, db]
+}

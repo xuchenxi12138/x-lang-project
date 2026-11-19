@@ -1,0 +1,460 @@
+// data.xle — xboot 的数据访问层（MyBatis-Plus 风格）
+//
+// ── 三层结构 ─────────────────────────────────────────────
+//
+//   Entity        实体基类：所有实体共享 id 字段（业务字段写在子类）
+//   EntityMeta    实体元数据：@Table/@TableId/@Column 注解 + classFields
+//                 反射出「Java 字段 ↔ 数据库列」的映射，每个实体类
+//                 只解析一次
+//   BaseMapper    通用 CRUD：insert / rowById / rowList / updateById /
+//                 deleteById / count —— 按元数据生成 SQL，ResultSet
+//                 按元数据转成实体字段
+//
+// ── 为什么 mapper 的类型化方法由用户写 ────────────────────
+//
+// MyBatis-Plus 的 `selectById()` 返回泛型 T；本语言没有泛型，也没有
+// 类型转换（as/cast）语法 —— `BaseMapper.rowById(id)` 只能返回行数组
+// （Array），强转成 User 类型编译器不认。
+//
+// 解决方案是「模板方法 + 协变覆写」：BaseMapper 提供行级 API 与
+// fillEntity 填充，**用户的 mapper 类覆写出类型化门面**：
+//
+//   @Mapper(entity = "User")
+//   class UserMapper extends BaseMapper {
+//       fn byId(id: Int) -> User {
+//           let row = self.rowById(id)
+//           if (len(row) == 0) { return null }
+//           let u = new User()
+//           fillEntity(u, self.meta, row)
+//           return u
+//       }
+//   }
+//
+// 协变覆写（Entity → User 收窄）语言是支持的（虚表按名字分派，
+// 返回类型不参与槽查找）。service 拿到的引用是编译器验证过的
+// User 类型 —— 比泛型擦除还干净。
+
+from "ioc.xle" import convertByType, Container
+from "../../stdlib/db/core/datasource.xle" import sqlBind, execAll, DataSource
+from "../../stdlib/db/core/result.xle" import ResultSet
+from "../../stdlib/db/mysql/driver.xle" import myParseUrl, MySqlDataSource, MY_COM_QUERY, MY_COM_PING, MY_COM_QUIT
+from "anno.xle" import mappingAnnoNames, isComponentAnno, beanNameOf, camelToSnake, isComponentClass, annoHasInherited, annoGetInherited, annoGetKVInherited, ANNO_COMPONENT, ANNO_SERVICE, ANNO_REPOSITORY, ANNO_CONTROLLER, ANNO_RESTCONTROLLER, ANNO_MAPPER, ANNO_AUTOWIRED, ANNO_VALUE, ANNO_GET_MAPPING, ANNO_POST_MAPPING, ANNO_PUT_MAPPING, ANNO_DELETE_MAPPING, ANNO_PATCH_MAPPING, ANNO_REQUEST_MAPPING, ANNO_TABLE, ANNO_TABLE_ID, ANNO_COLUMN, ANNO_QUERY
+
+// ---------------- 实体基类 ----------------
+//
+// 与团队既有约定一致（BaseEntity）：id 是公共字段，其余基础列
+// （status/create_user/create_time...）由各表自行决定是否建列 ——
+// fillEntity 只填「实体上真实存在的字段」。
+class Entity {
+    id: Int,
+
+    constructor() {
+        self.id = 0
+    }
+}
+
+// ---------------- 实体元数据 ----------------
+
+// 一个字段的映射：Java 字段名 ↔ 数据库列名 + 声明类型。
+class EntityField {
+    javaName: String
+    dbName: String
+    typeName: String
+
+    constructor(javaName: String, dbName: String, typeName: String) {
+        self.javaName = javaName
+        self.dbName   = dbName
+        self.typeName = typeName
+    }
+}
+
+// 一个实体的完整元数据。
+class EntityMeta {
+    // 表名（@Table 值；缺省时类名驼峰转下划线）。
+    table: String
+
+    // 主键字段（@TableId 所在字段；缺省 id）。
+    idJava: String
+    idDb: String
+
+    // 全部持久化字段（EntityField）。静态声明为 Array —— 元素是
+    // EntityField 实例（数组元素动态）。
+    fields: Array
+
+    constructor() {
+        self.table  = ""
+        self.idJava = "id"
+        self.idDb   = "id"
+        self.fields = []
+    }
+
+    // 列名 → 字段下标。没有则 -1。
+    fn indexOfDb(dbName: String) -> Int {
+        var i = 0
+        while i < len(self.fields) {
+            let f: EntityField = self.fields[i]
+            if (f.dbName == dbName) { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // 所有列名，逗号连接（SELECT 列清单用）。
+    fn colList() -> String {
+        var cols = []
+        var i = 0
+        while i < len(self.fields) {
+            let f: EntityField = self.fields[i]
+            arrPush(cols, f.dbName)
+            i = i + 1
+        }
+        return strJoin(cols, ", ")
+    }
+}
+
+// 解析实体类 → EntityMeta。
+//
+// 规则（与 MyBatis-Plus 默认策略一致）：
+//   表名   @Table("t_user") ；没有注解 → 类名驼峰转下划线
+//   主键   @TableId 标在字段上（缺省 id）
+//   列名   @Column("user_name") ；没有注解 → 字段名驼峰转下划线
+//   范围   classFields 给出的是**实体真实拥有的字段**（含继承），
+//          所以 User extends Entity 时 id 也在列清单里
+//
+// 元数据只解析一次的缓存不做 —— 每请求解析的开销可忽略（十几个
+// 字段的字符串比较），少一份缓存就少一份失效问题。
+fn entityMetaOf(clsName: String) -> EntityMeta {
+    let meta = new EntityMeta()
+
+    // 表名
+    let tbl = annoGetInherited(clsName, "class", "", ANNO_TABLE)
+    if (len(tbl) > 0) {
+        meta.table = toString(tbl[0])
+    } else {
+        meta.table = camelToSnake(clsName)
+    }
+
+    // 字段映射
+    let fields = classFields(clsName)
+    var i = 0
+    while i < len(fields) {
+        let row: Array = fields[i]
+        let fname = toString(row[0])
+        let ftype = toString(row[1])
+
+        let colAnno = annoGetInherited(clsName, "field", fname, ANNO_COLUMN)
+        var dbName = camelToSnake(fname)
+        if (len(colAnno) > 0) {
+            dbName = toString(colAnno[0])
+        }
+
+        arrPush(meta.fields, new EntityField(fname, dbName, ftype))
+        if (annoHasInherited(clsName, "field", fname, ANNO_TABLE_ID)) {
+            meta.idJava = fname
+            meta.idDb   = dbName
+        }
+        i = i + 1
+    }
+    return meta
+}
+
+// 把一行结果（[[列名, 值字符串], ...]）填进实体实例。
+//
+// 值都是字符串形态（ResultSet.cell 的输出），按字段的**声明类型**
+// 转换：Int → strParseInt、Float → strParseFloat、Bool → true/false。
+// 列在实体里没有对应字段时跳过（SELECT * 的多余列不炸）；
+// 值为 null 时字段保持零值。
+fn fillEntity(inst: Entity, meta: EntityMeta, row: Array) {
+    var i = 0
+    while i < len(row) {
+        let kv: Array = row[i]
+        let colName = toString(kv[0])
+        let rawVal  = kv[1]
+        let fi = meta.indexOfDb(colName)
+        if (fi >= 0 && rawVal != null) {
+            let f: EntityField = meta.fields[fi]
+            let v = convertByType(toString(rawVal), f.typeName)
+            fieldSet(inst, f.javaName, v)
+        }
+        i = i + 1
+    }
+}
+
+// ---------------- SQL 字面量 ----------------
+
+// sqlLiteral 不在本文件定义 —— db/core/dialect.xle 已有实现（经
+// datasource.xle 的 import 链并入）：数字形态不加引号、NULL/TRUE/
+// FALSE 特判、字符串转义加引号。比「一律加引号」更贴近 SQL 语义，
+// 框架复用它而不是再造一份。
+
+// 字段值 → SQL 字面量。
+//
+// null 值必须写 SQL 的 NULL（不带引号），写成 'null' 字符串会把
+// 数据库里的空值污染成四字符文本 —— 那种错要等报表出来才被发现。
+fn sqlValueOf(v) -> String {
+    let t = typeOf(v)
+    if (t == "Null") { return "NULL" }
+    if (t == "String") { return sqlLiteral(v) }
+    return sqlLiteral(toString(v))
+}
+
+// ---------------- 条件构造器 ----------------
+//
+// MyBatis-Plus 的 QueryWrapper 对应物。链式方法把条件追加进平行
+// 数组，toWhere() 渲染成 WHERE 片段（不带 WHERE 关键字，空条件
+// 返回空串）。
+class QueryWrapper {
+    // 平行数组：列名、运算符、SQL 字面量。
+    cols: Array
+    ops: Array
+    vals: Array
+
+    // ORDER BY 片段（"col DESC"），只支持一个。
+    order: String
+
+    constructor() {
+        self.cols  = []
+        self.ops   = []
+        self.vals  = []
+        self.order = ""
+    }
+
+    fn addCond(col: String, op: String, val: String) -> QueryWrapper {
+        arrPush(self.cols, col)
+        arrPush(self.ops, op)
+        arrPush(self.vals, val)
+        return self
+    }
+
+    fn eq(col: String, v) -> QueryWrapper {
+        return self.addCond(col, "=", sqlLiteral(toString(v)))
+    }
+    fn ne(col: String, v) -> QueryWrapper {
+        return self.addCond(col, "<>", sqlLiteral(toString(v)))
+    }
+    fn gt(col: String, v) -> QueryWrapper {
+        return self.addCond(col, ">", sqlLiteral(toString(v)))
+    }
+    fn ge(col: String, v) -> QueryWrapper {
+        return self.addCond(col, ">=", sqlLiteral(toString(v)))
+    }
+    fn lt(col: String, v) -> QueryWrapper {
+        return self.addCond(col, "<", sqlLiteral(toString(v)))
+    }
+    fn le(col: String, v) -> QueryWrapper {
+        return self.addCond(col, "<=", sqlLiteral(toString(v)))
+    }
+    fn like(col: String, v) -> QueryWrapper {
+        return self.addCond(col, "LIKE", sqlLiteral("%" + toString(v) + "%"))
+    }
+
+    fn orderByAsc(col: String) -> QueryWrapper {
+        self.order = col + " ASC"
+        return self
+    }
+    fn orderByDesc(col: String) -> QueryWrapper {
+        self.order = col + " DESC"
+        return self
+    }
+
+    // 渲染 WHERE 片段（不含 WHERE 关键字）。无条件时返回空串。
+    fn toWhere() -> String {
+        if (len(self.cols) == 0) { return "" }
+        var parts = []
+        var i = 0
+        while i < len(self.cols) {
+            arrPush(parts, toString(self.cols[i]) + " " + toString(self.ops[i]) +
+                           " " + toString(self.vals[i]))
+            i = i + 1
+        }
+        var s = strJoin(parts, " AND ")
+        if (len(self.order) > 0) {
+            s = s + " ORDER BY " + self.order
+        }
+        return s
+    }
+}
+
+// ---------------- BaseMapper ----------------
+//
+// Mapper 基类：持有实体元数据与数据源，生成并执行 SQL。
+//
+// 实例字段 entity / meta 由 XBoot 在装配阶段按 @Mapper(entity=...)
+// 注解填好；ds 由容器的 @Autowired 按 IS-A 匹配注入（字段声明是
+// 抽象基类 DataSource，运行时是 MySqlDataSource —— 依赖抽象而非
+// 实现，分层在这里兑现）。
+class BaseMapper {
+    // 实体类名（@Mapper(entity = "User") 的值）。
+    entity: String
+
+    // 实体元数据（XBoot 装配时解析好）。
+    meta: EntityMeta
+
+    // 数据源（容器注入）。
+    //
+    // ── @Autowired 必须写 ─────────────────────────
+    //
+    // 容器只注入**标注了注解**的字段（injectBean 按注解分派）。
+    // 这里漏标的话 ds 保持声明零值（Int 0），第一个 SQL 调用就会
+    // 报「虚调用的接收者不是类实例，实际是 Int」—— 报错位置在
+    // 使用点而不是装配点，查起来很绕。注解是装配的契约，不是
+    // 文档装饰。
+    @Autowired
+    ds: DataSource
+
+    constructor() {
+        self.entity = ""
+        self.meta   = new EntityMeta()
+        // ds 没有默认值 —— @Autowired 会在装配阶段写入。
+        // 声明上必须给类型，运行时未注入就访问会得到 null，
+        // 那是装配失败的显式症状，比静默的假数据诚实。
+    }
+
+    // INSERT。返回受影响行数（成功即 1）。
+    //
+    // id 为 0 时跳过 id 列（自增主键）；非 0 时显式写入。
+    fn insert(e: Entity) -> Int {
+        var cols = []
+        var vals = []
+        var i = 0
+        while i < len(self.meta.fields) {
+            let f: EntityField = self.meta.fields[i]
+            if (f.javaName == self.meta.idJava && e.id == 0) {
+                i = i + 1
+                continue
+            }
+            arrPush(cols, f.dbName)
+            arrPush(vals, sqlValueOf(fieldGet(e, f.javaName)))
+            i = i + 1
+        }
+        let sql = "INSERT INTO " + self.meta.table +
+                  " (" + strJoin(cols, ", ") + ") VALUES (" +
+                  strJoin(vals, ", ") + ")"
+        return self.ds.affected(sql)
+    }
+
+    // 按主键查一行。返回 [[列名, 值], ...]；没有则空数组。
+    //
+    // 这是行级 API —— 类型化门面（byId → User）由用户 mapper 覆写
+    // 提供，理由见文件头注释。
+    fn rowById(id: Int) -> Array {
+        let sql = "SELECT " + self.meta.colList() + " FROM " + self.meta.table +
+                  " WHERE " + self.meta.idDb + " = " + toString(id)
+        let rows = self.rowsOf(self.ds.query(sql))
+        if (len(rows) == 0) { return [] }
+        return rows[0]
+    }
+
+    // 条件查多行。qw 渲染出的 WHERE 片段（可为空）。
+    //
+    // ── 局部变量为什么叫 whereSql 而不是 where ──────────
+    // where 是语言关键字（模式匹配子句），不能作变量名。
+    fn rowList(qw: QueryWrapper) -> Array {
+        var sql = "SELECT " + self.meta.colList() + " FROM " + self.meta.table
+        let whereSql = qw.toWhere()
+        if (len(whereSql) > 0) {
+            sql = sql + " WHERE " + whereSql
+        }
+        return self.rowsOf(self.ds.query(sql))
+    }
+
+    // ResultSet → 行数组。每行 [[列名, 值字符串], ...]。
+    fn rowsOf(rs: ResultSet) -> Array {
+        let out = []
+        if (!rs.ok) {
+            fail("xboot: SQL 执行失败 —— " + rs.error)
+        }
+        var r = 0
+        while r < rs.count() {
+            var row = []
+            var c = 0
+            while c < rs.colCount() {
+                if (rs.isNull(r, c)) {
+                    arrPush(row, [rs.colName(c), null])
+                } else {
+                    arrPush(row, [rs.colName(c), rs.cell(r, c)])
+                }
+                c = c + 1
+            }
+            arrPush(out, row)
+            r = r + 1
+        }
+        return out
+    }
+
+    // UPDATE（按主键）。id 为 0 的实体拒绝更新 —— 那是没查过
+    // 就写，静默 UPDATE 全表比报错可怕得多。
+    fn updateById(e: Entity) -> Int {
+        if (e.id == 0) {
+            fail("xboot: updateById 拒绝 id=0 的实体（先 byId 查出来再改）")
+        }
+        var sets = []
+        var i = 0
+        while i < len(self.meta.fields) {
+            let f: EntityField = self.meta.fields[i]
+            if (f.javaName == self.meta.idJava) {
+                i = i + 1
+                continue
+            }
+            arrPush(sets, f.dbName + " = " + sqlValueOf(fieldGet(e, f.javaName)))
+            i = i + 1
+        }
+        let sql = "UPDATE " + self.meta.table + " SET " + strJoin(sets, ", ") +
+                  " WHERE " + self.meta.idDb + " = " + toString(e.id)
+        return self.ds.affected(sql)
+    }
+
+    // DELETE（按主键）。返回受影响行数。
+    fn deleteById(id: Int) -> Int {
+        let sql = "DELETE FROM " + self.meta.table +
+                  " WHERE " + self.meta.idDb + " = " + toString(id)
+        return self.ds.affected(sql)
+    }
+
+    // 条件计数。
+    fn count(qw: QueryWrapper) -> Int {
+        var sql = "SELECT COUNT(*) FROM " + self.meta.table
+        let whereSql = qw.toWhere()
+        if (len(whereSql) > 0) {
+            sql = sql + " WHERE " + whereSql
+        }
+        return self.ds.queryInt(sql)
+    }
+
+    // 主键是否存在。
+    fn existsById(id: Int) -> Bool {
+        return self.ds.exists("SELECT 1 FROM " + self.meta.table +
+                              " WHERE " + self.meta.idDb + " = " +
+                              toString(id))
+    }
+}
+
+// ---------------- 数据源装配 ----------------
+
+// 从配置建数据源。
+//
+// 约定（application.properties）：
+//   db.driver = mysql            （唯一支持的驱动；缺省 mysql）
+//   db.url    = mysql://host:3306/dbname
+//   db.username = root
+//   db.password = secret
+//
+// 连接失败是启动期错误 —— fail fast，带着驱动的报错文本退出。
+// Web 服务没有数据库却装作正常，比启动失败更难查。
+fn dataSourceFrom(cfg: Config) -> DataSource {
+    let driver = strLower(strTrim(cfg.getOr("db.driver", "mysql")))
+    if (driver != "mysql") {
+        fail("xboot: 不支持的数据源驱动 `" + driver + "`（当前支持：mysql）")
+    }
+    let url      = cfg.getOr("db.url", "")
+    let user     = cfg.getOr("db.username", "")
+    let password = cfg.getOr("db.password", "")
+    if (len(url) == 0) {
+        fail("xboot: 缺少配置 db.url（形如 mysql://127.0.0.1:3306/dbname）")
+    }
+    let ds = MySqlDataSource.ofUrl(url, user, password)
+    if (!ds.connect()) {
+        fail("xboot: 数据库连接失败 —— " + ds.lastError)
+    }
+    return ds
+}

@@ -1,0 +1,63 @@
+// 16-array.x — 数组基础语义
+//
+// 覆盖：建数组、读写元素、len、元素类型混装、二维棋盘的一维表示、
+// 数组作为函数参数、越界报错（在 17 里单独测）。
+//
+// 二维用一维表示是这个语言阶段的关键技巧：没有嵌套数组的语法糖，
+// 但 idx = y * w + x 完全够用，扫雷就是这么做。
+
+fn at(g: Array, w: Int, x: Int, y: Int) -> Int {
+    return g[y * w + x]
+}
+
+fn put(g: Array, w: Int, x: Int, y: Int, v: Int) -> Int {
+    g[y * w + x] = v
+    return v
+}
+
+// 建一个 w*h、全 0 的数组
+fn zeros(w: Int, h: Int) -> Array {
+    return array(w * h, 0)
+}
+
+let n = 5
+let a = array(n, 7)
+println(len(a))
+println(a[0])
+println(a[4])
+
+a[0] = 10
+a[4] = 40
+println(a)
+
+// 一维装二维：3x3 棋盘
+let w = 3
+let h = 3
+let g = zeros(w, h)
+println(len(g))
+put(g, w, 1, 1, 9)
+println(at(g, w, 1, 1))
+println(at(g, w, 0, 0))
+println(g)
+
+// 元素类型混装（动态类型数组）
+let mix = array(3, 0)
+mix[0] = "hello"
+mix[1] = 1.5
+mix[2] = true
+println(mix)
+
+// 自增计数：扫雷里统计剩余雷数要用
+let cells = array(4, 0)
+var i = 0
+while i < 4 {
+    cells[i] = i * i
+    i += 1
+}
+println(cells)
+
+// 数组比较的是引用还是内容？这里只验证同引用读写互通
+let alias = array(2, 0)
+let same = alias
+same[0] = 42
+println(alias[0])

@@ -1,0 +1,71 @@
+// service/user_service.xle — 用户业务逻辑
+//
+// ── 分层的意义在这一层兑现 ────────────────────────────────
+//
+// controller 只做「HTTP 形态 ↔ 业务调用」的翻译；mapper 只做
+// 「业务对象 ↔ SQL 行」的翻译。校验、状态判断这类业务规则写在这：
+//   · 创建前 username 非空由 controller 的参数校验兜（HTTP 语义 400）
+//   · 更新/删除前「存在性检查」是业务规则 —— 返回业务码（-1/0），
+//     由 controller 翻译成 404/成功
+//
+// mapper 字段是 @Autowired —— 容器按类型注入（classIs 匹配）。
+// private 会被容器拒绝（注入字段必须 public，见 ioc.xle 的封装
+// 守卫），这里 public 是框架约定不是风格疏忽。
+
+import "../../../../lib/xboot/data.xle"
+import "../entity/user.xle"
+import "../mapper/user_mapper.xle"
+
+@Service
+class UserService {
+    @Autowired
+    mapper: UserMapper
+
+    // 全量用户列表。
+    fn listAll() -> Array {
+        return self.mapper.listAll()
+    }
+
+    // 按状态筛选。
+    fn listByStatus(status: Int) -> Array {
+        return self.mapper.listByStatus(status)
+    }
+
+    // 用户名模糊搜索。
+    fn searchByName(keyword: String) -> Array {
+        return self.mapper.searchByName(keyword)
+    }
+
+    // 按主键取用户。不存在返回 null（controller 翻译成 404）。
+    fn getById(id: Int) -> User {
+        return self.mapper.byId(id)
+    }
+
+    // 新增。返回受影响行数（1 = 成功）。
+    fn create(u: User) -> Int {
+        return self.mapper.insert(u)
+    }
+
+    // 更新。id 不存在返回 -1（业务码），成功返回受影响行数。
+    //
+    // ── 为什么先查再改 ─────────────────────────────
+    // updateById 对不存在的 id 受影响 0 行，不报错 —— 静默的
+    // 0 行更新会让调用方误以为成功。存在性检查把「没改到东西」
+    // 变成显式的业务信号。
+    fn update(u: User) -> Int {
+        if (!self.mapper.existsById(u.id)) {
+            return 0 - 1
+        }
+        return self.mapper.updateById(u)
+    }
+
+    // 删除。返回受影响行数（0 = 没有这个人）。
+    fn remove(id: Int) -> Int {
+        return self.mapper.deleteById(id)
+    }
+
+    // 总数。
+    fn count() -> Int {
+        return self.mapper.count(new QueryWrapper())
+    }
+}

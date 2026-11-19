@@ -1,0 +1,239 @@
+// ============================================================
+// std.ui —— 图形界面组件库
+// ============================================================
+//
+// 这个测试**真的开窗**、真的画控件，然后截图。
+//
+// ── 怎么在没有人的情况下测试界面 ────────────────────────────
+//
+// 分两层：
+//
+//   1. **纯逻辑层**（不需要窗口）：命中判定、布局游标、数值
+//      格式化。这部分用 println 断言，与其它测试一样可精确比对。
+//
+//   2. **绘制层**（需要窗口）：开一个窗，把所有控件画一遍，截图。
+//      截图不做像素比对（第一版永远「不对」），价值在于留下基线：
+//      改了绘制代码后重跑，人眼 diff 一次就能看出哪里变了。
+//
+// ── 点击怎么模拟 ────────────────────────────────────────────
+//
+// 不能。win* 原语只**读**真实的鼠标事件，没有注入点击的接口 ——
+// 那是测试专用能力，不属于产品 API。
+//
+// 所以下面的断言是「**没人点的时候所有控件都必须报告没被点**」。
+// 这不是形式主义：判据写反（把「鼠标在控件内」当成「被点击」）时，
+// 窗口一打开按钮就自己按下去。这类 bug 在人看着的时候表现为
+// 「一闪而过」，是最难抓的一种。
+//
+// ── 布局为什么要抽成函数 ────────────────────────────────────
+//
+// 最初循环帧与截图帧各写了一遍控件坐标，结果是两处数值慢慢漂开：
+// 截图里的间距和实际运行时的间距不一样，而那正是唯一能看到的证据。
+//
+// 抽成 ui_demo 之后，循环帧与截图帧画的是**同一段代码**，顺带还
+// 验证了「重复调用不累积状态」—— 即时模式的正确性依赖这一点。
+
+from std.ui import uiHit, uiHitDown, uiTextCenter, uiTextInRect, uiTextLeft, uiButton, uiButtonEx, uiButtonPrimary, uiButtonDanger, uiButtonFlat, uiConsumeClick, uiCheckMark, uiCheck, uiCheckEx, uiRadioGroup, uiSlider, uiSliderLabeled, uiSliderEx, uiField, uiFieldLabeled, uiSeparator, uiPanel, uiPanelTitled, uiProgress, uiProgressLabeled, uiSeparatorEx, uiVRuleEx, uiPanelEx, uiPanelTitledEx, uiProgressEx, uiProgressLabeledEx, uiList, uiListScroll, uiCursor, uiCursorTake, uiModalBg, uiDialog, uiStatus, uiToolbar, uiFixed, Rect, Theme, Style, Anim, Button, Label, Panel, Progress, Cursor, Check, Slider, Frame, Widget, UiLabel, UiButton, UiPanel, UiProgress, UiCheck, UiSlider, UiTree, UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_NONE, UI_BTN_NORMAL, UI_BTN_PRIMARY, UI_BTN_DANGER
+
+// ============================================================
+// 一整套控件的布局
+// ============================================================
+//
+// 返回一个打包的状态数组（语言没有结构体）：
+//   0 passive 无人点击时是否所有控件都报告没被点（1 = 正常）
+//   1 vol     滑条值
+//   2 running 勾选框状态
+//   3 choice  单选组选中项
+//   4 selected 列表选中行
+//   5 scroll  列表滚动位置
+//
+// 内容高度是**算出来的**，不是猜的。逐段累加：
+//
+//   起 64
+//   按钮 64..94          y=108
+//   勾选框 108..152      y=162
+//   滑条 162..182，标签 184   y=210
+//   进度 210..230        y=240
+//   进度(带字) 240..260   y=274
+//   列表 274..418        y=432
+//   输入框 432..458
+//   底部留白 16          → 面板内容底 474
+//
+// 这里踩过一次：上一版把面板高度写成 448（y 硬编码），而内容实际
+// 到 472。表现是底部输入框**压过面板边框**，看起来像渲染 bug，
+// 实际是布局常量与内容不匹配。任何一处间距改动都会让两边的数字
+// 重新漂开，所以把推导写在这里，改的时候照着重算。
+
+const DEMO_W  = 520
+const DEMO_H  = 490      // 474 面板底 + 16 外边距
+
+// 面板内的左右边界。所有控件都排在这两条线之间。
+const PAD_L   = 32
+const PAD_R   = 488      // DEMO_W - 32
+
+fn ui_demo(vol: Float, running: Bool, choice: Int,
+           selected: Int, scroll: Int) -> Array {
+    var passive = 1
+
+    winFillRect(0, 0, DEMO_W, DEMO_H, UI_BG)
+
+    uiPanelTitled(16, 16, DEMO_W - 32, 458, "std.ui 组件总览")
+
+    // ---- 按钮四态 ----
+    var y = 64
+    if (uiButton(32, y, 90, 30, "普通")) { passive = 0 }
+    if (uiButtonPrimary(130, y, 90, 30, "主要")) { passive = 0 }
+    if (uiButtonDanger(228, y, 90, 30, "危险")) { passive = 0 }
+    if (uiButtonFlat(326, y, 90, 30, "扁平")) { passive = 0 }
+
+    // ---- 勾选框：返回值必须等于传入值 ----
+    y = 108
+    let c1 = uiCheck(32, y, "启用缓存", running)
+    if (c1 != running) { passive = 0 }
+    let c2 = uiCheck(32, y + 26, "详细日志", false)
+    if (c2 != false) { passive = 0 }
+
+    // ---- 单选组 ----
+    //
+    // 放在 x=300 而不是紧挨勾选框：它纵向占 3 行（104..168），
+    // 而滑条的数值标签在 y=184、右边缘到 x≈252。放在 x=220 时
+    // 「高」与滑条数值会挤在相邻两行上，视觉上连成一片。
+    let rl = array(3, "")
+    rl[0] = "低"
+    rl[1] = "中"
+    rl[2] = "高"
+    let nr = uiRadioGroup(300, 104, rl, choice)
+    if (nr != choice) { passive = 0 }
+
+    // ---- 滑条 ----
+    y = 162
+    let nv = uiSliderLabeled(32, y, 220, "音量", vol, 0.0, 100.0, 0)
+    if (nv != vol) { passive = 0 }
+
+    // ---- 进度 ----
+    y = 210
+    uiProgress(32, y, 340, 20, 0.65)
+    y = 240
+    uiProgressLabeled(32, y, 340, 20, 0.25)
+
+    // ---- 列表 ----
+    //
+    // 列表宽 300，滚动按钮占 x=304..356，状态点从 x=380 起 ——
+    // 留 24px 余量。上一版列表宽 340 时按钮到 400，而状态点在
+    // 396，两者横向重叠 4px：截图里「▲」和绿点几乎贴在一起。
+    y = 274
+    let items = ui_demo_items()
+    let lr = uiListScroll(32, y, 300, 144, items, selected, scroll)
+    let nsel = toInt(lr[0])
+    let nscr = toInt(lr[1])
+    if (nsel != -1) { passive = 0 }
+    if (nscr != scroll) { passive = 0 }
+
+    // ---- 状态点 ----
+    uiStatus(380, y, "已连接", UI_OK)
+    uiStatus(380, y + 22, "警告", UI_WARN)
+    uiStatus(380, y + 44, "失败", UI_ERR)
+
+    // ---- 输入框外观 ----
+    y = 432
+    uiField(32, y, 200, 26, "预设内容", true)
+    uiField(244, y, 200, 26, "未聚焦", false)
+
+    let out = array(6, 0)
+    out[0] = passive
+    out[1] = nv
+    out[2] = c1
+    out[3] = nr
+    out[4] = nsel
+    out[5] = nscr
+    return out
+}
+
+// 列表项。为什么单独一个函数：布局函数里每次都要重建这个数组，
+// 而它是纯数据，抽出来让布局函数读起来只剩坐标。
+fn ui_demo_items() -> Array {
+    let items = array(20, "")
+    var i = 0
+    while (i < len(items)) {
+        items[i] = "第 " + toString(i + 1) + " 行"
+        i = i + 1
+    }
+    return items
+}
+
+fn main() -> Int {
+    // ── 1. 纯逻辑层 ─────────────────────────────────────────
+    println("---- 数值格式化 ----")
+    println(uiFixed(3.14159, 2))    // 3.14
+    println(uiFixed(3.0, 0))        // 3
+    println(uiFixed(2.5, 0))        // 3（四舍五入）
+    println(uiFixed(-2.5, 1))       // -2.5
+    println(uiFixed(0.0, 2))        // 0.00
+    // 整数部分要补零，否则 0.05 会打成 ".1" 而不是 "0.1"
+    println(uiFixed(0.05, 1))       // 0.1
+    println(uiFixed(0.001, 2))      // 0.00
+    println(uiFixed(100.0, 2))      // 100.00
+
+    println("---- 布局游标 ----")
+    let c = uiCursor(20)
+    println(c[0])                   // 20
+    println(uiCursorTake(c, 32, 8)) // 20
+    println(c[0])                   // 60
+    println(uiCursorTake(c, 24, 0)) // 60
+    println(c[0])                   // 84
+    println(uiCursorTake(c, 10, 5)) // 84
+    println(c[0])                   // 99
+
+    // ── 2. 开窗 ─────────────────────────────────────────────
+    println("---- 绘制 ----")
+
+    if (!winOpen("std.ui 组件库", DEMO_W, DEMO_H)) {
+        // 无图形会话时明确跳过，不假装通过
+        println("无法开窗：当前环境没有图形会话")
+        println("ui smoke skipped")
+        return 0
+    }
+
+    var vol = 40.0
+    var running = true
+    var choice = 1
+    var selected = 2
+    var scroll = 0
+    var all_passive = 1
+
+    // 连跑 3 帧。每帧都完整重画 —— 即时模式下这是常态，也是
+    // 「状态不存在控件里」这条设计的直接后果。
+    var frame = 0
+    while (frame < 3 && !winShouldClose()) {
+        winBeginFrame()
+        let r = ui_demo(vol, running, choice, selected, scroll)
+        winEndFrame()
+
+        if (toInt(r[0]) != 1) { all_passive = 0 }
+        vol = toFloat(r[1])
+        // r[2] 里装的是 Bool，但数组元素的静态类型是未知的，
+        // 所以只能经 toInt 转一下再判。
+        running = toInt(r[2]) != 0
+        choice = toInt(r[3])
+        selected = toInt(r[4])
+        scroll = toInt(r[5])
+
+        frame = frame + 1
+        winSleep(30)
+    }
+
+    // 最后一帧留在屏幕上截图：状态全部复位到「正常展示」的样子，
+    // 让截图里能看到勾选、选中行、填充进度这些有内容的形态
+    winBeginFrame()
+    ui_demo(62.0, true, 1, 2, 0)
+    winEndFrame()
+
+    let shotOk = winScreenshot("build/ui-smoke.bmp")
+    winClose()
+
+    println("帧数 " + toString(frame))            // 3
+    println("被动性 " + toString(all_passive))    // 1（没有控件自己触发）
+    println("截图 " + toString(shotOk))           // true
+    println("ui smoke ok")
+    return 0
+}

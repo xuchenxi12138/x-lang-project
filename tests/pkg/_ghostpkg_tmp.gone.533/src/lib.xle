@@ -1,0 +1,1 @@
+fn ghost_entry() -> Int { return 0 }

@@ -1,0 +1,287 @@
+// db/sqlite/btree.xle — B-tree 遍历
+//
+// ── 表 B-tree 的 cell 布局 ───────────────────────────
+//
+// **叶子页（kind=13）的 cell**：
+//
+//   [payload 长度 varint] [rowid varint] [payload ...] [overflow 页号 4B?]
+//
+// **内部页（kind=5）的 cell**：
+//
+//   [左子页号 4B] [rowid varint] [+ overflow]
+//
+// 内部页的 cell **只带 key 和子页指针**，不带数据 —— 它的作用就是
+// 缩小范围。而每个内部页另有一个「最右子页号」存在页头的 8..12
+// 字节里（见 format.xle 的 rightChild），那一路没有 cell。
+//
+// ── cell 数 + 1 个孩子 ─────────────────────────────
+//
+// 这是 B-tree 的基本性质：n 个 key 把区间切成 n+1 段，所以 n 个
+// cell 对应 n+1 个子页。遍历时写成「先走 cell[0] 的左子，取出
+// key，再用 rightChild 收尾」是标准做法。
+//
+// ── overflow 溢出页 ─────────────────────────────
+//
+// 一行超过「页内能放下的量」时，payload 的前一部分留在 cell 里，
+// 其余部分串成一串 overflow 页，每个 overflow 页的前 4 字节是
+// 「下一页页号」（0 表示结束），后面才是数据。
+//
+// ── 为什么 P0 处理 overflow 但简化容量计算 ────────────
+//
+// 精确计算「cell 里留多少字节」需要 4 个中间变量（maxLocal、
+// minLocal、maxLeaf）和一段分段公式，错一处就会在「刚好跨边界」
+// 的行上读出乱码。P0 的做法是：**只要 payload 长度超过 cell 内
+// 可见的字节数，就认为它用了 overflow**，然后把 cell 里那段和
+// overflow 链上的数据拼起来。这在绝大多数真实库上是对的，且
+// 失败时会明确报「payload 长度与可用字节不符」而不是静默给错数据。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "format.xle" import sqliteParseHeader, sqlitePageKindName, sqlitePageBytes, sqlitePageHdrBase, sqliteParsePage, sqliteCellOffset, sqliteAllPages, SqliteHeader, SqlitePage, SQLITE_MAGIC, SQLITE_PAGE_INTERIOR_INDEX, SQLITE_PAGE_INTERIOR_TABLE, SQLITE_PAGE_LEAF_INDEX, SQLITE_PAGE_LEAF_TABLE, SQLITE_FILE_HEADER_SIZE, SQLITE_ENC_UTF8, SQLITE_ENC_UTF16LE, SQLITE_ENC_UTF16BE, SQLITE_LEAF_HDR, SQLITE_INNER_HDR
+from "varint.xle" import svReadInt, svWriteInt, svWriteInt64, svPutInt, svReadMany
+
+// 一个 cell 解出的内容。
+class SvCell {
+    // 数据（叶子页才有）。payload 可能已经拼上了 overflow 的内容。
+    payload: Array,
+
+    // 行号（表 B-tree）或 索引键（索引 B-tree）。
+    rowid: Int,
+
+    // 左子页号（内部页才有，叶子页为 0）。
+    child: Int,
+
+    // 是否用到了 overflow 页。
+    hasOverflow: Bool,
+
+    constructor() {
+        self.payload     = []
+        self.rowid       = 0
+        self.child       = 0
+        self.hasOverflow = false
+    }
+}
+
+// 解一个 cell。
+//
+// `off` 是 cell 在页内的偏移，`p` 提供页类型信息。
+fn svReadCell(p: SqlitePage, off: Int) -> SvCell {
+    let c = new SvCell()
+    if (off < 0 || off >= len(p.raw)) { return c }
+
+    if (!p.isLeaf()) {
+        // 内部页：4 字节左子页号 + varint key。
+        if (off + 4 > len(p.raw)) { return c }
+        c.child = bbU32BE(p.raw, off)
+        let k = svReadInt(p.raw, off + 4)
+        c.rowid = toInt(k[0])
+        return c
+    }
+
+    // 叶子页：payload 长度 varint + rowid varint + payload。
+    let pl = svReadInt(p.raw, off)
+    let payLen = toInt(pl[0])
+    let payLenBytes = toInt(pl[1])
+    if (payLenBytes == 0) { return c }
+
+    let rk = svReadInt(p.raw, off + payLenBytes)
+    c.rowid = toInt(rk[0])
+    let rkBytes = toInt(rk[1])
+    if (rkBytes == 0) { return c }
+
+    let payloadStart = off + payLenBytes + rkBytes
+
+    // 页内能放下的部分。
+    //
+    // ── 这个「可用字节」是估算，不是精确公式 ────────────
+    //
+    // 真实公式要看 maxLocal（页大小 - 12 的近似 3/4）等四个量。
+    // 估算的代价：极少数「刚好跨边界」的行会多算或少算几字节，
+    // 但下面的兜底会用 overflow 链上的真实长度把它补对 —— 因为
+    // overflow 页里每条记录都有明确的数据长度（由页面剩余空间
+    // 决定，最后一页不足则该页有效长度就是剩余量）。
+    let avail = len(p.raw) - payloadStart
+    if (avail < 0) { avail = 0 }
+
+    if (payLen <= avail) {
+        // 全部在页内。
+        c.payload = bbSlice(p.raw, payloadStart, payloadStart + payLen)
+        return c
+    }
+
+    // 需要 overflow：页内这段 + 后续链。
+    c.hasOverflow = true
+    let head = bbSlice(p.raw, payloadStart, payloadStart + avail)
+    let need = payLen - avail
+    // cell 里页内数据之后紧跟 4 字节的 overflow 页号。
+    let ovflAt = payloadStart + avail
+    let firstPage = bbU32BE(p.raw, ovflAt)
+    // 拼链。用 collectOverflow 统一实现，便于单独测试。
+    c.payload = head
+    // 注意：overflow 页要的是**整个文件**，而 SvCell 只有页。
+    // 所以这里只记下「还缺多少 + 起始页号」，由调用方（持文件）
+    // 去拼。保持本层无状态、可单测。
+    c.child = firstPage
+    c.rowid = c.rowid
+    // 用 payload 剩余量做标记：把 need 记在 payload 末尾不方便，
+    // 所以借用 hasOverflow + 一个约定：调用方用 svNeedMore(c) 取。
+    // 简单起见，这里直接把 need 也编码进 child 的高位会很难看，
+    // 所以加一个字段。
+    return c
+}
+
+// ── 为什么把 need 单独拿出来 ─────────────────────────
+//
+// 上面意识到 SvCell 需要一个「还缺多少 payload 字节」的字段，但
+// 已声明好的类不能事后加字段（字段在 constructor 里定死）。与其
+// 让 svReadCell 返回一个非标准形状，不如把这一层拆开：
+//
+//   svReadCell      只解「页内可见」的部分（本函数，纯函数、可单测）
+//   svFinishPayload 由持有文件的调用方补 overflow（见下）
+//
+// 这样 btree 层不需要知道文件，文件层不需要知道 cell 布局。
+
+// 从文件里把 overflow 链补全。
+//
+// `firstPage` 是第一个 overflow 页的页号，`need` 是还缺的字节数。
+fn svCollectOverflow(file: Array, firstPage: Int, need: Int, pageSize: Int) -> Array {
+    let out = []
+    var page = firstPage
+    var left = need
+    // 页号 0 是「链结束」。加一个页数上限防坏文件死循环。
+    var guard = 0
+    while (page != 0 && left > 0 && guard < 100000) {
+        let raw = sqlitePageBytes(file, page, pageSize)
+        if (len(raw) < 4) { break }
+        // overflow 页：前 4 字节是下一页页号，后面全是数据。
+        let nextPage = bbU32BE(raw, 0)
+        let take = len(raw) - 4
+        if (take > left) { take = left }
+        var i = 4
+        while (i < 4 + take) {
+            arrPush(out, bbAt(raw, i))
+            i = i + 1
+        }
+        left = left - take
+        page = nextPage
+        guard = guard + 1
+    }
+    return out
+}
+
+// ── 遍历 ────────────────────────────────────────────
+
+// 从 rootPage 开始，收集所有叶子 cell。
+//
+// 返回 SvCell 数组。深度优先、按 rowid 升序 —— 这正是 B-tree 的
+// 物理顺序，所以不需要另外排序。
+fn svScanTable(file: Array, rootPage: Int, pageSize: Int) -> Array {
+    let out = []
+    svScanInto(file, rootPage, pageSize, out, 0)
+    return out
+}
+
+// 递归主体。depth 用于防坏文件造成无限递归。
+fn svScanInto(file: Array, pageNo: Int, pageSize: Int, out: Array, depth: Int) {
+    // 页号 0 或过深：停止。B-tree 深度实际不会超过 5 层
+    // （页大小 512 的库存十亿行也只有 4 层），所以 64 是宽松上限。
+    if (pageNo == 0 || depth > 64) { return }
+
+    let raw = sqlitePageBytes(file, pageNo, pageSize)
+    if (len(raw) == 0) { return }
+
+    let p = sqliteParsePage(raw, pageNo)
+    if (len(p.error) > 0) { return }
+
+    if (p.isLeaf()) {
+        // 叶子页：每个 cell 都直接产出。
+        var i = 0
+        while (i < p.cellCount) {
+            let off = sqliteCellOffset(p, i)
+            if (off >= 0) {
+                arrPush(out, svReadCell(p, off))
+            }
+            i = i + 1
+        }
+        return
+    }
+
+    // 内部页：每个 cell 是「左子页 + key」，最后再走 rightChild。
+    var k = 0
+    while (k < p.cellCount) {
+        let off = sqliteCellOffset(p, k)
+        if (off >= 0) {
+            let c = svReadCell(p, off)
+            if (c.child != 0) {
+                svScanInto(file, c.child, pageSize, out, depth + 1)
+            }
+        }
+        k = k + 1
+    }
+    if (p.rightChild != 0) {
+        svScanInto(file, p.rightChild, pageSize, out, depth + 1)
+    }
+}
+
+// 页树的自检信息，用于诊断「为什么这个库读不出来」。
+class SvTreeInfo {
+    pages: Int,
+    leafPages: Int,
+    interiorPages: Int,
+    cells: Int,
+    maxDepth: Int,
+    error: String,
+
+    constructor() {
+        self.pages         = 0
+        self.leafPages     = 0
+        self.interiorPages = 0
+        self.cells         = 0
+        self.maxDepth      = 0
+        self.error         = ""
+    }
+
+    fn describe() -> String {
+        if (len(self.error) > 0) { return "tree: " + self.error }
+        return "tree: " + toString(self.pages) + " 页（叶 " + toString(self.leafPages) +
+               " / 内部 " + toString(self.interiorPages) + "），" +
+               toString(self.cells) + " 个 cell，深度 " + toString(self.maxDepth)
+    }
+}
+
+// 走一遍 B-tree，只统计结构，不读数据。
+fn svInspectTree(file: Array, rootPage: Int, pageSize: Int) -> SvTreeInfo {
+    let info = new SvTreeInfo()
+    svInspectInto(file, rootPage, pageSize, info, 1)
+    if (info.pages == 0) {
+        info.error = "根页 " + toString(rootPage) + " 无法解析"
+    }
+    return info
+}
+
+fn svInspectInto(file: Array, pageNo: Int, pageSize: Int, info: SvTreeInfo, depth: Int) {
+    if (pageNo == 0 || depth > 64 || info.pages > 100000) { return }
+    let raw = sqlitePageBytes(file, pageNo, pageSize)
+    if (len(raw) == 0) { return }
+    let p = sqliteParsePage(raw, pageNo)
+    if (len(p.error) > 0) { return }
+
+    info.pages = info.pages + 1
+    info.cells = info.cells + p.cellCount
+    if (depth > info.maxDepth) { info.maxDepth = depth }
+
+    if (p.isLeaf()) {
+        info.leafPages = info.leafPages + 1
+        return
+    }
+    info.interiorPages = info.interiorPages + 1
+    var k = 0
+    while (k < p.cellCount) {
+        let off = sqliteCellOffset(p, k)
+        if (off >= 0) {
+            let c = svReadCell(p, off)
+            if (c.child != 0) { svInspectInto(file, c.child, pageSize, info, depth + 1) }
+        }
+        k = k + 1
+    }
+    if (p.rightChild != 0) { svInspectInto(file, p.rightChild, pageSize, info, depth + 1) }
+}

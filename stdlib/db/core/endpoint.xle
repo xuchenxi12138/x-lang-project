@@ -1,0 +1,64 @@
+// db/core/endpoint.xle — 连接端点（host + port + 超时）
+//
+// ── 为什么端点要一个值对象 ─────────────────────────
+//
+// 七个驱动的连接配置各不相同（MySQL 有库名和字符集，Postgres 有
+// search_path，Redis 有 db 索引），但**它们全都有** host / port /
+// 连接超时这三样。如果每个驱动的 Config 各自抄一遍，那么「超时
+// 默认值该是多少」这个问题就有七份答案，而它们会漂移。
+//
+// 所以先定死 Endpoint，各驱动的 Config 组合它。
+
+struct Endpoint {
+    host: String,
+    port: Int,
+
+    // 连接超时（毫秒）。
+    //
+    // ── 为什么必须有超时 ──────────────────────────
+    //
+    // netConnect 在目标不可达时会阻塞到操作系统的 TCP 超时
+    // （Windows 默认约 21 秒）。那期间整个程序是冻住的 —— 而
+    // 数据库探测、健康检查这类场景恰恰最常遇到「连不上」。
+    //
+    // 所以驱动层必须自己做超时：连上之前反复 netConnect 不现实
+    // （它会阻塞），实际做法是「先探测端口能不能连」，连不上
+    // 立刻返回失败。
+    timeoutMs: Int,
+
+    // 是否启用 TCP_NODELAY 之类的低延迟设置。当前运行时没有
+    // setsockopt，字段保留是为了 API 稳定。
+    lowLatency: Bool,
+}
+
+fn endpointOf(host: String, port: Int) -> Endpoint {
+    return Endpoint {
+        host:       host,
+        port:       port,
+        timeoutMs:  3000,
+        lowLatency: true,
+    }
+}
+
+fn endpointWithTimeout(e: Endpoint, ms: Int) -> Endpoint {
+    return Endpoint {
+        host:       e.host,
+        port:       e.port,
+        timeoutMs:  ms,
+        lowLatency: e.lowLatency,
+    }
+}
+
+// 默认端口常量。放在这里而不是各驱动里，是因为「写配置时忘了端口」
+// 时需要一个合理默认值，而各驱动自己定义会重复。
+const PORT_MYSQL    = 3306
+const PORT_POSTGRES = 5432
+const PORT_ORACLE   = 1521
+const PORT_REDIS    = 6379
+const PORT_MONGO    = 27017
+const PORT_ES       = 9200
+
+// "host:port" 形式，用于日志与错误信息。
+fn endpointString(e: Endpoint) -> String {
+    return e.host + ":" + toString(e.port)
+}

@@ -1,0 +1,78 @@
+from "../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from "../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+// net/index.xle — 网络层统一入口
+//
+// ── 这一层提供什么 ────────────────────────────────
+//
+//   core/tcp_listener   TCP 监听器（端口监听）
+//   core/tcp_stream     TCP 连接（收发字节与文本）
+//   http/uri            URL 解析与百分号编码
+//   http/header         HTTP 头（大小写无关、重复头、折行）
+//   http/cookie         Cookie 解析与生成
+//   http/status         状态码与使用建议
+//   http/request        请求报文解析（含走私检测）
+//   http/response       响应序列化（含 HEAD/204 处理）
+//   http/reader         从流里读报文（Content-Length / chunked）
+//   http/router         路径路由（参数、通配、405）
+//   http/server         HTTP 服务端（单线程事件循环模型）
+//   http/client         HTTP 客户端（单次请求，无连接池）
+//
+// ── 为什么要有这个文件 ─────────────────────────
+//
+// 因为调用方通常会说「我需要 HTTP」，而不是「我需要 header.xle」。
+// 有入口文件之后，一行 import 就能拿到整层能力，且不用记住文件布局。
+//
+// 这与「一个文件一个类」不冲突：那些文件仍然是独立、可单独 import
+// 的（比如只做 URL 解析的程序不该被拖进 HTTP 服务端的依赖）。
+
+from "core/tcp_listener.xle" import TcpListener, TL_POLL_MS, TL_DEFAULT_WAIT_MS
+from "core/tcp_stream.xle" import TcpStream, TS_POLL_MS, TS_DEFAULT_WAIT_MS
+from "http/uri.xle" import uriIsUnreserved, uriPctEncodeByte, uriEncode, uriEncodePath, uriEncodeQueryValue, uriDecode, uriHexVal, uriFindSchemeColon, uriSplitAuthority, strLastFind, uriDirOf, uriNormalizePath, Uri
+from "http/header.xle" import arrRemoveAt, Headers, HD_COLON, HD_MAX_LINE
+from "http/cookie.xle" import ckParseRequestHeader, ckGet, ckDelete, SetCookie
+from "http/status.xle" import hsCommonCodes, hsReason, hsClass, hsHasNoBody, hsAdvice
+from "http/request.xle" import rqKnownMethods, rqParseQuery, rqPlusToSpace, Request
+from "http/response.xle" import Response
+from "http/reader.xle" import hsCrlfCrlf, out2Append, ResponseHead, HsReader, HS_MAX_LINE
+from "http/router.xle" import rnNormalizePattern, rnMatchPattern, rnSplitSegs, arrHas, Route, Match, Router
+from "http/server.xle" import hsHttpDateNow, Context, HttpServer
+
+// ── 能力说明 ──────────────────────────────────
+//
+// 与 db/index.xle 的 dbSupportMatrix 对应：让调用方在运行前就能
+// 看清哪些能力是真的可用、哪些有边界。
+fn netSupportMatrix() -> Array {
+    return [
+        ["TCP 监听/连接",       "完整", "IPv4；监听与连接均为非阻塞 + 轮询"],
+        ["TCP 收发",            "完整", "send 返回实际字节数；sendAll 循环至发完"],
+        ["UDP",                 "无",   "语言无 UDP 内建"],
+        ["IPv6 连接",           "无",   "平台层只用 AF_INET；URL 里可解析但不用于连接"],
+        ["HTTP/1.1 客户端",     "完整", "Content-Length / chunked / 读到关闭 三种 body"],
+        ["HTTP/1.1 服务端",     "完整", "单线程 accept 循环；Connection: close"],
+        ["HTTP keep-alive",     "无",   "单线程模型下复用连接比关闭更慢"],
+        ["HTTPS / TLS",         "无",   "语言无 TLS 内建；需前置反向代理"],
+        ["HTTP/2",              "无",   "只用文本帧"],
+        ["WebSocket",           "无",   "需要帧编解码与长连接升级，未实现"],
+        ["URI 解析",            "完整", "含 IPv6 字面量、userinfo、点段归一化"],
+        ["Cookie",              "完整", "请求解析 + SetCookie 生成 + 错误配置检测"],
+        ["路由",                "完整", "参数、通配、405、HEAD 复用 GET"],
+        ["gzip",                "无",   "语言无 zlib 内建"]
+    ]
+}
+
+fn netSupportSummary() -> String {
+    let rows = netSupportMatrix()
+    var out = "网络层能力矩阵"
+    var i = 0
+    while i < len(rows) {
+        let r: Array = rows[i]
+        let name: String = r[0]
+        let state: String = r[1]
+        let note: String = r[2]
+        out = out + "\n    " + strPadRight(name, 22, " ") +
+              strPadRight("[" + state + "]", 8, " ") + " " + note
+        i = i + 1
+    }
+    return out
+}

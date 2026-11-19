@@ -1,0 +1,43 @@
+---- 基本解析 ----
+[name, age, score, ok, none, tags]
+12
+true
+false
+string
+number
+number
+boolean
+null
+array
+---- 取字段 ----
+张三
+30
+95.5
+-1
+30
+---- 生成（往返） ----
+"张三"
+30
+95.5
+true
+null
+---- 数组 ----
+[1, 2, 3]
+[1.5, 2.5]
+[[1, 2], [3, 4]]
+[]
+[]
+---- 字符串转义 ----
+"he said \"hi\"\nand \\ bye\ttab"
+true
+---- unicode 转义 ----
+[世界]
+[😀]
+---- 顶层标量 ----
+[42]
+[hello]
+[true]
+[null]
+---- 构造 object ----
+{"x":1,"y":2}
+["x","y"]

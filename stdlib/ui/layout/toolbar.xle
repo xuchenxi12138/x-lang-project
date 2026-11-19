@@ -1,0 +1,232 @@
+// ui/layout/toolbar.xle — 工具栏（一排紧凑的图标/文字按钮）
+//
+// ── 工具栏不是「一排 Button」 ─────────────────────
+//
+// 它有四个 Button 没有的约束：
+//
+//   1. 高度固定且很矮（36px 左右），按钮要更紧凑
+//   2. 右侧常驻一组「靠右对齐」的项（搜索框、头像）
+//   3. 项之间要么全部紧挨（图标组），要么有分隔线分块
+//   4. 每一项的宽度由文字决定，而不是均分
+//
+// 这些都不是按钮本身的事，所以工具栏是**容器**而不是按钮的变体。
+//
+// ── 数据表示 ─────────────────────────────────
+//
+// 和 menu.xle 同一个思路：用字符串数组，按约定前缀区分类型。
+//
+//   "新建"          普通项（文字按钮）
+//   "|"             分隔线
+//   ">保存"         右侧组（前缀 >，靠右对齐）
+//   "!删除"         禁用项
+//
+// 为什么不用结构体：工具栏项几乎全是静态的，字符串字面量读起来
+// 最舒服，而且和菜单项共享同一套解析规则（menuitem.xle）。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+from "../display/menuitem.xle" import menuIsSep, menuIsDisabled, menuLabel, menuShortcut
+
+// 工具栏高度。比按钮高一点点，留出上下呼吸空间。
+const TBAR_H = 36
+
+// 项之间的间隔。
+const TBAR_GAP = 2
+
+// 每一项的左右内边距。
+const TBAR_PAD = 10
+
+class Toolbar extends Widget {
+    // 项数组，格式见文件头。
+    items: Array,
+
+    // 最近一次被点击的项索引。-1 表示没有。
+    //
+    // ── 为什么用索引而不是回调 ────────────────────
+    //
+    // 同 Modal / Menu 的理由：语言没有闭包，一个回调无法区分
+    // 「这次点的是第几项」。用索引让调用方自己 switch。
+    clickedIndex: Int,
+
+    // 悬停项索引，-1 表示无。
+    hoverIndex: Int,
+
+    constructor(r: Rect, items: Array) {
+        self.r            = r
+        self.vis          = true
+        self.enabled      = true
+        self.focused      = false
+        self.hovered      = false
+        self.items        = items
+        self.clickedIndex = 0 - 1
+        self.hoverIndex   = 0 - 1
+        self.style        = Style.plain()
+    }
+
+    static fn of(r: Rect, items: Array) -> Toolbar {
+        return new Toolbar(r, items)
+    }
+
+    // ── 项的分类 ─────────────────────────────────
+
+    // 是否属于右侧组。
+    fn isRight(s: String) -> Bool {
+        if (len(s) == 0) { return false }
+        return strSub(s, 0, 1) == ">"
+    }
+
+    // 是否分隔线。
+    fn isSep(s: String) -> Bool {
+        return s == "|"
+    }
+
+    // 显示文字（去掉前缀、去掉快捷键）。
+    fn itemText(s: String) -> String {
+        var t = s
+        if (self.isRight(t)) { t = strSub(t, 1, len(t)) }
+        return menuLabel(t)
+    }
+
+    fn itemDisabled(s: String) -> Bool {
+        var t = s
+        if (self.isRight(t)) { t = strSub(t, 1, len(t)) }
+        return menuIsDisabled(t)
+    }
+
+    // 单项宽度：文字宽 + 两侧内边距。分隔线固定 9px。
+    fn itemWidth(s: String) -> Int {
+        if (self.isSep(s)) { return TBAR_GAP + 9 }
+        return winTextWidth(self.itemText(s)) + TBAR_PAD * 2
+    }
+
+    // ── 布局 ────────────────────────────────────
+    //
+    // 两趟：先算左侧组的总宽和右侧组的总宽，再分别从两端排。
+    // 两趟是必要的 —— 否则右侧组的起点取决于左侧组实际占了多少，
+    // 而单趟扫描到右组时还不知道左组会不会溢出。
+
+    // 第 i 项的矩形。左侧组从左边排，右侧组从右边排。
+    fn itemRect(i: Int) -> Rect {
+        if (i < 0 || i >= len(self.items)) {
+            return rectOf(self.r.x, self.r.y, 0, 0)
+        }
+
+        // 左侧组：从原点累加，遇到第一个右侧项就停。
+        let y = self.r.y + 2
+        let h = self.r.h - 4
+        var x = self.r.x + 4
+        var j = 0
+        while j < len(self.items) {
+            let s = self.items[j]
+            if (self.isRight(s)) { break }
+            let w = self.itemWidth(s)
+            if (j == i) { return rectOf(x, y, w, h) }
+            x = x + w
+            j = j + 1
+        }
+
+        // 右侧组：从右端往左累加。先算总宽再定位，因为
+        // 「从右往左排」的第一项在最右边，而数组顺序是从左往右。
+        var rightW = 0
+        var k = 0
+        while k < len(self.items) {
+            let s = self.items[k]
+            if (self.isRight(s) && !self.isSep(s)) {
+                rightW = rightW + self.itemWidth(s)
+            }
+            k = k + 1
+        }
+        var rx = self.r.x + self.r.w - 4 - rightW
+        k = 0
+        while k < len(self.items) {
+            let s = self.items[k]
+            if (self.isRight(s)) {
+                let w = self.itemWidth(s)
+                if (k == i) { return rectOf(rx, y, w, h) }
+                rx = rx + w
+            }
+            k = k + 1
+        }
+
+        return rectOf(self.r.x, self.r.y, 0, 0)
+    }
+
+    fn indexAt(mx: Int, my: Int) -> Int {
+        var i = 0
+        while i < len(self.items) {
+            let rc = self.itemRect(i)
+            if (self.isSep(self.items[i])) {
+                i = i + 1
+                continue
+            }
+            if (rc.contains(mx, my)) { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // ── 交互 ────────────────────────────────────
+
+    fn updateHover(mx: Int, my: Int) {
+        if (!self.vis) {
+            self.hoverIndex = 0 - 1
+            return
+        }
+        self.hoverIndex = self.indexAt(mx, my)
+    }
+
+    // 处理点击。返回被点的项索引（-1 = 没点到有效项）。
+    //
+    // 点禁用项不返回索引，但**也不报错** —— 工具栏的禁用项应该
+    // 看起来就是灰的，点上去没反应是预期行为。
+    fn click(mx: Int, my: Int) -> Int {
+        if (!self.vis || !self.enabled) { return 0 - 1 }
+        let i = self.indexAt(mx, my)
+        if (i < 0) { return 0 - 1 }
+        if (self.itemDisabled(self.items[i])) { return 0 - 1 }
+        self.clickedIndex = i
+        return i
+    }
+
+    fn consume() {
+        self.clickedIndex = 0 - 1
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 底：比面板稍深，让工具栏「压」在内容上。
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.bg)
+        // 下边框：唯一的分隔线，比整体描边轻。
+        winFillRect(self.r.x, self.r.y + self.r.h - 1, self.r.w, 1, th.border)
+
+        var i = 0
+        while i < len(self.items) {
+            let s = self.items[i]
+            let rc = self.itemRect(i)
+
+            if (self.isSep(s)) {
+                // 分隔线：竖直短条，上下各留 8px。
+                winFillRect(rc.x + 4, rc.y + 8, 1, rc.h - 16, th.border)
+            } else {
+                // 项：悬停时加深底色（一个浅浅的圆角块）。
+                let dis = self.itemDisabled(s)
+                if (!dis && self.hoverIndex == i) {
+                    winFillRound(rc.x, rc.y, rc.w, rc.h, 4, th.surfaceHover)
+                }
+                var tc = th.text
+                if (dis) {
+                    tc = th.disabled
+                }
+                uiTextInRect(rc, self.itemText(s), tc)
+            }
+            i = i + 1
+        }
+    }
+}

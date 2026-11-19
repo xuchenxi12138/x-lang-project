@@ -1,0 +1,158 @@
+// ui/layout/statusbar.xle — 状态栏（窗口底部的一条信息带）
+//
+// ── 状态栏的语义 ──────────────────────────────
+//
+// 它是「长期可见的次要信息」的容器，典型内容：
+//
+//   左侧  当前上下文 / 提示（"就绪"、"正在保存..."）
+//   中间  可分段的统计（行数、字符数）
+//   右侧  常驻状态（连接状态、内存、版本号）
+//
+// ── 为什么不用三个 Label 拼 ──────────────────────
+//
+// 因为三段的**对齐方式不同**：左边左对齐、中间居中、右边右对齐。
+// 用三个 Label 拼时，中间的居中要手算宽度，而宽度依赖文字长度
+// —— 文字一变就得重算。作为容器，它自己知道怎么按区段排。
+//
+// ── 为什么分段用数组 ──────────────────────────
+//
+// 状态栏几乎总是「几个并列的短信息」，而不是一整句。用数组让
+// 调用方不用自己拼 " | " 分隔符 —— 拼字符串的地方多了，间距就
+// 会不一致。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 状态栏高度。一行小字 + 上下留白。
+const SBAR_H = 24
+
+// 段之间的分隔符与两侧留白。
+const SBAR_SEP = "  |  "
+
+class StatusBar extends Widget {
+    // 左侧段。第一个显示在最左。
+    left: Array,
+
+    // 中间段（居中显示，通常只有一个）。
+    center: String,
+
+    // 右侧段。最后一个显示在最右。
+    right: Array,
+
+    constructor(r: Rect) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.left    = []
+        self.center  = ""
+        self.right   = []
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect) -> StatusBar {
+        return new StatusBar(r)
+    }
+
+    // ── 内容设置 ─────────────────────────────────
+
+    fn setLeft(xs: Array) -> StatusBar {
+        self.left = xs
+        return self
+    }
+
+    fn setRight(xs: Array) -> StatusBar {
+        self.right = xs
+        return self
+    }
+
+    fn setCenter(s: String) -> StatusBar {
+        self.center = s
+        return self
+    }
+
+    // 单段便捷设置。用于「只有一句话」的场景（"就绪"）。
+    fn setText(s: String) -> StatusBar {
+        self.left = [s]
+        return self
+    }
+
+    // ── 拼接 ────────────────────────────────────
+
+    fn joinLeft() -> String {
+        return arrJoinStrings(self.left, SBAR_SEP)
+    }
+
+    fn joinRight() -> String {
+        return arrJoinStrings(self.right, SBAR_SEP)
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 底：比工具栏再深一级，视觉上「最靠底」。
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.bg)
+        // 上边框。
+        winFillRect(self.r.x, self.r.y, self.r.w, 1, th.border)
+
+        let pad = 10
+        let ty = self.r.y + (self.r.h - winTextHeight()) / 2
+
+        // ── 左段 ──
+        //
+        // 超长时省略而不是换行：状态栏只有一行高，换行会画到框外。
+        var ls = self.joinLeft()
+        let maxL = self.r.w / 2
+        if (winTextWidth(ls) > maxL) { ls = uiEllipsize(ls, maxL) }
+        winText(self.r.x + pad, ty, ls, th.textDim)
+
+        // ── 右段 ──
+        //
+        // 右对齐：x = 右边界 - 文字宽 - padding。这里必须用
+        // winTextWidth 实测，不能靠字符数估 —— 中文宽度是英文的两倍。
+        var rs = self.joinRight()
+        let maxR = self.r.w / 2
+        if (winTextWidth(rs) > maxR) { rs = uiEllipsize(rs, maxR) }
+        let rw = winTextWidth(rs)
+        winText(self.r.x + self.r.w - pad - rw, ty, rs, th.textDim)
+
+        // ── 中段 ──
+        //
+        // 居中。如果左右两段都不空，中段可能和它们重叠 —— 那种
+        // 情况下**不画中段**，而不是硬叠上去。重叠的文字比缺失
+        // 的文字更难读。
+        if (len(self.center) > 0) {
+            let cw = winTextWidth(self.center)
+            let cx = self.r.x + (self.r.w - cw) / 2
+            let lEnd = self.r.x + pad + winTextWidth(ls)
+            let rStart = self.r.x + self.r.w - pad - rw
+            if (cx > lEnd + 12 && cx + cw < rStart - 12) {
+                winText(cx, ty, self.center, th.textDim)
+            }
+        }
+    }
+}
+
+// 用分隔符拼接字符串数组。
+//
+// ── 为什么不用 arrJoin ────────────────────────
+//
+// stdlib/array.xle 的 arrJoin 要求元素是能被 toString 的值，而
+// 这里全是 String，直接拼更快也更准（不会给字符串加引号）。
+fn arrJoinStrings(xs: Array, sep: String) -> String {
+    var out = ""
+    var i = 0
+    while i < len(xs) {
+        if (i > 0) { out = out + sep }
+        out = out + toString(xs[i])
+        i = i + 1
+    }
+    return out
+}

@@ -1,0 +1,363 @@
+// str.xle（strTrimEnd / strStarts 等）与 conv.xle（boolToString 等）。
+// 见 tcp_stream.xle 里「每个文件都要写全自己用到的依赖」的说明。
+from "../../str.xle" import strIsEmpty, strIsBlank, strTrimStart, strTrimEnd, strPadLeft, strPadRight, strPadCenter, strDisplayWidth, strPadDisplayRight, strSplitN, strLines, strLineCount, strReplaceN, strFindNth, strCount, strReverse, strFirstLine, strEllipsis, strIsInt, strIsFloat, strChar, strRule, strBasename, strDirname, strExtname, strJoinPath, strTemplate
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+// net/http/header.xle — HTTP 头
+//
+// ── 为什么不能直接用 Array 存头 ─────────────────────
+//
+// 因为 HTTP 头有三个反直觉的性质，用扁平的 ["K","V","K","V"] 数组
+// 全部表达不了：
+//
+// 【1】名不区分大小写，值区分
+//
+//   Content-Type / content-type / CONTENT-TYPE 是同一个头。
+//   但值里的 "UTF-8" 和 "utf-8" 在多数场景等价、在少数场景不等价
+//   （比如 ETag 的 base64）。所以只能对**名**做小写归一化。
+//
+// 【2】同名头可以出现多次
+//
+//   Set-Cookie 必须能重复（一次响应下发多个 cookie）。
+//   Cache-Control 允许重复（`no-cache` + `max-age=0`）。
+//   用一个「名字 → 字符串」的映射会把后面的覆盖掉前面的 ——
+//   表现是「只生效一个 cookie」，而且不报错。
+//
+// 【3】有的头合并不是逗号拼接
+//
+//   Accept、Cache-Control 可以拼成逗号分隔的一个值（RFC 7230 §3.2.2）。
+//   但 Set-Cookie **绝对不能**拼（cookie 值里可能含逗号，如 Expires
+//   的 `Wed, 21 Oct 2015`）—— 拼了之后客户端解析全错。
+//
+// 这个类把这三个性质都如实表达：值存成数组（支持重复），名字做
+// 小写索引（支持大小写无关），并提供 getJoined 这类**显式**的分隔
+// 选择，而不在内部偷偷拼接。
+//
+// ── 为什么不用 Map ─────────────────────────────
+//
+// 因为本语言没有 Map 类型（P0 只有 Array 和 struct/class）。用
+// 「平行数组 + 线性查找」代替：头数量通常在 10~30 之间，线性查找
+// 的成本远低于一次哈希计算 + 桶定位的常数开销。真实服务里一个请求
+// 的头也就这么多，不值得为它引入一个哈希表。
+
+// 头的字段分隔符。RFC 7230 §3.2.4 要求 `:` 后面可以有任意多个空白。
+const HD_COLON = ":"
+
+// 单行的最大长度（字节）。这是 RFC 7230 §3.1.1 建议的 8000。
+//
+// 超过它的行视为畸形，直接拒绝而不是接受 —— 因为「行超长」是
+// 慢速攻击（Slowloris 变种：用无限长的头把服务端内存吃满）的
+// 典型特征。
+const HD_MAX_LINE = 8000
+
+// 一个 HTTP 头集合。
+class Headers {
+    // 头名（已转小写）。与 vals 一一对应。
+    keys: Array,
+
+    // 每个头名对应的值数组。
+    //
+    // ── 为什么是「数组的数组」 ───────────────────
+    //
+    // 见文件头【2】。Set-Cookie 必须能重复，用单个 String 就是把
+    // 后面的 cookie 静默覆盖掉。
+    vals: Array,
+
+    // 首次出现时的原始写法。序列化时用它，让 `Content-Type` 不会
+    // 变成 `content-type`。
+    //
+    // ── 为什么保留原始写法 ───────────────────────
+    //
+    // 因为有些老服务端/中间设备对头名大小写有（错误的）依赖。
+    // 更重要的是：调试时看到自己发的 `Content-Type` 变成小写，
+    // 会让人怀疑是不是哪里改了报文。
+    display: Array,
+
+    constructor() {
+        self.keys    = []
+        self.vals    = []
+        self.display = []
+    }
+
+    // ── 内部：找下标 ────────────────────────────
+    //
+    // ── 为什么不在每次 add 时排序二分 ────────────
+    //
+    // 因为插入顺序有意义（Host 该在前、Content-Length 该在后，便于
+    // 抓包阅读）。排序会打乱它，而头的数量少，线性查找完全够。
+    fn indexOfKey(lowerName: String) -> Int {
+        var i = 0
+        while i < len(self.keys) {
+            let k: String = self.keys[i]
+            if (k == lowerName) { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // ── 写 ────────────────────────────────────
+
+    // 追加一个值（保留已有的同名值）。
+    fn add(name: String, value: String) {
+        let trimmed = strTrim(name)
+        if (len(trimmed) == 0) { return }
+        let key = strLower(trimmed)
+        let at = self.indexOfKey(key)
+        if (at < 0) {
+            arrPush(self.keys, key)
+            arrPush(self.vals, [value])
+            arrPush(self.display, trimmed)
+            return
+        }
+        let bucket: Array = self.vals[at]
+        arrPush(bucket, value)
+    }
+
+    // 设置（覆盖已有的同名值）。
+    fn set(name: String, value: String) {
+        let trimmed = strTrim(name)
+        if (len(trimmed) == 0) { return }
+        let key = strLower(trimmed)
+        let at = self.indexOfKey(key)
+        if (at < 0) {
+            arrPush(self.keys, key)
+            arrPush(self.vals, [value])
+            arrPush(self.display, trimmed)
+            return
+        }
+        self.vals[at] = [value]
+    }
+
+    // 删除一个头（所有同名值）。
+    fn remove(name: String) {
+        let key = strLower(strTrim(name))
+        let at = self.indexOfKey(key)
+        if (at < 0) { return }
+        arrRemoveAt(self.keys, at)
+        arrRemoveAt(self.vals, at)
+        arrRemoveAt(self.display, at)
+    }
+
+    // ── 读 ────────────────────────────────────
+
+    fn has(name: String) -> Bool {
+        return self.indexOfKey(strLower(strTrim(name))) >= 0
+    }
+
+    // 取第一个值。没有时返回 def。
+    //
+    // ── 为什么返回 def 而不是空串 ─────────────────
+    //
+    // 因为「头不存在」和「头的值是空串」是两回事：
+    //   `X-Foo:`     头存在，值为空
+    //   （无 X-Foo）  头不存在
+    // 用空串当默认值就把这两种混成一种了。调用方需要区分时传一个
+    // 标记字符串作 def。
+    fn getOr(name: String, def: String) -> String {
+        let at = self.indexOfKey(strLower(strTrim(name)))
+        if (at < 0) { return def }
+        let bucket: Array = self.vals[at]
+        if (len(bucket) == 0) { return def }
+        let v: String = bucket[0]
+        return v
+    }
+
+    // 取第一个值，没有时返回空串。最常用。
+    fn get(name: String) -> String {
+        return self.getOr(name, "")
+    }
+
+    // 取所有值。返回值是副本，改它不影响内部状态。
+    fn getAll(name: String) -> Array {
+        let at = self.indexOfKey(strLower(strTrim(name)))
+        if (at < 0) { return [] }
+        let bucket: Array = self.vals[at]
+        let out = []
+        var i = 0
+        while i < len(bucket) {
+            arrPush(out, bucket[i])
+            i = i + 1
+        }
+        return out
+    }
+
+    // 取所有值并用逗号拼起来（适用于 Accept / Cache-Control）。
+    //
+    // ── 绝不要用它拼 Set-Cookie ───────────────────
+    //
+    // 见文件头【3】。cookie 的 Expires 属性值是 `Wed, 21 Oct 2015
+    // 07:28:00 GMT`，含逗号。拼起来之后浏览器会把 `21 Oct 2015...`
+    // 当成第二个 cookie 的一部分，结果是 cookie 全部失效 —— 而且
+    // 服务端日志上看不出任何异常。
+    fn getJoined(name: String) -> String {
+        let vals = self.getAll(name)
+        if (len(vals) == 0) { return "" }
+        var out = ""
+        var i = 0
+        while i < len(vals) {
+            if (i > 0) { out = out + ", " }
+            out = out + toString(vals[i])
+            i = i + 1
+        }
+        return out
+    }
+
+    // 有多少个头（按名字算，重复的不另计）。
+    fn count() -> Int {
+        return len(self.keys)
+    }
+
+    // 按出现顺序列出所有名字（小写）。
+    fn names() -> Array {
+        let out = []
+        var i = 0
+        while i < len(self.keys) {
+            arrPush(out, self.keys[i])
+            i = i + 1
+        }
+        return out
+    }
+
+    // ── 解析与序列化 ───────────────────────────
+
+    // 从多行文本解析。
+    //
+    // 输入是「已经剥掉起始行和空行」的那个块：每行 `Name: Value`。
+    // 行尾的 \r 本方法容错处理。
+    // 写盘 < 0 的返回：见 parseLines 的说明。
+    static fn parseLines(lines: Array) -> Headers {
+        let h = new Headers()
+        var i = 0
+        let n = len(lines)
+        while i < n {
+            let raw: String = lines[i]
+            let line = strTrimEnd(raw)
+            if (len(line) == 0) {
+                i = i + 1
+                continue
+            }
+
+            // ── 折行（obs-fold）──────────────────────
+            //
+            // RFC 7230 §3.2.4 废弃了「以空白开头的续行」，但真实世界
+            // 里还有老代理会发。它的语义是「接上一行」。
+            //
+            // 不处理的话，这一行会被当成一个没有冒号的畸形头，然后
+            // 被静默丢弃 —— 于是 Set-Cookie 被截断成一半，或者
+            // 一个长 Referer 只保留了第一段。
+            if (strStarts(line, " ") || strStarts(line, "\t")) {
+                let lastAt = len(h.keys) - 1
+                if (lastAt >= 0) {
+                    let bucket: Array = h.vals[lastAt]
+                    if (len(bucket) > 0) {
+                        let last: String = bucket[len(bucket) - 1]
+                        bucket[len(bucket) - 1] = last + " " + strTrim(line)
+                    }
+                }
+                i = i + 1
+                continue
+            }
+
+            let at = strFind(line, HD_COLON)
+            if (at <= 0) {
+                // 没有冒号、或冒号在开头：畸形行。跳过而不是报错 ——
+                // 一个畸形头不应该让整个请求失败（这是 Web 的宽容传统）。
+                i = i + 1
+                continue
+            }
+            let name  = strTrim(strSub(line, 0, at))
+            let value = strTrim(strSub(line, at + 1, len(line)))
+            h.add(name, value)
+            i = i + 1
+        }
+        return h
+    }
+
+    // 序列化成行数组（每条值独占一行，行尾带 \r\n）。
+    //
+    // ── 为什么每条值独占一行 ─────────────────────
+    //
+    // 因为这是唯一能同时正确表达 Set-Cookie 和普通头的方式。
+    // 合并同名值（`A: 1, 2`）对普通头合规，对 Set-Cookie 是错的。
+    // 全部拆行对普通头也合规（RFC 允许），所以选「全部拆行」这个
+    // 在两种情况下都正确的做法。
+    fn toLines() -> Array {
+        let out = []
+        var i = 0
+        while i < len(self.keys) {
+            let bucket: Array = self.vals[i]
+            let name: String = self.display[i]
+            var j = 0
+            while j < len(bucket) {
+                let v: String = bucket[j]
+                arrPush(out, name + ": " + v + "\r\n")
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    fn toText() -> String {
+        let lines = self.toLines()
+        var out = ""
+        var i = 0
+        while i < len(lines) {
+            out = out + toString(lines[i])
+            i = i + 1
+        }
+        return out
+    }
+
+    fn copy() -> Headers {
+        let h = new Headers()
+        var i = 0
+        while i < len(self.keys) {
+            arrPush(h.keys, self.keys[i])
+            arrPush(h.display, self.display[i])
+            let bucket: Array = self.vals[i]
+            let cp = []
+            var j = 0
+            while j < len(bucket) {
+                arrPush(cp, bucket[j])
+                j = j + 1
+            }
+            arrPush(h.vals, cp)
+            i = i + 1
+        }
+        return h
+    }
+
+    fn describe() -> String {
+        var out = "Headers(" + toString(self.count()) + ")"
+        var i = 0
+        while i < len(self.keys) {
+            let bucket: Array = self.vals[i]
+            let name: String = self.display[i]
+            var j = 0
+            while j < len(bucket) {
+                out = out + "\n  " + name + ": " + toString(bucket[j])
+                j = j + 1
+            }
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// 按下标原地删除一个元素。
+//
+// ── 为什么需要它（arrRemoveAt 是内建吗）───────
+//
+// 内建有 arrRemove（按值删除），但没有「按下标删除」。按值删除在
+// 头名场景下不能用：如果两个位置的字符串恰好相同（比如两个空值），
+// arrRemove 会把不该删的也删掉。按下标删才能精确。
+fn arrRemoveAt(xs: Array, at: Int) {
+    if (at < 0 || at >= len(xs)) { return }
+    var i = at
+    let n = len(xs)
+    while i < n - 1 {
+        xs[i] = xs[i + 1]
+        i = i + 1
+    }
+    arrPop(xs)
+}

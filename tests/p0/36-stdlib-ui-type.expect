@@ -1,0 +1,70 @@
+210
+80
+12000
+110
+50
+false
+true
+true
+true
+false
+false
+Rect { x: 15, y: 25, w: 190, h: 50 }
+Rect { x: 13, y: 24, w: 200, h: 60 }
+Rect { x: 18, y: 28, w: 184, h: 44 }
+Rect { x: 10, y: 20, w: 200, h: 20 }
+Rect { x: 10, y: 64, w: 200, h: 16 }
+Rect { x: 10, y: 86, w: 200, h: 10 }
+Rect { x: 10, y: 20, w: 60, h: 60 }
+Rect { x: 70, y: 20, w: 140, h: 60 }
+true
+3900150
+2450411
+true
+true
+16711680
+true
+true
+确定
+0
+true
+false
+1
+2
+3
+居中
+0
+1
+设置
+0.5
+false
+true
+Rect { x: 20, y: 40, w: 300, h: 32 }
+80
+36
+false
+false
+false
+true
+false
+false
+false
+false
+false
+true
+false
+false
+false
+0.0
+0.5
+1.0
+0.0
+1.0
+0
+50
+100
+0
+100
+0.0
+Rect { x: 0, y: -4, w: 101, h: 20 }
+ui-type ok

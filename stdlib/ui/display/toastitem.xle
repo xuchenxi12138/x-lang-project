@@ -1,0 +1,83 @@
+// ui/display/toastitem.xle — 一条轻提示的数据
+//
+// ── Toast 与 Modal 的分工 ─────────────────────────
+//
+//   Modal —— 「必须由你决定」的事，挡住一切，等回应
+//   Toast —— 「告诉你一声」的事，不打扰，自己消失
+//
+// 所以 Toast 的三条硬性要求：
+//
+//   1. 不遮挡正在操作的东西（放屏幕底部或顶部，不放中间）
+//   2. 不拦截点击（否则它就从「提示」变成「障碍」）
+//   3. 自动消失（否则用户要手动关，而它本来就不重要）
+//
+// ── 为什么条目和管理器分两个文件 ─────────────────
+//
+//   toastitem.xle —— 本文件，一条提示的数据 + 自己怎么画
+//   toast.xle     —— 队列管理、位置计算、生命周期
+//
+// 拆开的直接好处：想改一条提示长什么样时，只看得到这一条提示
+// 的字段，不用在队列逻辑里翻。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// Toast 类型。不同图标 + 不同强调色。
+const TOAST_INFO    = 0
+const TOAST_SUCCESS = 1
+const TOAST_WARN    = 2
+const TOAST_ERROR   = 3
+
+// 每条 Toast 的高度。
+const TOAST_H = 44
+
+// 最多同时显示几条。再多就是噪音，而人一次也只能看 2~3 条。
+const TOAST_MAX = 3
+
+// 默认显示时长（秒）。
+const TOAST_DUR = 3.0
+
+class ToastItem {
+    text: String,
+    kind: Int,
+
+    // 剩余显示时间（秒）。递减到 0 就移除。
+    remain: Float,
+
+    // 进入动画进度 0.0~1.0。用于淡入 / 上滑。
+    enter: Float,
+
+    constructor(text: String, kind: Int) {
+        self.text  = text
+        self.kind  = kind
+        self.remain = TOAST_DUR
+        self.enter = 0.0
+    }
+
+    fn accentColor(th: Theme) -> Int {
+        if (self.kind == TOAST_SUCCESS) { return th.ok }
+        if (self.kind == TOAST_WARN) { return th.warn }
+        if (self.kind == TOAST_ERROR) { return th.err }
+        return th.accent
+    }
+
+    // 图标字符。用字符而不是绘制形状，因为这里只需要一个
+    // 极小的符号，而自绘每个图标（对勾、感叹号、叉）要几十行。
+    //
+    // ── 字体里有这些字符吗 ────────────────────
+    //
+    // 用 ASCII 的 "i"、"v"、"!"、"x"，全都一定存在。虽然不如
+    // Unicode 符号好看，但「一定画得出来」比「可能更好看」重要。
+    fn icon() -> String {
+        if (self.kind == TOAST_SUCCESS) { return "v" }
+        if (self.kind == TOAST_WARN) { return "!" }
+        if (self.kind == TOAST_ERROR) { return "x" }
+        return "i"
+    }
+}
+
+// ── Toast 管理器 ─────────────────────────────────

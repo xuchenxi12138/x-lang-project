@@ -1,0 +1,13 @@
+[package]
+name = "pkgtest"
+version = "0.1.0"
+entry = "src/main.xle"
+
+[dependencies]
+# 相对路径依赖。这条声明加上下面 main.xle 里的 `import @mathutil`，
+# 就是「包管理成立」的全部证据：
+#
+#   声明（这里） → 引用（main.xle） → 解析（编译时按清单找文件）
+#
+# 少了任何一环，包管理就退化成「又一个 import 写法」。
+mathutil = { path = "../mathutil" }

@@ -1,0 +1,100 @@
+// 39-visibility.xle — 访问修饰符：private / protected / public
+//
+// 这组测试要证明的是「封装是真的」：
+//
+//   1. 字段的 private / protected 编译期就被拒
+//   2. 方法的 private 也编译期就被拒 —— 这一条曾经完全没生效
+//      （ClassMethod.vis 解析了、存了，调用点一次都没查）
+//   3. protected 在子类里可访问，在「无关的类」里不可访问
+//   4. 覆写不能收窄可见性（父类 public → 子类 private 是错的）
+//   5. 静态方法同样受可见性约束（它不进虚表，判据走 AST）
+//
+// ── 为什么这条测试同时要有正例和负例 ─────────────────────────
+//
+// 只测「能访问」会漏掉「检查根本没生效」；只测「不能访问」会漏掉
+// 「把一切都拒了」。两个方向都要有，中间那些合法的调用才被真正
+// 验证过。
+//
+// 负例不能写在这个文件里（编译失败会让整个文件跑不起来），
+// 它们由 run_tests.sh 单独用 should-fail 用例驱动。
+
+// ============================================================
+// 1. private 字段：只有本类能碰
+// ============================================================
+
+class Vault {
+    private secret: Int,
+    protected inherited: Int,
+    public label: String,
+
+    constructor(s: Int) {
+        self.secret = s
+        self.inherited = s * 2
+        self.label = "vault"
+    }
+
+    // 类内读自己的 private —— 必须允许
+    fn peek() -> Int {
+        return self.secret
+    }
+
+    // 类内读写自己的 protected —— 必须允许
+    fn bump() {
+        self.inherited = self.inherited + 1
+    }
+
+    // private 方法：类内调用必须允许
+    private fn internalHelper() -> Int {
+        return self.secret * 10
+    }
+
+    fn useHelper() -> Int {
+        return self.internalHelper()
+    }
+}
+
+class SubVault extends Vault {
+    // 子类必须自己声明构造函数：构造函数不进虚表、不被继承
+    // （`new SubVault(...)` 里的类名是写死的，没有派发的必要）。
+    constructor(s: Int) {
+        // `secret` 是 private 的 —— 连子类都不能碰，所以这里只能
+        // 通过父类的公开入口来间接设置它。
+        self.inherited = s * 2
+        self.label = "sub"
+    }
+
+    // 子类读父类 protected —— 必须允许
+    fn readParentProtected() -> Int {
+        return self.inherited
+    }
+
+    // 子类写父类 protected —— 必须允许
+    fn writeParentProtected(v: Int) {
+        self.inherited = v
+    }
+}
+
+fn main() {
+    let v = new Vault(7)
+    println(toString(v.peek()))
+    println(toString(v.peek()))
+
+    v.bump()
+    println(toString(v.peek()))
+
+    // public 字段谁都能读写
+    println(v.label)
+    v.label = "renamed"
+    println(v.label)
+
+    // 类内调 private 方法合法
+    println(toString(v.useHelper()))
+
+    // 子类访问父类 protected
+    let s = new SubVault(3)
+    println(toString(s.readParentProtected()))
+    s.writeParentProtected(100)
+    println(toString(s.readParentProtected()))
+
+    println("-- 封装有效 --")
+}

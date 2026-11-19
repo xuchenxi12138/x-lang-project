@@ -1,0 +1,25 @@
+-- 扫描 --
+class count: 7
+bean: GreetService
+beans found: 1
+by name  : false
+by inst  : false
+name==inst: true
+greet anno: [/greet]
+methods   : [[speak, public]]
+fields    : [[n, Int, public, false]]
+-- 实例化 --
+made: GreetService
+greet via fieldGet: hello, ann
+pair: 7
+-- 分派 --
+animal: ...
+dog   : woof
+cat   : meow
+zoo[0]: ...
+zoo[1]: woof
+zoo[2]: meow
+calc: 15
+-- 组装 --
+route: /greet -> hello, world
+done

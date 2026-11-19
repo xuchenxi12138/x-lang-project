@@ -1,0 +1,117 @@
+// ============================================================
+// std.math —— 矩阵、统计、数论
+// ============================================================
+//
+// 矩阵用「扁平一维数组 + 行列数」表示：rows × cols 的元素 (r,c)
+// 在下标 r*cols + c（行优先）。
+//
+// 每个函数显式收 rows/cols，不打包成矩阵对象：语言没有结构体，
+// 任何打包都会退化成数组里塞 [rows, cols, data]，于是每次取
+// 行列数都要 toInt(m[0])，既慢又容易错位。
+
+from std.math import matZeros, matOnes, matEye, matFromRows, matGet, matSet, matAdd, matSub, matMulElem, matScale, matAddScalar, matMul, matTranspose, matSum, matMean, matMin, matMax, matArgMin, matArgMax, matRowSums, matColSums, arrayMean, variance, popVariance, stddev, popStddev, median, lerp, normalize, fact, comb, gcd, lcm, isPrime, nearly, epsDefault
+
+fn main() -> Void {
+    println("---- 构造 ----")
+    println(matZeros(2, 3))          // [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    println(matOnes(2, 2))           // [1.0, 1.0, 1.0, 1.0]
+    println(matEye(3, 3))            // [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    // 非方阵单位阵：取 min(rows,cols) 个 1
+    println(matEye(2, 3))            // [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+    println("---- 访问 ----")
+    // 2×3 = [[1,2,3],[4,5,6]]
+    let a = matZeros(2, 3)
+    matSet(a, 3, 0, 0, 1.0)
+    matSet(a, 3, 0, 1, 2.0)
+    matSet(a, 3, 0, 2, 3.0)
+    matSet(a, 3, 1, 0, 4.0)
+    matSet(a, 3, 1, 1, 5.0)
+    matSet(a, 3, 1, 2, 6.0)
+    println(a)                       // [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    println(matGet(a, 3, 0, 1))      // 2.0
+    println(matGet(a, 3, 1, 2))      // 6.0
+
+    println("---- 逐元素 ----")
+    println(matAdd(a, a))            // [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
+    println(matSub(a, a))            // [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    println(matMulElem(a, a))        // [1.0, 4.0, 9.0, 16.0, 25.0, 36.0]
+    println(matScale(a, 2.0))        // [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
+    println(matAddScalar(a, 10.0))   // [11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
+
+    println("---- 矩阵乘法 ----")
+    // 3×2 = [[7,8],[9,10],[11,12]]
+    let b = matZeros(3, 2)
+    matSet(b, 2, 0, 0, 7.0)
+    matSet(b, 2, 0, 1, 8.0)
+    matSet(b, 2, 1, 0, 9.0)
+    matSet(b, 2, 1, 1, 10.0)
+    matSet(b, 2, 2, 0, 11.0)
+    matSet(b, 2, 2, 1, 12.0)
+    // 2×3 · 3×2 = 2×2
+    // [1,2,3]·[7,9,11] = 1*7+2*9+3*11 = 58
+    // [1,2,3]·[8,10,12] = 8+20+36 = 64
+    // [4,5,6]·[7,9,11] = 28+45+66 = 139
+    // [4,5,6]·[8,10,12] = 32+50+72 = 154
+    println(matMul(a, 2, 3, b, 2))   // [58.0, 64.0, 139.0, 154.0]
+
+    // 乘以单位阵不变
+    let i3 = matEye(3, 3)
+    println(matMul(a, 2, 3, i3, 3))  // [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+    println("---- 转置 ----")
+    // 2×3 → 3×2
+    println(matTranspose(a, 2, 3))   // [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+
+    println("---- 归约 ----")
+    println(matSum(a))               // 21.0
+    println(matMean(a))              // 3.5
+    println(matMin(a))               // 1.0
+    println(matMax(a))               // 6.0
+    println(matArgMin(a))            // 0
+    println(matArgMax(a))            // 5
+    println(matRowSums(a, 2, 3))     // [6.0, 15.0]
+    println(matColSums(a, 2, 3))     // [5.0, 7.0, 9.0]
+
+    println("---- 统计 ----")
+    // 经典样本 [2,4,4,4,5]：均值 3.8
+    // 样本方差(分母 n-1) = 1.2，总体方差(分母 n) = 0.96
+    let xs = array(5, 0.0)
+    xs[0] = 2.0
+    xs[1] = 4.0
+    xs[2] = 4.0
+    xs[3] = 4.0
+    xs[4] = 5.0
+    println(arrayMean(xs))           // 3.8
+    println(variance(xs))            // 1.2
+    println(popVariance(xs))         // 0.96
+    println(stddev(xs))              // 1.0954451150103321
+    println(median(xs))              // 4.0
+
+    println("---- 数值工具 ----")
+    println(lerp(10.0, 20.0, 0.25))  // 12.5
+    // t 超出 [0,1] 会被钳制，调用方不用自己夹
+    println(lerp(10.0, 20.0, 5.0))   // 20.0
+    println(lerp(10.0, 20.0, -3.0))  // 10.0
+    println(normalize(5.0, 0.0, 10.0))   // 0.5
+    // 区间退化时返回 0 而不是 NaN（NaN 会污染后续计算）
+    println(normalize(5.0, 3.0, 3.0))    // 0.0
+
+    println("---- 数论 ----")
+    println(fact(5))                 // 120.0
+    println(fact(0))                 // 1.0
+    // C(52,5) 是德州扑克的起手组合数
+    println(comb(52, 5))             // 2598960.0
+    println(comb(5, 0))              // 1.0
+    println(gcd(48, 18))             // 6
+    println(gcd(-48, 18))            // 6（结果恒非负）
+    println(lcm(4, 6))               // 12
+    println(isPrime(97))             // true
+    println(isPrime(100))            // false
+
+    println("---- 浮点比较 ----")
+    // 0.1 + 0.2 != 0.3，必须用容差
+    println(0.1 + 0.2 == 0.3)                    // false
+    println(nearly(0.1 + 0.2, 0.3, 1.0e-9))      // true
+    println(nearly(1.0, 1.1, 1.0e-9))            // false
+}

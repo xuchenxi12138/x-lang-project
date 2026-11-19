@@ -1,0 +1,361 @@
+// net/core/tcp_stream.xle — 一个 TCP 连接
+//
+// ── 这个文件为什么必须存在（它包住的那层坑） ─────────────
+//
+// 语言暴露了六个网络内建：netListen / netAccept / netRecv /
+// netSend / netClose / netConnect，外加 netPort / netPeer /
+// netError / netPending 四个辅助。看起来够用，但有三个语义陷阱
+// 是每个调用方都会踩一遍的：
+//
+// 【坑 1】所有 socket 都是非阻塞的（platform.c 里 set_nonblock）
+//
+//   所以 netRecv 立即返回，没数据就给空串。想「等到有数据」必须
+//   自己 sleep + 重试。直接 `let s = netRecv(fd)` 的代码在局域网上
+//   看起来能跑（数据通常已经到了），一上公网就全是空串。
+//
+// 【坑 2】netRecv 返回空串有两种截然不同的含义
+//
+//   ""  = 没有数据（EAGAIN）
+//   ""  = 对端已关闭（recv 返回 0）
+//
+//   这两个在 netRecv 里**无法区分**。要区分必须调 netPending(fd)
+//   （平台层用 MSG_PEEK 探一个字节）。不知道这一点的话，服务端
+//   会把死连接永远留在句柄表里，跑到几千连接后耗尽句柄。
+//
+// 【坑 3】send 可能只发出去一部分
+//
+//   TCP 是流协议，内核发送缓冲区满了 send 就只发一部分并返回实际
+//   字节数。返回 Bool 让人以为「要么全发要么全没发」，而「8000
+//   字节里发出 4096」是正常情况。要发完必须循环。
+//
+// 本文件就是这三个陷阱的封装。
+
+// 本文件用到了 bbFromUtf8 / bbToWire / bbSlice / bbToText / bbConcat。
+//
+// ── 为什么每个文件都要自己 import 一遍 ─────────────
+//
+// 因为 import 是「文本合并」，不是「模块导出」。tcp_listener.xle
+// import 了 bytes.xle，只代表 tcp_listener.xle 自己能看到那些函数
+// —— 合并顺序是「先递归展开被 import 的文件」，字节码里它们确实在
+// 同一个命名空间，但**符号可见性按文件算**。
+//
+// 拆文件的代价就是每个文件都要写全自己用到的依赖。好处是删掉某个
+// 文件时不会有「别人靠我间接引的函数」这种隐式耦合。
+from "../../db/codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+
+// 轮询间隔（毫秒）。太小空转烧 CPU，太大让每次往返都多等一截。
+//
+// 5ms 的选择：一个 HTTP 请求的「发请求 + 等首字节 + 读完」是三次
+// 轮询，5ms 粒度下最坏多付 15ms —— 相对一次局域网往返（<1ms）确实
+// 明显，但相对用户体验预算（几百毫秒）可以忽略。DB 层 socket.xle
+// 用了同样的 5ms，两个文件保持一致。
+const TS_POLL_MS = 5
+
+// 默认等待预算（毫秒）。
+//
+// 3 秒覆盖「服务端在算一个慢查询」或「公网抖动两下」，同时不至于
+// 让断线的连接把调用方卡到用户以为程序死了。
+const TS_DEFAULT_WAIT_MS = 3000
+
+class TcpStream {
+    // 底层句柄。-1 表示已关闭。
+    //
+    // ── 为什么用 Int 而不是包装成一个句柄类型 ──────────
+    //
+    // 语言没有独立的不透明句柄类型，内建就是收发 Int。包装的成本
+    // 在于「每次调内建都要拆包」，收益在于「不同句柄类型不会混用」
+    // —— 而那个收益由 TcpListener / TcpStream 两个类的存在已经拿到了：
+    // 监听器句柄存在 TcpListener.fd 里，连接句柄存在 TcpStream.fd 里，
+    // 想把监听器传给 recv 必须写 `stream.fd` 而那时类型已经不对了。
+    fd: Int,
+
+    // 对端地址（"host:port"）。连接成功后由 netPeer 填，失败时保留
+    // 调用方给的目标地址 —— 诊断「我本来想连哪里」比「连上了哪里」
+    // 在失败场景下更有用。
+    peer: String,
+
+    // 最近一次错误。空串表示没有错误。
+    //
+    // ── 为什么错误放字段而不是全用返回元组 ────────────
+    //
+    // 因为「事后想看为什么失败」这个需求很常见，而把 error 塞进
+    // 每个返回值会让正常路径的代码全是 `let r = ...; let v = r[1]`。
+    // 折中：操作成功的路径只看主体返回值，出问题再看 lastError。
+    lastError: String,
+
+    constructor(fd: Int, peer: String) {
+        self.fd        = fd
+        self.peer      = peer
+        self.lastError = ""
+    }
+
+    // ── 建立连接 ──────────────────────────────────
+
+    // 主动连接。返回 [ok, TcpStream, error]。
+    //
+    // ── 为什么返回元组而不是 null ───────────────────
+    //
+    // 语言没有可空类型。声明 `-> TcpStream` 却返回 null 会报警告，
+    // 而调用方每次都判 null 会让类型推断失效。返回 [ok, stream]
+    // 让编译器全程知道 flow 是 TcpStream。
+    //
+    // ── 失败时第二个分量是什么 ─────────────────────
+    //
+    // 是一个 fd = -1 的占位 stream。这带来一个隐患：调用方忘了看
+    // ok 就会拿到占位对象继续用。所以占位对象的所有方法都先判
+    // isOpen() 并立即失败 —— 两道防线，漏一道也不会静默出错。
+    static fn connect(host: String, port: Int) -> Array {
+        let fd = netConnect(host, port)
+        let label = host + ":" + toString(port)
+        if (fd < 0) {
+            let why = netError()
+            var msg = "连接 " + label + " 失败"
+            if (len(why) > 0) { msg = msg + "：" + why }
+            msg = msg + "（主机不可达 / 端口未监听 / DNS 解析失败 / 防火墙拦截）"
+            let dead = new TcpStream(0 - 1, label)
+            dead.lastError = msg
+            return [false, dead, msg]
+        }
+        // 连上之后用 netPeer 读回真实对端地址（主机名可能被解析成 IP，
+        // 端口一般不变，但读回来能让日志里的地址和实际一致的）。
+        let perr = netPeer(fd)
+        var peerLabel = label
+        if (len(perr) > 0) { peerLabel = perr }
+        return [true, new TcpStream(fd, peerLabel), ""]
+    }
+
+    // ── 状态 ──────────────────────────────────────
+
+    fn isOpen() -> Bool {
+        return self.fd >= 0
+    }
+
+    // 对端是否还活着。
+    //
+    // ── 这个方法和「有没有数据」无关 ─────────────────
+    //
+    // netPending 用的是 MSG_PEEK：看一眼但不取走。所以「活着且没数据」
+    // 返回 true，「对端有序关闭」返回 false。这正是服务端清理死连接
+    // 需要的信号，也是区分坑 2 的唯一手段。
+    fn alive() -> Bool {
+        if (self.fd < 0) { return false }
+        return netPending(self.fd)
+    }
+
+    fn describe() -> String {
+        var s = "closed"
+        if (self.isOpen()) { s = "open" }
+        return "TcpStream " + self.peer + " [" + s + "]"
+    }
+
+    // ── 发送 ──────────────────────────────────────
+
+    // 单次尝试发送，返回实际发出的字节数。不循环、不等待。
+    //
+    // 保留这个方法是因为有些场景（心跳、流式推送）宁可丢一部分也要
+    // 立即返回，不能被 waitMs 卡住。
+    fn sendOnce(bytes: Array) -> Int {
+        if (self.fd < 0) {
+            self.lastError = "连接已关闭，无法发送"
+            return 0
+        }
+        if (len(bytes) == 0) { return 0 }
+        let n = netSend(self.fd, bbToWire(bytes))
+        if (n < 0) {
+            let why = netError()
+            self.lastError = "发送失败"
+            if (len(why) > 0) { self.lastError = self.lastError + "：" + why }
+            return 0
+        }
+        return n
+    }
+
+    // 循环发送直到全部发出。返回 [ok, 已发字节数, error]。
+    //
+    // ── 为什么必须循环（坑 3 的正解） ─────────────────
+    //
+    // 非阻塞 socket 的发送缓冲区是有限的（Windows 默认 8KB 起）。
+    // 发一个 1MB 的响应，第一轮 send 只吃掉 8KB 是常态。不循环的
+    // 实现会「成功发送」8KB 然后静默截断 —— 客户端拿到残缺的 body，
+    // 报的是「JSON 解析失败」这类看起来毫无关系的问题。
+    fn sendAll(bytes: Array, waitMs: Int) -> Array {
+        if (self.fd < 0) {
+            self.lastError = "连接已关闭，无法发送"
+            return [false, 0, self.lastError]
+        }
+        let total = len(bytes)
+        if (total == 0) { return [true, 0, ""] }
+
+        // ── 发送前先探一次对端是否还在 ──────────────
+        //
+        // 这一探的价值有限但必要：它只覆盖「发送前**已经知道**对方
+        // 关了」这一种情况。发送过程中对方关掉的话，send 仍会成功
+        // —— 因为「send 成功」在 TCP 里的准确含义是「数据已交给本机
+        // 内核」，不是「对方收到了」。这是 TCP 的固有性质，任何封装
+        // 都无法改变。要确认对方收到只能靠应用层 ACK。
+        //
+        // 实测（本文件 _t.xle 第 9 项）：对端 close 后立刻 sendText
+        // 仍然 ok=true。这不是 bug，是 TCP。加这一探之后，至少
+        // 「已知关闭」的场景会明确失败，而不是让调用方以为发出去了。
+        if (!self.alive()) {
+            self.close()
+            self.lastError = "发送失败：对端已关闭连接（发送前探测到 FIN）"
+            return [false, 0, self.lastError]
+        }
+
+        var sent  = 0
+        var spent = 0
+        while sent < total {
+            let n = self.sendOnce(bbSlice(bytes, sent, total))
+            if (n > 0) {
+                sent = sent + n
+                spent = 0          // 有进展就重置预算，避免大包被误判超时
+                continue
+            }
+            // 一次都没发出去：可能是缓冲区满（正常），也可能是对端断了。
+            if (!self.alive()) {
+                self.close()
+                self.lastError = "发送中断：对端已关闭连接（已发 " +
+                                 toString(sent) + "/" + toString(total) + " 字节）"
+                return [false, sent, self.lastError]
+            }
+            if (spent >= waitMs) {
+                self.lastError = "发送超时：等待 " + toString(waitMs) +
+                                 "ms 后仍只发出 " + toString(sent) +
+                                 "/" + toString(total) + " 字节"
+                return [false, sent, self.lastError]
+            }
+            sleep(TS_POLL_MS)
+            spent = spent + TS_POLL_MS
+        }
+        return [true, sent, ""]
+    }
+
+    // 发送文本（按 UTF-8 编码）。返回 [ok, 已发字节数, error]。
+    //
+    // ── 为什么 sendText 走 bbFromUtf8 而不是 netSend(fd, s) ────
+    //
+    // netSend 接受 String 时直接把 String 的内部字节发出去，那本身
+    // 是对的。但这里必须先过一遍字节数组，原因是要和 sendAll 的
+    // 部分发送循环共用同一条路径 —— 如果 sendText 直连 netSend，
+    // 中文长文本就会绕过循环，被静默截断。
+    fn sendText(s: String) -> Array {
+        return self.sendAll(bbFromUtf8(s), TS_DEFAULT_WAIT_MS)
+    }
+
+    fn sendTextWithin(s: String, waitMs: Int) -> Array {
+        return self.sendAll(bbFromUtf8(s), waitMs)
+    }
+
+    // ── 接收 ──────────────────────────────────────
+
+    // 单次尝试接收。返回 [hasData, bytes]。
+    //
+    // 不等待。没数据立刻给 [false, []]。区分「没数据」和「已关闭」
+    // 要靠 alive()。
+    fn recvOnce() -> Array {
+        if (self.fd < 0) { return [false, []] }
+        let raw = netRecv(self.fd)
+        // 空串既表示「暂无数据」也表示「对端关闭」，见文件头坑 2。
+        if (len(raw) == 0) { return [false, []] }
+        // strBytes 按字节原样取，不做编码转换。收到的可能是任意二进制
+        // （HTTP body 的 gzip、WebSocket 帧），逐字节取出才安全。
+        return [true, strBytes(raw)]
+    }
+
+    // 等待并接收一批数据。返回 [ok, bytes, error]。
+    //
+    // ── 为什么「返回一批」而不是「读满 N 字节」 ──────────
+    //
+    // 读满 N 字节是协议层的事（HTTP 要读 Content-Length，TLS 要读
+    // 完整记录）。放在这里会把「怎么算一个包」的协议知识下沉到
+    // 传输层，而传输层不该知道任何协议。所以这里只回答「这一轮
+    // 拿到了什么」，包边界由上层拼。
+    fn recvWithin(waitMs: Int) -> Array {
+        if (self.fd < 0) {
+            self.lastError = "连接已关闭，无法接收"
+            return [false, [], self.lastError]
+        }
+        var spent = 0
+        while true {
+            let r = self.recvOnce()
+            if (r[0] == true) { return [true, r[1], ""] }
+
+            // 没数据。先看连接是不是还在 —— 这是坑 2 的正解。
+            if (!self.alive()) {
+                self.close()
+                self.lastError = "对端已关闭连接"
+                return [false, [], self.lastError]
+            }
+            if (spent >= waitMs) {
+                self.lastError = "接收超时：等待 " + toString(waitMs) +
+                                 "ms 内没有收到数据"
+                return [false, [], self.lastError]
+            }
+            sleep(TS_POLL_MS)
+            spent = spent + TS_POLL_MS
+        }
+        // 不可达：while true 只能靠 return 退出。
+        return [false, [], "不可达"]
+    }
+
+    fn recv() -> Array {
+        return self.recvWithin(TS_DEFAULT_WAIT_MS)
+    }
+
+    // 接收并转文本。返回 [ok, text, error]。
+    //
+    // 只用于 HTTP 这类本来就是文本的协议。二进制 body 请用 recvWithin。
+    fn recvTextWithin(waitMs: Int) -> Array {
+        let r = self.recvWithin(waitMs)
+        if (r[0] != true) { return [false, "", r[2]] }
+        let bytes: Array = r[1]
+        return [true, bbToText(bytes), ""]
+    }
+
+    fn recvText() -> Array {
+        return self.recvTextWithin(TS_DEFAULT_WAIT_MS)
+    }
+
+    // 把可读数据全部读干（直到某一轮没拿到）。
+    //
+    // ── 为什么需要这个「读干」而不是一直 recvWithin ────────
+    //
+    // 因为 recvWithin 一次只返回内核当前能给的那么多。响应体可能有
+    // 几十 KB，内核一次只给 64KB 上限内的一部分。要拿全必须反复读，
+    // 而「读到什么时候算完」对 HTTP 是 Content-Length、对 WebSocket
+    // 是帧长 —— 这里只提供「尽可能读干」的原子操作，让上层循环判断。
+    //
+    // 返回 [ok, bytes, error]。**注意**：ok=true 不代表读完了，只代表
+    // 「至少读到了一批且连接还活着」。
+    fn drain(waitMs: Int) -> Array {
+        let first = self.recvWithin(waitMs)
+        if (first[0] != true) { return first }
+        var acc: Array = first[1]
+        var spent = 0
+        while spent < waitMs {
+            let more = self.recvOnce()
+            if (more[0] != true) { break }
+            acc = bbConcat(acc, more[1])
+            spent = 0
+        }
+        return [true, acc, ""]
+    }
+
+    // ── 关闭 ──────────────────────────────────────
+
+    // 关闭连接。
+    //
+    // ── 为什么没有 shutdown(half) ───────────────────
+    //
+    // 半关闭（写完还继续读，HTTP/1.0 的 keep-alive 需要）在语言层
+    // 没有对应内建，plat_tcp_close 直接 close 并且不处理 TIME_WAIT。
+    // 硬要模拟就是「关掉重开一个新连接」—— 那不是半关闭，是实现
+    // 欺骗。所以这一层不提供，需要时由上层改成短连接。
+    fn close() {
+        if (self.fd >= 0) {
+            netClose(self.fd)
+            self.fd = 0 - 1
+        }
+    }
+}

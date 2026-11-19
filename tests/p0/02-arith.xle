@@ -1,0 +1,44 @@
+// 02-arith.x — 算术、变量、类型提升
+//
+// 验证点：
+//   1. let / var 声明与赋值
+//   2. Int 与 Float 的区分（3 与 3.0 要打印成不同样子）
+//   3. 整数除法截断向零
+//   4. Int 与 Float 混算时提升到 Float
+//   5. 位运算
+
+println("=== 整数 ===")
+let a = 17
+let b = 5
+println(a + b)
+println(a - b)
+println(a * b)
+println(a / b)      // 整数除法，应为 3
+println(a % b)      // 应为 2
+println(-a)         // 应为 -17
+
+println("=== 浮点 ===")
+let x = 17.0
+let y = 5.0
+println(x + y)      // 22.0
+println(x / y)      // 3.4
+println(x)
+
+println("=== 混合提升 ===")
+println(a + y)      // 22.0（Int 提升为 Float）
+println(a / y)      // 3.4，不是 3
+
+println("=== 位运算 ===")
+println(a & b)      // 17 & 5 = 1
+println(a | b)      // 17 | 5 = 21
+println(a ^ b)      // 17 ^ 5 = 20
+println(a << 2)     // 68
+println(a >> 2)     // 4
+println(~0)         // -1
+
+println("=== 复合赋值 ===")
+var n = 10
+n += 5
+println(n)          // 15
+n *= 2
+println(n)          // 30

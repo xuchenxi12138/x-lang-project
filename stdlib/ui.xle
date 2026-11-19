@@ -1,0 +1,2787 @@
+// ============================================================
+// std.ui —— 图形界面组件库
+// ============================================================
+//
+// ── 这一层是什么，不是什么 ──────────────────────────────────
+//
+// 底层只有 17 个 win* 原语（开窗、画矩形、画文字、轮询点击……）。
+// 用它们做界面时，代码会迅速退化成几百行「算坐标 + 填颜色 + 判命中」
+// 的重复劳动，而每写一个新窗口就要重来一遍。
+//
+// 这一层把这些重复劳动收成一组**即时模式控件**：
+//
+//   uiButton(...)   画一个按钮，并返回「这一帧被点了吗」
+//   uiSlider(...)   画一个滑条，返回当前值
+//   uiCheck(...)    画一个勾选框，返回当前是否勾上
+//   uiList(...)     画一个可滚动列表，返回选中的行
+//   ...
+//
+// ── 即时模式（immediate mode）────────────────────────────────
+//
+// 没有控件树、没有控件对象、没有回调。每帧都从零重画，「控件状态」
+// 由**调用方自己用变量保管**：
+//
+//   var vol = 0
+//   var running = true
+//   while (!winShouldClose()) {
+//       winBeginFrame()
+//       vol = uiSlider(20, 60, 200, vol, 0, 100)
+//       if (uiCheck(20, 100, "运行中", running)) { running = !running }
+//       winEndFrame()
+//   }
+//
+// 这是本语言唯一可行的形态：语言没有结构体，控件对象无处存放；
+// 没有闭包，回调也无处存放。而即时模式恰好只需要「输入旧值、
+// 输出新值」—— 完全用得上语言的现有能力。
+//
+// 代价是「状态只有一份」这件事变成了调用方的责任，好处是它也
+// **只能有一份**：不存在「界面里存一份、逻辑里存一份、漏同步」
+// 那类最难查的 bug。
+//
+// ── 坐标约定 ────────────────────────────────────────────────
+//
+// 全部用绝对屏幕坐标（左上角原点），与 winFillRect 一致。
+// 布局工具（uiLayout 那组）负责推进「下一个控件该放哪」。
+
+// ============================================================
+// 配色
+// ============================================================
+//
+// 深色系，与窗口默认背景同调。为什么给默认值而不强制传入：
+// 一个界面里 90% 的控件用同一套色，每次调用都传 5 个颜色参数
+// 会把真正的信息（位置、尺寸、文字）埋掉。
+
+const UI_BG        = 0x1E1E24   // 窗口底色
+const UI_SURFACE   = 0x2A2A33   // 面板/控件底
+const UI_SURFACE_H = 0x34343F   // 悬停
+const UI_SURFACE_A = 0x3E3E4C   // 按下
+const UI_BORDER    = 0x3F3F4D
+const UI_TEXT      = 0xE8E8F0
+const UI_TEXT_DIM  = 0x9A9AA8
+const UI_ACCENT    = 0x3B82F6   // 主色（蓝）
+const UI_ACCENT_D  = 0x2563EB   // 主色按下
+const UI_OK        = 0x22C55E
+const UI_WARN      = 0xF59E0B
+const UI_ERR       = 0xEF4444
+const UI_TRACK     = 0x22222A   // 滑条轨
+// ============================================================
+// 命中判定
+// ============================================================
+//
+// 每个控件都要判「鼠标在不在里面」，所以抽出来。四个参数都是
+// 矩形的左上角与尺寸。
+
+fn uiHit(x: Int, y: Int, w: Int, h: Int) -> Bool {
+    let mx = winMouseX()
+    let my = winMouseY()
+    return mx >= x && my >= y && mx < x + w && my < y + h
+}
+
+// 鼠标是否在这个矩形内按下（用于立即反馈，不用等松开）
+fn uiHitDown(x: Int, y: Int, w: Int, h: Int) -> Bool {
+    if (!uiHit(x, y, w, h)) { return false }
+    return winMouseDown(0)
+}
+
+// ============================================================
+// 文本绘制
+// ============================================================
+
+// 水平居中写字。y 是文字顶边。
+fn uiTextCenter(cx: Int, y: Int, s: String, color: Int) {
+    let w = winTextWidth(s)
+    winText(cx - w / 2, y - winTextHeight() / 2, s, color)
+}
+
+// 在矩形内居中写字（水平居中 + 垂直居中）
+fn uiTextInRect(x: Int, y: Int, w: Int, h: Int, s: String, color: Int) {
+    let tw = winTextWidth(s)
+    let th = winTextHeight()
+    winText(x + (w - tw) / 2, y + (h - th) / 2, s, color)
+}
+
+// 左对齐 + 垂直居中
+fn uiTextLeft(x: Int, y: Int, w: Int, h: Int, s: String, pad: Int, color: Int) {
+    winText(x + pad, y + (h - winTextHeight()) / 2, s, color)
+}
+
+// ============================================================
+// 按钮
+// ============================================================
+//
+// 返回**这一帧是否被点击**。调用方拿到 true 就执行动作：
+//
+//   if (uiButton(20, 20, 100, 32, "确定")) { doIt() }
+//
+// ── 为什么用「本帧内」而不是「按下时」──
+//
+// 点击的完整语义是「在同一控件上按下并松开」。只用按下判定的话，
+// 用户在按钮上按下、拖到别处松开，动作照样触发 —— 那不符合任何
+// 一个平台的按钮行为，而用户会立刻察觉。
+//
+// 所以这里用事件队列：pollClick 给出 (x, y, button)，弹到 (x,y)
+// 落在本控件矩形内、且是左键，才算这个按钮的一次点击。
+//
+// ── 事件会不会被吃掉 ────────────────────────────────────────
+//
+// 会。一次点击只被**第一个**检查的控件消费。这是有意的：同一帧
+// 里两个控件都「被点击」不是合法状态，让多个控件同时响应同一次
+// 点击只会造成叠加的副作用。
+//
+// 代价是：如果一个控件被别的控件完全遮住，它永远收不到点击。
+// 这与真实界面的行为一致（上面的控件挡住下面的），所以不修。
+
+fn uiButton(x: Int, y: Int, w: Int, h: Int, label: String) -> Bool {
+    return uiButtonEx(x, y, w, h, label, UI_SURFACE, UI_SURFACE_H, UI_TEXT);
+}
+
+fn uiButtonEx(x: Int, y: Int, w: Int, h: Int, label: String,
+              bg: Int, bgHover: Int, fg: Int) -> Bool {
+    let over = uiHit(x, y, w, h)
+    var fill = bg
+    if (over) { fill = bgHover }
+    if (uiHitDown(x, y, w, h)) { fill = UI_SURFACE_A }
+
+    winFillRect(x, y, w, h, fill)
+    winBorderRect(x, y, w, h, 1, UI_BORDER)
+    uiTextInRect(x, y, w, h, label, fg)
+
+    return uiConsumeClick(x, y, w, h)
+}
+
+// 主色按钮（强调操作：确定、提交、开始）
+fn uiButtonPrimary(x: Int, y: Int, w: Int, h: Int, label: String) -> Bool {
+    let over = uiHit(x, y, w, h)
+    var fill = UI_ACCENT
+    if (over) { fill = UI_ACCENT_D }
+    winFillRect(x, y, w, h, fill)
+    uiTextInRect(x, y, w, h, label, 0xFFFFFF)
+    return uiConsumeClick(x, y, w, h)
+}
+
+// 危险按钮（删除、清空）
+fn uiButtonDanger(x: Int, y: Int, w: Int, h: Int, label: String) -> Bool {
+    return uiButtonEx(x, y, w, h, label, UI_ERR, 0xDC2626, 0xFFFFFF);
+}
+
+// 文字按钮（无边框，用于工具栏）
+fn uiButtonFlat(x: Int, y: Int, w: Int, h: Int, label: String) -> Bool {
+    let over = uiHit(x, y, w, h)
+    if (over) { winFillRect(x, y, w, h, UI_SURFACE_H) }
+    uiTextInRect(x, y, w, h, label, UI_TEXT)
+    return uiConsumeClick(x, y, w, h)
+}
+
+// 从事件队列里取一次点击，若落在矩形内则返回 true。
+//
+// 注意：**无论是否命中都要把事件取走**。不取走的话，队列里会
+// 堆满陈旧事件，下一个控件会拿到「很久以前的那次点击」——
+// 表现为「点了个空白处，某个按钮莫名其妙被按下」。
+fn uiConsumeClick(x: Int, y: Int, w: Int, h: Int) -> Bool {
+    let ev = winPollClick()
+    if (typeOf(ev) == "Null") { return false }
+    let ex = toInt(ev[0])
+    let ey = toInt(ev[1])
+    let eb = toInt(ev[2])
+    // 0 = 左键。右键与中键在这里不消费（各控件自己决定要不要）
+    if (eb != 0) { return false }
+    return ex >= x && ey >= y && ex < x + w && ey < y + h
+}
+
+// ============================================================
+// 勾选框
+// ============================================================
+//
+// 返回**新值**而不是「是否被点」。调用方写 `v = uiCheck(...)` 就
+// 完成了状态更新，不用先判再取反：
+//
+//   running = uiCheck(20, 100, "运行中", running)
+//
+// 为什么这样更安全：`if (uiCheck(...)) { running = !running }` 这种
+// 写法里，「画」和「翻状态」是两个动作，一旦有人只写一半，界面
+// 会显示勾上而逻辑里是没勾 —— 而且不报错。
+
+// 画一个对勾，以 (cx, cy) 为中心。
+//
+// 为什么抽出来：对勾的像素形状是**唯一**的视觉资产，硬编码旧式
+// uiCheck、结构体版 Check.draw、类层 UiCheck.draw 三处都要它。
+// 复制三份的后果不是代码冗余，而是「改了一处、另一处还是老样子」——
+// 而这种偏差在截图里几乎看不出来，只会让人觉得哪里怪。
+//
+// 没有画圆/画线的原语，所以用 4 步 × 2 像素的小方块拼出两条斜线。
+// 线宽必须是 2：1 像素的斜线在浅色主题上会被抗锯齿吃掉一半。
+fn uiCheckMark(cx: Int, cy: Int, c: Int) {
+    var i = 0
+    while (i < 4) {
+        winFillRect(cx - 5 + i, cy + i - 1, 2, 2, c)
+        winFillRect(cx + 1 + i, cy - 3 - i + 4, 2, 2, c)
+        i = i + 1
+    }
+}
+
+fn uiCheck(x: Int, y: Int, label: String, checked: Bool) -> Bool {
+    let box = 18
+    let over = uiHit(x, y, box + 8 + winTextWidth(label), box)
+    var fill = UI_TRACK
+    if (over) { fill = UI_SURFACE_H }
+    winFillRect(x, y, box, box, fill)
+    winBorderRect(x, y, box, box, 1, UI_BORDER)
+
+    // 勾：两条短线段组成的对勾。线宽 2 才看得清。
+    if (checked) {
+        uiCheckMark(x + box / 2, y + box / 2, UI_ACCENT)
+    }
+
+    winText(x + box + 8, y + (box - winTextHeight()) / 2, label, UI_TEXT)
+
+    if (uiConsumeClick(x, y, box + 8 + winTextWidth(label), box)) {
+        return !checked
+    }
+    return checked
+}
+
+// 带主题与点击归属的勾选框 —— **类型层唯一该用的版本**。
+//
+// ── 与 uiCheck 的三处差别 ──────────────────────────────────
+//
+// 1. 全部颜色从 th 取。旧版用 UI_TRACK / UI_TEXT 这些硬编码深色
+//    常量，浅色主题下就是「纯黑方块 + 看不见的浅色文字」。
+//
+// 2. 不碰 winPollClick。旧版内部调 uiConsumeClick，把点击队列里的
+//    事件取走；而类型层是「每帧取一次快照（Frame.begin），所有控件
+//    共用一个快照」。两边同时取，先画的控件会把事件偷走 —— 表现为
+//    「点勾选框时旁边的按钮也跟着动」或者「点了没反应」。
+//
+// 3. 不做判定。绘制就是绘制，命中交给 Frame / Rect.contains。
+//    返回新值会诱使人把它当「是否被点」，那是旧版的语义陷阱。
+//
+// 参数 heat 而不是 pressed：悬停与按下在这里不必区分，两者都只是
+// 「鼠标在这块上面」，多一个状态只会多一处可能写错的判断。
+fn uiCheckEx(x: Int, y: Int, label: String, checked: Bool, th: Theme) {
+    let box = 18
+    let over = uiHit(x, y, box + 8 + winTextWidth(label), box)
+    var fill = th.track
+    if (over) { fill = th.surfaceHover }
+    winFillRect(x, y, box, box, fill)
+    winBorderRect(x, y, box, box, 1, th.border)
+
+    if (checked) {
+        uiCheckMark(x + box / 2, y + box / 2, th.accent)
+    }
+
+    var fg = th.text
+    if (over) { fg = th.text }
+    winText(x + box + 8, y + (box - winTextHeight()) / 2, label, fg)
+}
+
+// ============================================================
+// 单选组
+// ============================================================
+//
+// 返回**新选中项**（0 起）。垂直排列，每项一行。
+
+fn uiRadioGroup(x: Int, y: Int, labels: Array, selected: Int) -> Int {
+    let rowH = 24
+    let box = 16
+    var i = 0
+    var sel = selected
+    while (i < len(labels)) {
+        let ry = y + i * rowH
+        let label = toString(labels[i])
+        let over = uiHit(x, ry, box + 8 + winTextWidth(label), box)
+
+        winFillRect(x, ry, box, box, UI_TRACK)
+        winBorderRect(x, ry, box, box, 1, UI_BORDER)
+        // 选中点：实心圆用 2×2 的小方块近似（没有画圆的原语）
+        if (i == sel) {
+            let cx = x + box / 2
+            let cy = ry + box / 2
+            winFillRect(cx - 3, cy - 3, 6, 6, UI_ACCENT)
+        }
+        var fg = UI_TEXT
+        if (over) { fg = 0xFFFFFF }
+        winText(x + box + 8, ry + (box - winTextHeight()) / 2, label, fg)
+
+        if (uiConsumeClick(x, ry, box + 8 + winTextWidth(label), box)) {
+            sel = i
+        }
+        i = i + 1
+    }
+    return sel
+}
+
+// ============================================================
+// 滑条
+// ============================================================
+//
+// 返回**当前值**（浮点）。调用方写 `v = uiSlider(...)`。
+//
+// ── 拖动怎么实现 ────────────────────────────────────────────
+//
+// 没有「拖动中」这个状态可存，所以判据是「鼠标按在轨道区域内」。
+// 也就是说按住之后横向移动会持续更新值 —— 这正是想要的拖动。
+// 代价是鼠标移出轨道区域（纵向）后拖动中断，但那符合直觉：用户
+// 已经不在滑条上了。
+//
+// 精度：值按 (mx - x) / (w - 1) 归一化。分母用 w-1 而不是 w，
+// 否则鼠标在最右一像素时只到 (w-1)/w，永远拖不到最大值。
+
+fn uiSlider(x: Int, y: Int, w: Int, val: Float, lo: Float, hi: Float) -> Float {
+    let trackH = 6
+    let knobW = 14
+    let knobH = 20
+    let cy = y + knobH / 2 - trackH / 2
+
+    winFillRect(x, cy, w, trackH, UI_TRACK)
+
+    // 已填充部分
+    var ratio = 0.0
+    if (hi > lo) { ratio = (val - lo) / (hi - lo) }
+    if (ratio < 0.0) { ratio = 0.0 }
+    if (ratio > 1.0) { ratio = 1.0 }
+    let filled = toInt(ratio * toFloat(w - knobW) + 0.5)
+    winFillRect(x, cy, filled + knobW / 2, trackH, UI_ACCENT)
+
+    // 把手
+    let kx = x + filled
+    winFillRect(kx, y, knobW, knobH, UI_TEXT)
+
+    // 拖动：鼠标必须按在「把手或轨道」的纵向范围内
+    if (winMouseDown(0) && uiHit(x, y, w, knobH)) {
+        let span = w - knobW
+        var t = 0.0
+        if (span > 0) {
+            t = toFloat(winMouseX() - x - knobW / 2) / toFloat(span)
+        }
+        if (t < 0.0) { t = 0.0 }
+        if (t > 1.0) { t = 1.0 }
+        return lo + t * (hi - lo)
+    }
+    return val
+}
+
+// 带数值标签的滑条。label 形如 "音量"，值显示在右侧。
+fn uiSliderLabeled(x: Int, y: Int, w: Int, label: String,
+                   val: Float, lo: Float, hi: Float, decimals: Int) -> Float {
+    winText(x, y + 22, label, UI_TEXT_DIM)
+    let nv = uiSlider(x, y, w, val, lo, hi)
+    // 值右对齐在滑条上方
+    let vs = uiFixed(nv, decimals)
+    winText(x + w - winTextWidth(vs), y + 22, vs, UI_TEXT)
+    return nv
+}
+
+// 带主题的滑条 —— 只画，不读鼠标、不返回新值。
+//
+// 为什么连鼠标都不读：类型层的调用方已经知道「鼠标在哪、按着没」
+// （它要自己判 Frame / Rect.contains 才能决定值归谁）。这里再读
+// 一次 winMouseX，等于同一次输入被两条路径解释，而两条路径的
+// 边界条件（夹取位置、knobW 偏移）只要有一像素不一致，就成了
+// 「拖到最右到不了 100」这种查半天的问题。
+//
+// 值由调用方算好后传进来，这里只负责把 (lo..hi) 映射成像素。
+fn uiSliderEx(x: Int, y: Int, w: Int, ratio: Float, th: Theme) {
+    let trackH = 6
+    let knobW = 14
+    let knobH = 20
+    let cy = y + knobH / 2 - trackH / 2
+
+    var t = ratio
+    if (t < 0.0) { t = 0.0 }
+    if (t > 1.0) { t = 1.0 }
+
+    winFillRect(x, cy, w, trackH, th.track)
+
+    let span = w - knobW
+    // span <= 0 时没有可拖动的行程：只画把手贴左边，不画填充段。
+    // 画成负宽度会让 winFillRect 收到负数 —— 那在像素层面是未定义行为。
+    var filled = 0
+    if (span > 0) { filled = toInt(t * toFloat(span) + 0.5) }
+
+    if (span > 0) {
+        winFillRect(x, cy, filled + knobW / 2, trackH, th.accent)
+    }
+
+    // 把手：面用主题底色、边用前景色，悬停时边变主色。
+    //
+    // ── 为什么不是一块实心色 ────────────────────────────────
+    //
+    // 试过三种画法，只有这一种在深浅两个主题下同时成立：
+    //
+    //   实心 th.text      深色主题下是一个白方块（过硬），浅色主题下
+    //                     是一个黑方块（像块贴上去的胶带）
+    //   实心 th.surface   两边的轨道色都和它太接近，把手直接隐形
+    //   面 surface + 边 text
+    //                     ✓ 面给出「这是一个独立物体」，边给出轮廓
+    //
+    // 边的颜色用 text 而不是 border：border 在浅色主题下是 0xC8C8D2，
+    // 压在同样浅的轨道（0xDDDDE6）上几乎看不见 —— 而把手看不见等于
+    // 滑条没有把手。
+    let kx = x + filled
+    var kc = th.textDim
+    if (uiHit(x, y, w, knobH)) { kc = th.accent }
+    winFillRect(kx, y, knobW, knobH, th.surface)
+    winBorderRect(kx, y, knobW, knobH, 1, kc)
+}
+
+// ============================================================
+// 输入框（只显示，不含键盘输入）
+// ============================================================
+//
+// ── 为什么没有真正的键盘输入 ────────────────────────────────
+//
+// 底层没有「读键盘」的原语 —— win* 那 17 个里只有鼠标。
+// 加键盘需要新的平台内建（WM_CHAR 队列），那是运行时的工作，
+// 不是标准库能凭空造出来的。
+//
+// 所以这里的 uiField 是「显示一段文本，带输入框外观」，配合
+// 外部数据源使用（比如扫描码、按钮键盘、文件内容）。真正的
+// 文本输入等 winKeyChar 那批原语落地后由 uiFieldEdit 提供。
+//
+// 这个限制写在这里而不是藏着，是因为「看起来能输入、点了没反应」
+// 是最消耗信任的一种缺陷。
+
+fn uiField(x: Int, y: Int, w: Int, h: Int, text: String, focused: Bool) {
+    winFillRect(x, y, w, h, UI_TRACK)
+    var bc = UI_BORDER
+    if (focused) { bc = UI_ACCENT }
+    winBorderRect(x, y, w, h, 1, bc)
+    uiTextLeft(x, y, w, h, text, 8, UI_TEXT)
+}
+
+// 字段标签 + 输入框，水平排列。返回输入框左边缘的 x（方便继续排）。
+fn uiFieldLabeled(x: Int, y: Int, labelW: Int, w: Int, h: Int,
+                  label: String, text: String, focused: Bool) -> Int {
+    uiTextLeft(x, y, labelW, h, label, 0, UI_TEXT_DIM)
+    uiField(x + labelW, y, w, h, text, focused)
+    return x + labelW
+}
+
+// ============================================================
+// 分隔线 / 面板 / 进度条
+// ============================================================
+
+fn uiSeparator(x: Int, y: Int, w: Int) {
+    winFillRect(x, y, w, 1, UI_BORDER)
+}
+
+fn uiPanel(x: Int, y: Int, w: Int, h: Int) {
+    winFillRect(x, y, w, h, UI_SURFACE)
+    winBorderRect(x, y, w, h, 1, UI_BORDER)
+}
+
+// 面板标题栏。返回内容区顶边 y（方便接着排内容）。
+fn uiPanelTitled(x: Int, y: Int, w: Int, h: Int, title: String) -> Int {
+    uiPanel(x, y, w, h)
+    let barH = 28
+    winFillRect(x + 1, y + 1, w - 2, barH, UI_SURFACE_H)
+    uiTextLeft(x, y, w, barH, title, 10, UI_TEXT)
+    return y + barH + 8
+}
+
+// 进度条。ratio 在 0..1，超出会被夹住。
+fn uiProgress(x: Int, y: Int, w: Int, h: Int, ratio: Float) {
+    winFillRect(x, y, w, h, UI_TRACK)
+    var r = ratio
+    if (r < 0.0) { r = 0.0 }
+    if (r > 1.0) { r = 1.0 }
+    let fw = toInt(r * toFloat(w) + 0.5)
+    if (fw > 0) { winFillRect(x, y, fw, h, UI_ACCENT) }
+    winBorderRect(x, y, w, h, 1, UI_BORDER)
+}
+
+// 带百分比文字的进度条
+fn uiProgressLabeled(x: Int, y: Int, w: Int, h: Int, ratio: Float) {
+    uiProgress(x, y, w, h, ratio)
+    let pct = uiFixed(ratio * 100.0, 0) + "%"
+    winText(x + (w - winTextWidth(pct)) / 2,
+            y + (h - winTextHeight()) / 2, pct, UI_TEXT)
+}
+
+// 下面三个是「带主题」的版本。旧版把 UI_BORDER / UI_TRACK / UI_TEXT
+// 写死在函数体里，浅色主题下会画出深灰分隔线和黑轨道 —— 而调用方
+// 完全无从修复，因为参数里根本没有颜色。
+//
+// 保留旧版是为了不破坏已有代码（tests/p0/28 与 games 下的旧 demo
+// 都还在用），但**新代码一律用 Ex**。
+
+fn uiSeparatorEx(x: Int, y: Int, w: Int, th: Theme) {
+    winFillRect(x, y, w, 1, th.border)
+}
+
+// 竖分隔线。demo 里「左栏 | 右栏」那条 —— 用一个 1 像素宽、高 h 的
+// 矩形画，比给 uiSeparatorEx 加一个方向参数更清楚。
+fn uiVRuleEx(x: Int, y: Int, h: Int, th: Theme) {
+    winFillRect(x, y, 1, h, th.border)
+}
+
+fn uiPanelEx(x: Int, y: Int, w: Int, h: Int, th: Theme) {
+    winFillRect(x, y, w, h, th.surface)
+    winBorderRect(x, y, w, h, 1, th.border)
+}
+
+// 返回内容区左边缘的 x（与旧版返回顶边 y 不同：Rect 更完整，
+// 但这里只画不布局，保持与旧版一致的返回值没有意义，于是改成一个
+// 明确的「内容区矩形」由调用方自己拼 —— 见 UiPanel.body）。
+fn uiPanelTitledEx(x: Int, y: Int, w: Int, h: Int, title: String, th: Theme) {
+    uiPanelEx(x, y, w, h, th)
+    let barH = 28
+    winFillRect(x + 1, y + 1, w - 2, barH, th.surfaceHover)
+    winFillRect(x + 1, y + 1 + barH, w - 2, 1, th.border)
+    uiTextLeft(x, y, w, barH, title, 10, th.text)
+}
+
+// 进度条（带主题）。文字颜色按「压在填充段上还是空轨道上」切换 ——
+// 这一条不能省：主色是深蓝，正文色是深灰，两者在填充段上都不够看，
+// 必须换成 onAccent 的白色。
+fn uiProgressEx(x: Int, y: Int, w: Int, h: Int, ratio: Float, th: Theme) {
+    winFillRect(x, y, w, h, th.track)
+    var r = ratio
+    if (r < 0.0) { r = 0.0 }
+    if (r > 1.0) { r = 1.0 }
+    let fw = toInt(r * toFloat(w) + 0.5)
+    if (fw > 0) { winFillRect(x, y, fw, h, th.accent) }
+    winBorderRect(x, y, w, h, 1, th.border)
+}
+
+fn uiProgressLabeledEx(x: Int, y: Int, w: Int, h: Int, ratio: Float, th: Theme) {
+    uiProgressEx(x, y, w, h, ratio, th)
+    let pct = uiFixed(ratio * 100.0, 0) + "%"
+    let tw = winTextWidth(pct)
+    let tx = x + (w - tw) / 2
+
+    var r = ratio
+    if (r < 0.0) { r = 0.0 }
+    if (r > 1.0) { r = 1.0 }
+    let fw = toInt(r * toFloat(w) + 0.5)
+
+    var fg = th.text
+    if (tx + tw / 2 <= x + fw) { fg = th.onAccent }
+    winText(tx, y + (h - winTextHeight()) / 2, pct, fg)
+}
+
+// ============================================================
+// 滚动列表
+// ============================================================
+//
+// 返回选中的行号（-1 = 本帧没点任何行）。
+//
+// ── 状态的划分 ──────────────────────────────────────────────
+//
+// 「选中哪一行」和「滚到第几行」都由调用方保管，本函数只负责
+// 画出来 + 判定点击。所以签名里有 selected 与 scroll 两个入参。
+//
+// 滚动用鼠标滚轮做不到（没有读滚轮的原语），所以用「上/下按钮」：
+// 它们和列表一起画，点击时由调用方改 scroll。
+
+fn uiList(x: Int, y: Int, w: Int, h: Int, items: Array,
+          selected: Int, scroll: Int) -> Int {
+    let rowH = 24
+    winFillRect(x, y, w, h, UI_TRACK)
+    winBorderRect(x, y, w, h, 1, UI_BORDER)
+
+    let visible = h / rowH
+    var i = 0
+    var sel = -1
+
+    while (i < visible) {
+        let idx = scroll + i
+        if (idx >= len(items)) { break }
+        let ry = y + i * rowH
+        let over = uiHit(x + 1, ry, w - 2, rowH)
+
+        if (idx == selected) {
+            winFillRect(x + 1, ry, w - 2, rowH, UI_ACCENT)
+        } else if (over) {
+            winFillRect(x + 1, ry, w - 2, rowH, UI_SURFACE_H)
+        }
+
+        var fg = UI_TEXT
+        if (idx == selected) { fg = 0xFFFFFF }
+        uiTextLeft(x, ry, w, rowH, toString(items[idx]), 8, fg)
+
+        if (uiConsumeClick(x + 1, ry, w - 2, rowH)) { sel = idx }
+        i = i + 1
+    }
+    return sel
+}
+
+// 列表 + 上下滚动按钮。返回 [新选中行, 新 scroll]。
+//
+// 返回数组而不是两个值：语言没有元组。两个元素的开销可以忽略，
+// 而调用点 `let r = uiListScroll(...)` 读起来比拆两个函数清楚。
+fn uiListScroll(x: Int, y: Int, w: Int, h: Int, items: Array,
+                selected: Int, scroll: Int) -> Array {
+    let btnW = 24
+    let listW = w - btnW - 4
+
+    let sel = uiList(x, y, listW, h, items, selected, scroll)
+
+    var scr = scroll
+    let visible = (h / 24)
+    let maxScroll = len(items) - visible
+    let bx = x + listW + 4
+
+    // 上
+    if (uiButtonEx(bx, y, btnW, btnW, "▲", UI_SURFACE, UI_SURFACE_H, UI_TEXT)) {
+        if (scr > 0) { scr = scr - 1 }
+    }
+    // 下
+    if (uiButtonEx(bx, y + btnW + 4, btnW, btnW, "▼",
+                   UI_SURFACE, UI_SURFACE_H, UI_TEXT)) {
+        if (scr < maxScroll) { scr = scr + 1 }
+    }
+
+    let out = array(2, 0)
+    out[0] = sel
+    out[1] = scr
+    return out
+}
+
+// ============================================================
+// 布局工具
+// ============================================================
+//
+// 「把控件一个个摆下去」是每个界面都要写的循环。这里给一个最小
+// 但够用的列布局：调用方持有一个游标（y 坐标），每摆完一个控件
+// 就推进它。
+//
+// ── 为什么用数组做游标而不是返回值 ──────────────────────────
+//
+// 返回值形式（`y = uiNextY(y, h)`）在嵌套布局时会写成一串赋值，
+// 而且调用方容易忘记加间距。用单元素数组当「引用」是这个语言里
+// 模拟引用的唯一手段 —— 与扫雷里把整局状态打包进数组同理。
+//
+//   let c = uiCursor(20)
+//   uiCursorPutButton(c, 120, 32, 8, "确定")
+//   ...
+//
+// 更简单的做法是直接传 y 并用返回值：
+//
+//   var y = 20
+//   if (uiButton(20, y, 120, 32, "确定")) { ... }
+//   y = y + 32 + 8
+//
+// 这已经足够清楚，所以下面只提供两个最小的辅助函数，不再造一套
+// 布局引擎 —— 布局引擎的正确用法需要度量、约束、换行策略，那是
+// 另一个规模的东西，而当前这些界面的复杂度用不上。
+
+// 单个游标：cursor[0] 是当前 y
+fn uiCursor(y: Int) -> Array {
+    let a = array(1, 0)
+    a[0] = y
+    return a
+}
+
+// 取当前 y，并把游标往下推 h + gap
+fn uiCursorTake(c: Array, h: Int, gap: Int) -> Int {
+    let y = toInt(c[0])
+    c[0] = y + h + gap
+    return y
+}
+
+// ============================================================
+// 对话框 / 遮罩
+// ============================================================
+
+// 半透明遮罩做不到（没有 alpha 混合原语），所以用「深色实心 +
+// 中间亮框」模拟模态对话框的视觉层次。
+fn uiModalBg(w: Int, h: Int) {
+    winFillRect(0, 0, w, h, 0x14141A)
+}
+
+// 居中对话框。返回内容区顶边 y。
+fn uiDialog(winW: Int, winH: Int, w: Int, h: Int, title: String) -> Int {
+    let x = (winW - w) / 2
+    let y = (winH - h) / 2
+    uiPanel(x, y, w, h)
+    uiTextLeft(x, y, w, 36, title, 14, UI_TEXT)
+    uiSeparator(x + 1, y + 36, w - 2)
+    return y + 36 + 12
+}
+
+// ============================================================
+// 提示与状态
+// ============================================================
+
+// 一行带颜色圆点状态文字（用于「已连接」「失败」这类）
+fn uiStatus(x: Int, y: Int, text: String, color: Int) {
+    winFillRect(x, y + 4, 8, 8, color)
+    winText(x + 14, y, text, UI_TEXT)
+}
+
+// 工具栏：一排文字按钮，返回被点中的下标（-1 = 没点）
+fn uiToolbar(x: Int, y: Int, labels: Array, h: Int) -> Int {
+    let pad = 10
+    var cx = x
+    var i = 0
+    var hit = -1
+    while (i < len(labels)) {
+        let label = toString(labels[i])
+        let w = winTextWidth(label) + pad * 2
+        if (uiButtonFlat(cx, y, w, h, label)) { hit = i }
+        cx = cx + w
+        i = i + 1
+    }
+    return hit
+}
+
+// ============================================================
+// 内部：数字格式化
+// ============================================================
+//
+// std.ui 不 import std.conv，以避免「图形界面依赖类型转换库」这种
+// 无谓的耦合（conv 只用一个函数）。所以这里放一个极小的定点格式化。
+fn uiFixed(x: Float, decimals: Int) -> String {
+    if (decimals <= 0) {
+        return toString(toInt(math(round, x)))
+    }
+    var scale = 1.0
+    var k = 0
+    while (k < decimals) {
+        scale = scale * 10.0
+        k = k + 1
+    }
+    let neg = x < 0.0
+    let shifted = toInt(math(round, math(abs, x * scale)))
+    var body = toString(shifted)
+    while (len(body) <= decimals) {
+        body = "0" + body
+    }
+    let cut = len(body) - decimals
+    var out = strSub(body, 0, cut) + "." + strSub(body, cut, len(body))
+    if (neg) { out = "-" + out }
+    return out
+}
+// ============================================================
+// 类型层：Rect / Theme / 组件类型（v0.14）
+// ============================================================
+//
+// ── 为什么在这一节之前，所有控件都要传四个 Int ──────────────
+//
+// `uiButton(x, y, w, h, label)` 签名里的四个 Int 表示「一个矩形」，
+// 但这个概念在类型系统里不存在 —— 它只是四个恰好一起出现的数字。
+// 后果是三条：
+//
+//   1. w 和 h 传反是**编译期完全合法**的。`uiButton(0,0,600,800,…)`
+//      和 `uiButton(0,0,800,600,…)` 类型完全相同，但一个是竖排
+//      一个是横排。这类 bug 只能靠肉眼发现。
+//   2. 每个函数都要重新接受一遍这四个参数，21 个控件就有 21 处
+//      重复的坐标算术。
+//   3. 「把一组控件整体下移 20 像素」这种操作无处表达 —— 只能
+//      逐个改调用点。
+//
+// 有了 `Rect` 之后，第 1 条变成编译错误，第 2 条变成一次传参，
+// 第 3 条变成一次加法。
+//
+// ── 保留旧函数，不删不弃 ────────────────────────────────────
+//
+// 上面 21 个 `uiXxx(x,y,w,h,...)` 全部保留。理由不是保守，而是：
+// 它们承载了 std.ui 的稳定契约，而类型层是**新增的一层**，
+// 不是替换。两层并存让迁移可以逐个控件进行 —— 而「一次性大改
+// UI 库」在任何项目里都会引入一批与主题无关的回归。
+//
+// 类型层内部的实现直接复用旧函数，所以不存在两套绘制逻辑：
+// `bt.draw()` 最终调的就是 `uiButton`。
+
+// ---- 矩形 ----
+//
+// 字段顺序固定为 x, y, w, h。这个顺序参与内存布局，也参与
+// `Rect { w: 100 }` 这种省略字段的默认值填充 —— 改顺序要同步
+// 改所有依赖它的代码，所以它在写下的那一刻就是契约。
+struct Rect {
+    x: Int,
+    y: Int,
+    w: Int,
+    h: Int,
+}
+
+fn Rect.right(self: Rect) -> Int { return self.x + self.w }
+fn Rect.bottom(self: Rect) -> Int { return self.y + self.h }
+fn Rect.area(self: Rect) -> Int { return self.w * self.h }
+fn Rect.isEmpty(self: Rect) -> Bool { return self.w <= 0 || self.h <= 0 }
+fn Rect.cx(self: Rect) -> Int { return self.x + self.w / 2 }
+fn Rect.cy(self: Rect) -> Int { return self.y + self.h / 2 }
+
+// 命中判定。与 uiHit 同一个规则：左闭右开，右/下边界不属于矩形。
+fn Rect.contains(self: Rect, px: Int, py: Int) -> Bool {
+    return px >= self.x && py >= self.y &&
+           px < self.x + self.w && py < self.y + self.h
+}
+
+// 含鼠标位置的判定 —— 界面里最高频的那个判断。
+fn Rect.hovered(self: Rect) -> Bool {
+    return self.contains(winMouseX(), winMouseY())
+}
+
+// 含鼠标按下状态的判定。
+fn Rect.pressed(self: Rect) -> Bool {
+    return self.hovered() && winMouseDown(0)
+}
+
+// 内缩 d 像素（四边各收 d）。d 为负时是外扩。
+fn Rect.inset(self: Rect, d: Int) -> Rect {
+    return Rect {
+        x: self.x + d,
+        y: self.y + d,
+        w: self.w - d * 2,
+        h: self.h - d * 2,
+    }
+}
+
+fn Rect.offset(self: Rect, dx: Int, dy: Int) -> Rect {
+    return Rect { x: self.x + dx, y: self.y + dy, w: self.w, h: self.h }
+}
+
+// 贴到另一个矩形内部（左上角对齐 + 内边距）
+fn Rect.inOf(self: Rect, pad: Int) -> Rect {
+    return Rect {
+        x: self.x + pad,
+        y: self.y + pad,
+        w: self.w - pad * 2,
+        h: self.h - pad * 2,
+    }
+}
+
+// 在底部切出一条高 h 的横条，返回它（原矩形不动）。
+//
+// 布局最常见的一步就是「从剩余空间里切一块出来」。返回新矩形
+// 而不是修改 self，因为字段不可变 —— 但这恰好让「切完还剩什么」
+// 也成了一个可以继续算的值。
+fn Rect.stripTop(self: Rect, h: Int) -> Rect {
+    return Rect { x: self.x, y: self.y, w: self.w, h: h }
+}
+
+fn Rect.stripBottom(self: Rect, h: Int) -> Rect {
+    return Rect { x: self.x, y: self.y + self.h - h, w: self.w, h: h }
+}
+
+fn Rect.below(self: Rect, h: Int, gap: Int) -> Rect {
+    return Rect { x: self.x, y: self.y + self.h + gap, w: self.w, h: h }
+}
+
+// 左右切分：返回左半（ratio 为 0..100 的百分比，避免用 Float）
+fn Rect.leftPct(self: Rect, pct: Int) -> Rect {
+    return Rect { x: self.x, y: self.y, w: self.w * pct / 100, h: self.h }
+}
+
+fn Rect.rightOf(self: Rect, pct: Int) -> Rect {
+    let lw = self.w * pct / 100
+    return Rect { x: self.x + lw, y: self.y, w: self.w - lw, h: self.h }
+}
+
+// ---- 主题 ----
+//
+// 配色从 12 个散落的 `const UI_*` 收成一个对象。
+//
+// ── 为什么这比常量好 ────────────────────────────────────────
+//
+// 常量只能有一份。想同时支持深色/浅色、或者让某个面板用强调色，
+// 就只能「换个常量名再写一遍全部控件」。而 Theme 是一个值：
+// 可以在运行时选、可以按窗口传、可以派生（`dark.withAccent(...)`）。
+//
+// 默认值就是原来那套深色配色，所以 `Theme {}` 与旧行为一致。
+struct Theme {
+    bg: Int,
+    surface: Int,
+    surfaceHover: Int,
+    surfaceActive: Int,
+    border: Int,
+    text: Int,
+    textDim: Int,
+    accent: Int,
+    accentDark: Int,
+    ok: Int,
+    warn: Int,
+    err: Int,
+    track: Int,
+    onAccent: Int,   // 画在主色块上的文字颜色
+}
+
+fn Theme.dark() -> Theme {
+    return Theme {
+        bg: UI_BG,
+        surface: UI_SURFACE,
+        surfaceHover: UI_SURFACE_H,
+        surfaceActive: UI_SURFACE_A,
+        border: UI_BORDER,
+        text: UI_TEXT,
+        textDim: UI_TEXT_DIM,
+        accent: UI_ACCENT,
+        accentDark: UI_ACCENT_D,
+        ok: UI_OK,
+        warn: UI_WARN,
+        err: UI_ERR,
+        track: UI_TRACK,
+        onAccent: 0xFFFFFF,
+    }
+}
+
+// 浅色主题。存在的意义是证明 Theme 真的是个**值**：换一套配色
+// 不需要改任何控件代码，只换传进来的那个对象。
+fn Theme.light() -> Theme {
+    return Theme {
+        bg: 0xF2F2F5,
+        surface: 0xFFFFFF,
+        surfaceHover: 0xE8E8EE,
+        surfaceActive: 0xD8D8E2,
+        border: 0xC8C8D2,
+        text: 0x1C1C22,
+        textDim: 0x5E5E6C,
+        accent: 0x2563EB,
+        accentDark: 0x1D4ED8,
+        ok: 0x16A34A,
+        warn: 0xB45309,
+        err: 0xDC2626,
+        track: 0xDDDDE6,
+        onAccent: 0xFFFFFF,
+    }
+}
+
+// 派生：换主色，其余不变。
+//
+// 这是「值」相对「常量」的核心优势 —— 12 个 const 要做同样的事，
+// 只能再写 12 行赋值，而且每加一个主题就多 12 行。
+fn Theme.withAccent(self: Theme, c: Int) -> Theme {
+    return Theme {
+        bg: self.bg, surface: self.surface,
+        surfaceHover: self.surfaceHover, surfaceActive: self.surfaceActive,
+        border: self.border, text: self.text, textDim: self.textDim,
+        accent: c, accentDark: self.accentDark,
+        ok: self.ok, warn: self.warn, err: self.err, track: self.track,
+        onAccent: self.onAccent,
+    }
+}
+
+// ---- 样式（Style）----
+//
+// ============================================================
+// 设计说明：为什么需要 Style，而不是给每个控件加字段
+// ============================================================
+//
+// ── 问题 ────────────────────────────────────────────────────
+//
+// v0.16 之前，控件的视觉属性散在各处：UiButton 有 kind（三档配色），
+// UiLabel 有 color（一个前景色），UiPanel 有 title，函数式 API 更是
+// 把 bg/bgHover/fg 当位置参数传 —— uiButtonEx 已经是 8 个参数。
+//
+// 想加一个「圆角」，三处都要改，而且函数式那套的每个调用点都会多一个
+// 位置参数。这不是「参数有点多」，是**样式没有归属**：它既不属于
+// 业务数据，也不属于几何，所以没人知道该放哪，最后就摊在参数表里。
+//
+// ── 解法：把样式收成一个值 ──────────────────────────────────
+//
+// Style 是一组**视觉属性**，全部有默认值，全部可覆盖，还能派生：
+//
+//     let s = Style.card().radius(10).fill(0x222233)
+//     let b = new UiButton(r, "OK")
+//     b.style = s
+//
+// 加一个属性只需要在 Style 里加一个字段 + 一个派生方法，
+// 所有控件的调用点一行都不用改。这是「描述与判定分离」那条原则
+// 在样式上的延续。
+//
+// ── 为什么 Style 是 struct 而不是 class ─────────────────────
+//
+// 和 Rect / Theme 同一个理由：样式是值。拷贝一份改一个字段，
+// 原样式不受影响 —— 这让「基于主题派生一套局部样式」变得安全：
+//
+//     let base = Style.fromTheme(th)
+//     let danger = base.fill(th.err)      // base 没被改
+//     let warn   = base.fill(th.warn)     // 从同一个 base 派生
+//
+// 如果是引用语义，上面第二行会悄悄改掉 danger 的配色 —— 而
+// 那种 bug 只在同时用两个派生样式时才出现。
+//
+// ── 字段为什么这么多 ────────────────────────────────────────
+//
+// 因为「自定义组件的形状、颜色、动画」这个需求本身就是这么多维度。
+// 少一个字段，用户就得回到「直接调 winFillRect」的地步 —— 那等于
+// 绕过整套布局与命中判定。宁可字段多，不可能力缺。
+struct Style {
+    // ---- 填充 ----
+    //
+    // 三个状态色而不是一个：按钮的「悬停/按下」反馈是 UI 的基本要求，
+    // 让调用方自己判断状态再改样式，等于把每种控件的状态机都抄一遍。
+    fill: Int,          // 常态填充。UI_NONE(-1) 表示不填充
+    fillHover: Int,     // 悬停
+    fillActive: Int,    // 按下
+
+    // ---- 描边 ----
+    border: Int,        // UI_NONE 表示不描边
+    borderW: Int,       // 线宽（像素）
+
+    // ---- 圆角 ----
+    //
+    // 半径 0 = 直角。会按 min(w,h)/2 自动夹紧（见 gui_win32.c 的
+    // xgui_fill_round）—— 所以给一个大半径不会画出怪形状，
+    // 只会变成胶囊。
+    radius: Int,
+
+    // ---- 文字 ----
+    text: Int,
+    textDim: Int,       // 次要文字（标签、提示）
+    align: Int,         // 0=居中 1=左对齐 2=右对齐
+
+    // ---- 渐变 ----
+    //
+    // gradFrom / gradTo 都是 UI_NONE 时用纯色 fill。
+    // 只填一个时按 fill 处理（不算错误，但会忽略渐变）。
+    gradFrom: Int,
+    gradTo: Int,
+    gradVertical: Bool,
+
+    // ---- 透明度 ----
+    //
+    // 0~100 的整数而不是 0.0~1.0 的浮点。
+    //
+    // 理由：这个值几乎总是在做整数运算（50% + 25% 叠加），
+    // 而浮点比较的边界问题（0.30000000000000004 > 0.3）在样式
+    // 继承上会真的出错 —— 「明明设了 0.3 却不生效」。
+    // 整数百分比没有这个问题，且 UI_NONE_ALPHA(100) 语义清晰。
+    alpha: Int,
+
+    // ---- 变换 ----
+    //
+    // rotDeg 单位是度，正数逆时针。scale 是倍数（100 = 1.0 倍，
+    // 同样是整数避免浮点边界问题）。
+    rotDeg: Float,
+    scale: Int,
+
+    // ---- 裁剪 ----
+    //
+    // 为真时把绘制限制在控件矩形内。列表、滚动区域必须开 ——
+    // 否则超出的内容会画到别的控件上面。
+    clip: Bool,
+
+    // ---- 阴影 ----
+    //
+    // 简化成「偏移 + 颜色」，不做模糊：GDI 没有模糊，而为了阴影
+    // 引入一整个软件模糊层不值得。硬边阴影在深色主题下看起来是
+    // 「浮起一层」，视觉够用。
+    shadow: Int,        // UI_NONE 无阴影
+    shadowX: Int,
+    shadowY: Int,
+}
+
+// UI_NONE：所有「不画」的统一哨兵。
+//
+// 用 -1 而不是 0 的原因：0 是合法的黑色（0x000000）。早期版本用
+// 0 表示「无颜色」，结果黑色填充永远画不出来 —— 而且症状是
+// 「设了黑色却没效果」，看起来像圆角或裁剪出了问题。
+const UI_NONE = -1
+
+// 全默认样式：不填不描边、无圆角、走主题文字色、不透明、无变换。
+//
+// 这是一个「什么都不做」的样式，所以它适合做链式派的起点：
+//     Style.plain().fill(x).radius(8)
+fn Style.plain() -> Style {
+    return Style {
+        fill: UI_NONE, fillHover: UI_NONE, fillActive: UI_NONE,
+        border: UI_NONE, borderW: 1,
+        radius: 0,
+        text: UI_NONE, textDim: UI_NONE, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100,
+        rotDeg: 0.0, scale: 100,
+        clip: false,
+        shadow: UI_NONE, shadowX: 0, shadowY: 2,
+    }
+}
+
+// 从主题派生一套基础样式：面板色 + 细描边 + 小圆角。
+//
+// 这是绝大多数控件想要的起点，也是「主题一变、整套界面跟着变」
+// 的落点 —— 控件不存硬编码颜色，只持有从主题派生的 Style。
+fn Style.fromTheme(th: Theme) -> Style {
+    return Style {
+        fill: th.surface, fillHover: th.surfaceHover, fillActive: th.surfaceActive,
+        border: th.border, borderW: 1,
+        radius: 4,
+        text: th.text, textDim: th.textDim, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100,
+        rotDeg: 0.0, scale: 100,
+        clip: false,
+        shadow: UI_NONE, shadowX: 0, shadowY: 2,
+    }
+}
+
+// 卡片样式：大圆角 + 阴影，用于浮层和对话框。
+fn Style.card() -> Style {
+    return Style {
+        fill: UI_SURFACE, fillHover: UI_SURFACE, fillActive: UI_SURFACE,
+        border: UI_BORDER, borderW: 1,
+        radius: 10,
+        text: UI_TEXT, textDim: UI_TEXT_DIM, align: 0,
+        gradFrom: UI_NONE, gradTo: UI_NONE, gradVertical: true,
+        alpha: 100,
+        rotDeg: 0.0, scale: 100,
+        clip: false,
+        shadow: 0x000000, shadowX: 0, shadowY: 6,
+    }
+}
+
+// ---- 派生方法（链式）----
+//
+// 每个方法都返回一个新 Style。命名用短动词而不是 setFill：
+// 链式调用里 `s.fill(x).radius(8)` 比 `s.setFill(x).setRadius(8)`
+// 读起来更像描述而不是命令序列，而这正是「样式是值」的表达。
+
+fn Style.fill(self: Style, c: Int) -> Style {
+    return Style {
+        fill: c, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.states(self: Style, hover: Int, active: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: hover, fillActive: active,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.border(self: Style, c: Int, w: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: c, borderW: w, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.radius(self: Style, r: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: r,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.textColor(self: Style, c: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: c, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+// 注意参数名用 c1/c2 而不是 from/to：`from` 是关键字（循环与导入都用它）。
+// 这不是随手起名 —— 语言层不开放关键字做标识符，参数名就必须绕开。
+fn Style.gradient(self: Style, c1: Int, c2: Int, vertical: Bool) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: c1, gradTo: c2, gradVertical: vertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+// 透明度 0~100。夹紧而不是报错：样式派生链上去一点不奇怪，
+// 而为了一个越界值中断整个界面渲染没有意义。
+fn Style.opacity(self: Style, pct: Int) -> Style {
+    var p = pct
+    if (p < 0) { p = 0 }
+    if (p > 100) { p = 100 }
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: p, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.rotate(self: Style, deg: Float) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: deg, scale: self.scale,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+// 缩放，百分比（100 = 原尺寸）。
+fn Style.scaleTo(self: Style, pct: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: pct,
+        clip: self.clip, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.withClip(self: Style) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: true, shadow: self.shadow,
+        shadowX: self.shadowX, shadowY: self.shadowY,
+    }
+}
+
+fn Style.withShadow(self: Style, c: Int, dx: Int, dy: Int) -> Style {
+    return Style {
+        fill: self.fill, fillHover: self.fillHover, fillActive: self.fillActive,
+        border: self.border, borderW: self.borderW, radius: self.radius,
+        text: self.text, textDim: self.textDim, align: self.align,
+        gradFrom: self.gradFrom, gradTo: self.gradTo, gradVertical: self.gradVertical,
+        alpha: self.alpha, rotDeg: self.rotDeg, scale: self.scale,
+        clip: self.clip, shadow: c,
+        shadowX: dx, shadowY: dy,
+    }
+}
+
+// ---- 动画（Anim）----
+//
+// ============================================================
+// 设计说明：为什么动画是「按时间插值」而不是状态机
+// ============================================================
+//
+// ── 即时模式下的动画该长什么样 ──────────────────────────────
+//
+// 状态机式的动画（onStart / onUpdate / onComplete + 内部计时器）
+// 需要一个**长期存活且可变**的对象。而即时模式每帧重建一切，
+// 状态机里的计时器要么存在外部，要么就得让控件有身份 ——
+// 后者正是即时模式要避免的东西。
+//
+// 所以这里用最朴素也最稳的形式：**一个值 + 一个时间区间**。
+//
+//     let a = Anim.at(0.0, 1.0, 0.3)
+//     let v = a.value()      // 每帧算一次，0 到 1
+//
+// 没有回调、没有内部状态推进、没有生命周期。t0 是创建时刻，
+// value() 用 winTime() 现算 —— 同一个 Anim 值在任何帧调用
+// 都会得到「按真实时间应得的值」，所以它天然可以在多控件间
+// 共享，也天然能被拷贝。
+//
+// 代价：Anim 必须被**持有**（存在某个跨帧存活的地方）。这是
+// 调用方的责任，也是唯一无法避免的一点 —— 时间的流逝本身
+// 就需要一个「从什么时候开始」的记录。
+//
+// ── 缓动曲线为什么手写而不是查表 ────────────────────────────
+//
+// 二次曲线足够，而且闭式公式让「任意时刻求值」成立（查表要给
+// 每个阶段建表，表的精度又成了新参数）。真要更好的曲线，
+// cubic 版本也只是改两行。
+struct Anim {
+    a: Float,        // 起点值
+    b: Float,        // 终点值
+    t0: Float,       // 起始时刻（winTime）
+    dur: Float,      // 时长（秒）
+    ease: Int,       // 0=线性 1=easeIn 2=easeOut 3=easeInOut
+}
+
+// 缓动：把线性 0~1 映射成曲线 0~1。
+//
+// 三个公式都保证 e(0)=0、e(1)=1 —— 这是动画不「跳」的前提。
+fn Anim.easeApply(kind: Int, t: Float) -> Float {
+    if (kind == 1) {
+        return t * t                       // easeIn：慢起
+    }
+    if (kind == 2) {
+        return t * (2.0 - t)               // easeOut：快起慢停
+    }
+    if (kind == 3) {
+        // easeInOut：前半加速、后半减速。用 2t² / 1-2(1-t)²
+        // 而不是三次贝塞尔 —— 后者要解方程才能求值，而这个
+        // 每帧都要算。
+        if (t < 0.5) { return 2.0 * t * t }
+        let u = 1.0 - t
+        return 1.0 - 2.0 * u * u
+    }
+    return t                               // 线性
+}
+
+fn Anim.at(a: Float, b: Float, dur: Float) -> Anim {
+    return Anim {
+        a: a, b: b,
+        t0: winTime(),
+        dur: dur,
+        ease: 2,      // 默认 easeOut：UI 里最常用的是「快速出现、缓缓停住」
+    }
+}
+
+// 起止都是 0~1 的简化版（主用于透明度、进度）。
+fn Anim.unit(dur: Float) -> Anim {
+    return Anim.at(0.0, 1.0, dur)
+}
+
+fn Anim.withEase(self: Anim, kind: Int) -> Anim {
+    return Anim {
+        a: self.a, b: self.b,
+        t0: self.t0, dur: self.dur,
+        ease: kind,
+    }
+}
+
+// 改起点时刻（用于手动推迟开始）。
+fn Anim.startedAt(self: Anim, t: Float) -> Anim {
+    return Anim {
+        a: self.a, b: self.b,
+        t0: t, dur: self.dur,
+        ease: self.ease,
+    }
+}
+
+// 当前进度 0.0~1.0（未缓动）。用于「是不是结束了」之外的自定义插值。
+fn Anim.progress(self: Anim) -> Float {
+    let el = winTime() - self.t0
+    if (self.dur <= 0.0) { return 1.0 }
+    var k = el / self.dur
+    if (k < 0.0) { k = 0.0 }
+    if (k > 1.0) { k = 1.0 }
+    return k
+}
+
+// 当前值（已缓动）。
+fn Anim.value(self: Anim) -> Float {
+    let k = Anim.easeApply(self.ease, self.progress())
+    return self.a + (self.b - self.a) * k
+}
+
+// 当前值，转成 Int。位置、尺寸、颜色分量这类整数场景用这个，
+// 省掉调用点每处的 toInt。
+fn Anim.valueInt(self: Anim) -> Int {
+    return toInt(Anim.value(self))
+}
+
+fn Anim.done(self: Anim) -> Bool {
+    return Anim.progress(self) >= 1.0
+}
+
+// ---- 样式的绘制执行 ----
+//
+// ============================================================
+// 设计说明：Style 到这里才变成像素
+// ============================================================
+//
+// 前面整段 Style 只是一个「数据描述」。真正难的不是把 19 个字段
+// 装进结构体 —— 难的是**决定哪个字段在什么条件下生效、按什么
+// 顺序叠加**。这段就是那个决定，也是整个特性的落点。
+//
+// ── 绘制顺序为什么不能乱 ────────────────────────────────────
+//
+//   1. 裁剪（如果开了）——必须最先，否则后面的影子会画到外面
+//   2. 阴影             ——必须在填充之前，否则被自己的填充盖住
+//   3. 变换（旋转/缩放）——填充/描边都受它影响
+//   4. 填充（渐变优先于纯色）
+//   5. 描边
+//   6. 文字             ——必须在填充之上
+//
+// 顺序错了的症状都很具体：阴影画在填充之后 → 阴影完全看不见；
+// 文字画在填充之前 → 文字被糊掉；变换放在填充之后 → 只有描边
+// 和文字跟着转，填充不动，看起来像「两个不同的控件拼在一起」。
+
+// 按当前状态取填充色。返回 UI_NONE 表示不填。
+//
+// 状态优先级：按下 > 悬停 > 常态。这是所有平台的共同约定 ——
+// 按住鼠标时手指就在那儿，此刻的视觉反馈必须是「正在按」。
+fn Style.fillFor(self: Style, hovered: Bool, pressed: Bool) -> Int {
+    if (pressed) {
+        if (self.fillActive != UI_NONE) { return self.fillActive }
+    }
+    if (hovered) {
+        if (self.fillHover != UI_NONE) { return self.fillHover }
+    }
+    return self.fill
+}
+
+// 画一块区域，用这套样式。
+//
+// `r` 是控件矩形，`hovered` / `pressed` 由调用方从当前帧的事件算出。
+// 这是 Style 唯一需要的「环境信息」—— 除此之外的一切都在 Style 里。
+fn Style.draw(self: Style, r: Rect, hovered: Bool, pressed: Bool) {
+    if (r.isEmpty()) { return }
+
+    // ---- 1. 裁剪 ----
+    if (self.clip) { winClip(r.x, r.y, r.w, r.h) }
+
+    // ---- 2. 透明度 ----
+    //
+    // 推入而不是设置：乘性叠加让嵌套自然成立（面板 0.8 里的
+    // 按钮 0.5 得到 0.4，而覆盖语义会丢掉外层的 0.8）。
+    let a = 1.0 * toFloat(self.alpha) / 100.0
+    winAlpha(a)
+
+    // ---- 3. 阴影 ----
+    //
+    // 画在变换之前、用轴对齐矩形。旋转的阴影在 GDI 里要单独算
+    // 一份变换，而视觉收益近乎为零 —— 「影子跟着转」没人会注意，
+    // 但代价是每帧多一次坐标系切换。
+    if (self.shadow != UI_NONE) {
+        winFillRound(r.x + self.shadowX, r.y + self.shadowY,
+                     r.w, r.h, self.radius, self.shadow)
+    }
+
+    // ---- 4. 变换 ----
+    //
+    // 轴心取矩形中心：绕左上角旋转会让控件甩出视野，
+    // 而「绕中心转」是所有人对「旋转这个控件」的默认预期。
+    let rotated = self.rotDeg != 0.0
+    let scaled = self.scale != 100
+    if (rotated || scaled) {
+        winPushTransform(toFloat(r.cx()), toFloat(r.cy()),
+                         self.rotDeg, toFloat(self.scale) / 100.0)
+    }
+
+    // ---- 5. 填充 ----
+    //
+    // 渐变优先于纯色。两个都设时用渐变 —— 因为渐变是更具体的
+    // 意图，静默忽略它会让「我明明设了渐变」变成一个哑谜。
+    if (self.gradFrom != UI_NONE && self.gradTo != UI_NONE) {
+        winGradient(r.x, r.y, r.w, r.h, self.gradFrom, self.gradTo,
+                    self.gradVertical)
+    } else {
+        let f = Style.fillFor(self, hovered, pressed)
+        if (f != UI_NONE) {
+            winFillRound(r.x, r.y, r.w, r.h, self.radius, f)
+        }
+    }
+
+    // ---- 6. 描边 ----
+    if (self.border != UI_NONE && self.borderW > 0) {
+        winBorderRound(r.x, r.y, r.w, r.h, self.radius,
+                       self.borderW, self.border)
+    }
+
+    // ---- 7. 变换收尾（文字要在变换内画，才能跟着转）----
+    if (rotated || scaled) { winPopTransform() }
+
+    // ---- 8. 透明度收尾 ----
+    //
+    // 注意：弹出在文字之前。文字的 alpha 由它自己的颜色控制，
+    // 而 blend_on_bg 的近似在文字上误差最大（细笔画预混合后
+    // 会和背景糊在一起）。所以文字不参与 opacity —— 这是近似
+    // 实现的一个明确取舍，写在实现里而不是藏着。
+    winPopAlpha()
+
+    if (self.clip) { winUnclip() }
+}
+
+// 只画填充 + 描边，不画文字、不管透明度与变换。
+//
+// 存在的理由：滑块轨道、进度条底槽这类「纯色块」用得着，
+// 而它们每帧几十个，走完整 draw 会把 alpha 栈推推弹弹几十次。
+fn Style.drawBox(self: Style, r: Rect) {
+    if (r.isEmpty()) { return }
+    if (self.gradFrom != UI_NONE && self.gradTo != UI_NONE) {
+        winGradient(r.x, r.y, r.w, r.h, self.gradFrom, self.gradTo,
+                    self.gradVertical)
+    } else if (self.fill != UI_NONE) {
+        winFillRound(r.x, r.y, r.w, r.h, self.radius, self.fill)
+    }
+    if (self.border != UI_NONE && self.borderW > 0) {
+        winBorderRound(r.x, r.y, r.w, r.h, self.radius,
+                       self.borderW, self.border)
+    }
+}
+
+// 在区域内按 align 写一行字。0=居中 1=左 2=右，pad 是左右留白。
+//
+// 抽出来是因为「填充 + 描边 + 文字」这个组合在控件里重复太多次，
+// 而每次重写都要重新决定 align 的分支 —— 那正是容易写反的地方。
+fn Style.drawText(self: Style, r: Rect, s: String, pad: Int) {
+    if (self.text == UI_NONE) { return }
+    if (self.align == 1) {
+        uiTextLeft(r.x, r.y, r.w, r.h, s, pad, self.text)
+        return
+    }
+    if (self.align == 2) {
+        winText(r.x + r.w - pad - winTextWidth(s),
+                r.y + (r.h - winTextHeight()) / 2, s, self.text)
+        return
+    }
+    uiTextInRect(r.x, r.y, r.w, r.h, s, self.text)
+}
+
+// 一个完整的「带样式控件」：填充 + 描边 + 文字，一步到位。
+//
+// 这是 99% 的控件想要的。`Style.draw` 是给需要自己控制文字位置
+// 的场景（图标按钮、双行标签），而这个是默认路径。
+fn Style.render(self: Style, r: Rect, label: String, hovered: Bool, pressed: Bool) {
+    Style.draw(self, r, hovered, pressed)
+    Style.drawText(self, r, label, 8)
+}
+
+// 用动画覆盖透明度。返回派生出的新样式 —— 和所有派生方法一样
+// 不改原值，因为「动画中的样式」每帧都不同，而原始样式要留着
+// 做下一帧的起点。
+fn Style.animateAlpha(self: Style, an: Anim) -> Style {
+    return Style.opacity(self, an.valueInt())
+}
+
+// 用动画覆盖旋转角。
+fn Style.animateRot(self: Style, an: Anim) -> Style {
+    return Style.rotate(self, an.value())
+}
+
+// 用动画覆盖缩放（Anim 走 0~1，这里映射成 0~100%）。
+fn Style.animateScale(self: Style, an: Anim) -> Style {
+    return Style.scaleTo(self, an.valueInt())
+}
+
+// ---- 按钮 ----
+//
+// `Button` 是一个**描述**，不是一个控件对象。
+//
+// ── 这和「保留状态的对象」有什么不同 ────────────────────────
+//
+// 真正的控件对象要存「是否悬停 / 是否按下 / 是否聚焦」，那需要
+// 跨帧存活的可变状态。而字段不可变，做不到 —— 也不该做：跨帧
+// 状态一旦分散在控件对象里，就会出现「状态在界面里一份、在逻辑
+// 里一份」的同步问题，那正是即时模式刻意避开的东西。
+//
+// 所以 Button 描述的是「长什么样、放在哪」，画的时候从当前帧的
+// 鼠标/事件实时算出视觉反馈。调用方需要保管的只有业务状态
+// （选中的是哪个、开关是不是开着），那本来就该归它。
+struct Button {
+    rect: Rect,
+    label: String,
+    kind: Int,      // 0=普通 1=主色 2=危险 3=文字
+    enabled: Bool,
+}
+
+fn Button.of(r: Rect, label: String) -> Button {
+    return Button { rect: r, label: label, kind: 0, enabled: true }
+}
+
+fn Button.primary(r: Rect, label: String) -> Button {
+    return Button { rect: r, label: label, kind: 1, enabled: true }
+}
+
+fn Button.danger(r: Rect, label: String) -> Button {
+    return Button { rect: r, label: label, kind: 2, enabled: true }
+}
+
+fn Button.flat(r: Rect, label: String) -> Button {
+    return Button { rect: r, label: label, kind: 3, enabled: true }
+}
+
+fn Button.disabled(self: Button) -> Button {
+    return Button { rect: self.rect, label: self.label,
+                    kind: self.kind, enabled: false }
+}
+
+// 从主题 + 按钮种类算出这套按钮的样式。
+//
+// 这个函数替代了原来 5 个 if 分支里各自的 fill 选择逻辑。它把
+// 「按钮长什么样」收成一处数据，于是：
+//   · 想给所有按钮加圆角 → 改 Button.style 一处
+//   · 想给某类按钮改色 → 改对应分支一处
+//   · 想让用户自定义某个按钮 → 外面套一层 .fill(x).radius(12)
+//
+// 注意 kind 3（文字按钮）刻意不设填充 —— 它的「背景」只在悬停时
+// 出现。用一个 UI_NONE 的常态填充 + 有值的悬停填充正好表达这件事，
+// 而不用在 draw 里再写一个 if。
+fn Button.style(self: Button, th: Theme) -> Style {
+    if (!self.enabled) {
+        return Style.fromTheme(th)
+            .fill(th.surfaceActive)
+            .border(th.border, 1)
+            .radius(4)
+            .textColor(th.textDim)
+    }
+    if (self.kind == 1) {
+        return Style.fromTheme(th)
+            .fill(th.accent)
+            .states(th.accentDark, th.accentDark)
+            .border(UI_NONE, 0)
+            .radius(4)
+            .textColor(th.onAccent)
+    }
+    if (self.kind == 2) {
+        return Style.fromTheme(th)
+            .fill(th.err)
+            .states(0xDC2626, 0xB91C1C)
+            .border(UI_NONE, 0)
+            .radius(4)
+            .textColor(0xFFFFFF)
+    }
+    if (self.kind == 3) {
+        // 文字按钮：常态不填，悬停才出底色
+        return Style.fromTheme(th)
+            .fill(UI_NONE)
+            .states(th.surfaceHover, th.surfaceActive)
+            .border(UI_NONE, 0)
+            .radius(4)
+            .textColor(th.text)
+    }
+    return Style.fromTheme(th)
+        .fill(th.surface)
+        .states(th.surfaceHover, th.surfaceActive)
+        .border(th.border, 1)
+        .radius(4)
+        .textColor(th.text)
+}
+
+// 只画，不判定点击。这是类型层的统一约定：
+// **draw 只管像素，判定由 Frame 统一做**。见文件末尾「点击归属」。
+//
+// 现在的实现全部走 Style.draw —— 所以圆角、渐变、透明度、旋转
+// 这些能力**自动**对按钮生效，不需要在 draw 里为每种加一遍分支。
+// 这正是引入 Style 的直接收益：原来「再加一个圆角参数就是 9 个参数」
+// 的困境消失了。
+fn Button.draw(self: Button, th: Theme) {
+    let st = Button.style(self, th)
+    Style.render(st, self.rect, self.label, self.rect.hovered(), self.rect.pressed())
+}
+
+// 用自定义样式画。调用方想圆角 16、加渐变、半透明，都从这条走。
+//
+// 这里逐个字段搬而不是直接 Style.render(over, ...)：over 是调用方
+// 给的**覆盖**，它的 textDim / align / clip 一般都是默认值，直接用
+// 会把主题派生的那部分冲掉。显式列出要覆盖的字段，其余留主题值。
+fn Button.drawStyled(self: Button, th: Theme, over: Style) {
+    var st = Style.fromTheme(th)
+        .fill(over.fill)
+        .states(over.fillHover, over.fillActive)
+        .border(over.border, over.borderW)
+        .radius(over.radius)
+        .textColor(over.text)
+        .gradient(over.gradFrom, over.gradTo, over.gradVertical)
+        .opacity(over.alpha)
+        .rotate(over.rotDeg)
+        .scaleTo(over.scale)
+    if (over.shadow != UI_NONE) {
+        st = st.withShadow(over.shadow, over.shadowX, over.shadowY)
+    }
+    Style.render(st, self.rect, self.label, self.rect.hovered(), self.rect.pressed())
+}
+
+// ---- 文本 ----
+//
+// 配色默认**跟随主题**（`fromTheme` 为真时用 th.text / th.textDim），
+// 需要固定颜色时用 `.colored(...)` 覆盖。
+//
+// 为什么要有这个开关而不是「color 为 0 就当没设」：0x000000 是合法
+// 的黑色，用它当哨兵会让「故意要纯黑」变得不可表达。多一个 Bool
+// 字段比留一个语义空洞划算。
+struct Label {
+    rect: Rect,
+    text: String,
+    color: Int,
+    align: Int,     // 0=居中 1=左 2=右
+    pad: Int,
+    fromTheme: Bool,
+    dim: Bool,      // 跟随主题时用次要前景色
+}
+
+fn Label.of(r: Rect, text: String) -> Label {
+    return Label { rect: r, text: text, color: 0, align: 0, pad: 8,
+                   fromTheme: true, dim: false }
+}
+
+fn Label.left(r: Rect, text: String) -> Label {
+    return Label { rect: r, text: text, color: 0, align: 1, pad: 8,
+                   fromTheme: true, dim: false }
+}
+
+// 次要文字（说明、读数）
+fn Label.dimmed(self: Label) -> Label {
+    return Label { rect: self.rect, text: self.text, color: self.color,
+                   align: self.align, pad: self.pad,
+                   fromTheme: self.fromTheme, dim: true }
+}
+
+fn Label.colored(self: Label, c: Int) -> Label {
+    return Label { rect: self.rect, text: self.text,
+                   color: c, align: self.align, pad: self.pad,
+                   fromTheme: false, dim: self.dim }
+}
+
+fn Label.draw(self: Label, th: Theme) {
+    let r = self.rect
+    var fg = self.color
+    if (self.fromTheme) {
+        fg = th.text
+        if (self.dim) { fg = th.textDim }
+    }
+    if (self.align == 1) {
+        uiTextLeft(r.x, r.y, r.w, r.h, self.text, self.pad, fg)
+    } else if (self.align == 2) {
+        let tw = winTextWidth(self.text)
+        winText(r.x + r.w - self.pad - tw,
+                r.y + (r.h - winTextHeight()) / 2, self.text, fg)
+    } else {
+        uiTextInRect(r.x, r.y, r.w, r.h, self.text, fg)
+    }
+}
+
+// ---- 面板 ----
+struct Panel {
+    rect: Rect,
+    title: String,
+    theme: Theme,
+}
+
+fn Panel.of(r: Rect, title: String, th: Theme) -> Panel {
+    return Panel { rect: r, title: title, theme: th }
+}
+
+// 画面板，返回**内容区**（去掉标题栏与内边距）。
+//
+// 返回 Rect 而不是 Int（旧 uiPanelTitled 返回内容区顶边 y）：
+// 内容区是一个矩形，只给 y 会让调用方还得自己算 x/w/h，那正是
+// 这一层想消灭的重复劳动。
+// 面板样式：大圆角 + 投影，用于浮层级的容器。
+//
+// 原来 Panel.draw 只有 winFillRect + winBorderRect —— 硬边直角，
+// 在视觉上永远是「一块贴上去的色块」。加上圆角和阴影之后它才
+// 真的像一个面板，而这两件事都是 Style 的多行字段，不是新参数。
+fn Panel.style(self: Panel) -> Style {
+    let th = self.theme
+    return Style.fromTheme(th)
+        .fill(th.surface)
+        .border(th.border, 1)
+        .radius(6)
+        .textColor(th.text)
+}
+
+fn Panel.draw(self: Panel) -> Rect {
+    let r = self.rect
+    let st = Panel.style(self)
+    Style.drawBox(st, r)
+    if (len(self.title) > 0) {
+        let barH = 28
+        // 标题栏用悬停色铺，并且**只在上面两个角**圆角 —— 这是
+        // 面板最难做得像样的一处：整条标题栏都圆角的话，下沿会
+        // 露出一道弧线缝。这里用「同半径的矩形，但只信任上沿」：
+        // 靠外层 clip 把下沿切掉。
+        let bar = Rect { x: r.x + 1, y: r.y + 1, w: r.w - 2, h: barH }
+        winClip(bar.x, bar.y, bar.w, bar.h)
+        let barStyle = Style.plain()
+            .fill(self.theme.surfaceHover)
+            .radius(5)
+        Style.drawBox(barStyle, Rect { x: bar.x, y: bar.y,
+                                       w: bar.w, h: bar.h + 8 })
+        winUnclip()
+        uiTextLeft(r.x, r.y, r.w, barH, self.title, 10, self.theme.text)
+        return Rect { x: r.x + 10, y: r.y + barH + 12,
+                      w: r.w - 20, h: r.h - barH - 22 }
+    }
+    return Rect { x: r.x + 10, y: r.y + 10, w: r.w - 20, h: r.h - 20 }
+}
+
+// ---- 进度条 ----
+struct Progress {
+    rect: Rect,
+    ratio: Float,
+    label: Bool,
+}
+
+fn Progress.of(r: Rect, ratio: Float) -> Progress {
+    return Progress { rect: r, ratio: ratio, label: false }
+}
+
+fn Progress.withLabel(self: Progress) -> Progress {
+    return Progress { rect: self.rect, ratio: self.ratio, label: true }
+}
+
+// 全自绘，不复用 uiProgress —— 旧函数用的是硬编码深色常量，
+// 在浅色主题下就是「深灰轨道 + 白字」，看不见。
+// 这不是重写，是类型层必须自己承担配色。
+fn Progress.draw(self: Progress, th: Theme) {
+    let r = self.rect
+    var t = self.ratio
+    if (t < 0.0) { t = 0.0 }
+    if (t > 1.0) { t = 1.0 }
+
+    // 轨道与填充都要圆角，而且半径取 r.h/2 —— 进度条是胶囊形的，
+    // 高度就是直径。这样 1px 细条也是圆头，不会像被切了一刀。
+    let rad = r.h / 2
+
+    // 轨道：深色底 + 细描边
+    let trackStyle = Style.plain()
+        .fill(th.track)
+        .border(th.border, 1)
+        .radius(rad)
+    Style.drawBox(trackStyle, r)
+
+    // 填充：圆角必须和轨道一致，否则两端的弧度对不上会露出一道
+    // 深浅不一的月牙。宽度为 0 时不画（RoundRect 在 w<h 时形状退化）。
+    let fw = toInt(t * toFloat(r.w) + 0.5)
+    if (fw > 0) {
+        let fillStyle = Style.plain().fill(th.accent).radius(rad)
+        Style.drawBox(fillStyle, Rect { x: r.x, y: r.y, w: fw, h: r.h })
+    }
+
+    if (self.label) {
+        let pct = toString(toInt(t * 100.0 + 0.5)) + "%"
+        // 文字压在填充区上时用 onAccent，压在空轨道上用 text。
+        // 判据是「文字中心在不在填充宽度以内」，比逐像素判断省事得多。
+        let tw = winTextWidth(pct)
+        let tx = r.x + (r.w - tw) / 2
+        var fg = th.text
+        if (tx + tw / 2 <= r.x + fw) { fg = th.onAccent }
+        winText(tx, r.y + (r.h - winTextHeight()) / 2, pct, fg)
+    }
+}
+
+// ---- 行/列游标（布局） ----
+//
+// 旧方案用 `array(1, 0)` 当游标，调用方看到的是「一个装的数字的数组」，
+// 完全不知道它是什么。改成结构体之后，`c.y` 自解释。
+//
+// 这里字段可变做不到，所以游标对象每次推进都**返回新的**：
+//     var c = Cursor.at(20, 20)
+//     let r = c.take(32, 8)      // 拿走一条 32 高的
+//     c = c.advance(32, 8)       // 游标前移
+// 两句话有点啰嗦，但语义清楚，而且 `r` 和 `c` 的分离恰好让
+// 「这一条的位置」和「下一条去哪」不会再混。
+struct Cursor {
+    x: Int,
+    y: Int,
+}
+
+fn Cursor.at(x: Int, y: Int) -> Cursor {
+    return Cursor { x: x, y: y }
+}
+
+// 当前游标位置的横条，高 h、宽 w。
+fn Cursor.row(self: Cursor, w: Int, h: Int) -> Rect {
+    return Rect { x: self.x, y: self.y, w: w, h: h }
+}
+
+fn Cursor.advance(self: Cursor, h: Int, gap: Int) -> Cursor {
+    return Cursor { x: self.x, y: self.y + h + gap }
+}
+
+fn Cursor.indent(self: Cursor, dx: Int) -> Cursor {
+    return Cursor { x: self.x + dx, y: self.y }
+}
+
+// ---- 勾选框 ----
+//
+// 旧 uiCheck 的契约是「返回**新值**」而不是「是否被点」：
+//
+//     v = uiCheck(20, 100, "运行中", v)        // 正确
+//     if (uiCheck(20, 100, "运行中", v)) { v = !v }   // 错
+//
+// 第二种写法错得很隐蔽：`uiCheck` 在 v 为 true 时什么都不做也返回
+// true，于是立刻被取反成 false。看起来像「自己把自己点掉了」。
+//
+// 我在 games/settings/demo.xle 里就是这么写错的，而且错了两处：
+// 一处把返回值当「点击」，另一处紧接着用 `!st.music` 再取反一次。
+// 两次错正好抵消了一次，所以第一帧看着是对的，第二帧才崩。
+//
+// 光靠注释显然挡不住。类型层的做法是让**返回值只能有一种解释**：
+// Check.draw 返回 Check 本身（一个结构体），想拿状态就读 `.on`，
+// 它永远不可能是 Bool，也就不可能被当成「是否点击」误用。
+struct Check {
+    rect: Rect,      // 方块 + 间距 + 标签文字，整个可点区域
+    label: String,
+    on: Bool,
+}
+
+fn Check.of(r: Rect, label: String, on: Bool) -> Check {
+    return Check { rect: r, label: label, on: on }
+}
+
+// 以矩形左边为基准，按标准勾选框尺寸重建（方块 18 + 间距 8 + 文字宽）
+fn Check.at(x: Int, y: Int, label: String, on: Bool) -> Check {
+    let box = 18
+    return Check {
+        rect: Rect { x: x, y: y, w: box + 8 + winTextWidth(label), h: box },
+        label: label,
+        on: on,
+    }
+}
+
+// 勾选框的方块样式。
+fn Check.boxStyle(self: Check, th: Theme, hovered: Bool) -> Style {
+    if (self.on) {
+        return Style.plain()
+            .fill(th.accent)
+            .border(th.accent, 0)
+            .radius(3)
+    }
+    if (hovered) {
+        return Style.plain()
+            .fill(th.surfaceHover)
+            .border(th.border, 1)
+            .radius(3)
+    }
+    return Style.plain()
+        .fill(th.track)
+        .border(th.border, 1)
+        .radius(3)
+}
+
+// 只画，不改状态也不判点击 —— 状态变化由调用方通过 `.toggle()`
+// 或 `.with(b)` 显式完成。
+//
+// 为什么不再「画完顺便返回新状态」：那会让 draw 同时承担两个语义，
+// 而返回值是 Check 时调用方很容易忘了接。分成 draw / toggle 两步，
+// 漏接会直接体现为「点了没反应」，是可发现的；而 draw 里偷偷改
+// 状态漏接则表现为「偶发逻辑错」，不可发现。
+fn Check.draw(self: Check, th: Theme) {
+    let box = 18
+    let r = self.rect
+    let over = r.hovered()
+
+    // 方块：圆角 3，选中时是主色块，未选中是深色槽
+    Style.drawBox(Check.boxStyle(self, th, over),
+                  Rect { x: r.x, y: r.y, w: box, h: box })
+
+    if (self.on) {
+        // 对勾用一个四点多边形，而不是 8 个 2x2 的 winFillRect 像素点。
+        //
+        // 原来的像素拼法有个具体的毛病：2x2 的小方块在斜线上必然
+        // 出现台阶，而且随 DPI 缩放会露出缝。多边形一次成型，边缘
+        // 由 GDI 做抗锯齿以外的光栅化，至少不会有缝。
+        //
+        // 点在 18px 方块的相对坐标上取：短臂 (5,9)→(8,12)，
+        // 长臂 (8,12)→(13,6)。宽度靠两个偏移点做出来。
+        let cx = r.x
+        let cy = r.y
+        let pts = array(12, 0)
+        pts[0]  = cx + 5
+        pts[1]  = cy + 9
+        pts[2]  = cx + 8
+        pts[3]  = cy + 12
+        pts[4]  = cx + 13
+        pts[5]  = cy + 6
+        pts[6]  = cx + 13
+        pts[7]  = cy + 4
+        pts[8]  = cx + 8
+        pts[9]  = cy + 10
+        pts[10] = cx + 5
+        pts[11] = cy + 7
+        winPath(pts, th.onAccent)
+    }
+
+    winText(r.x + box + 8, r.y + (box - winTextHeight()) / 2,
+            self.label, th.text)
+}
+
+// 显式翻转。调用方必须先自己判断「这次点击归我」，再调它。
+//
+// 这个分离不是啰嗦，而是把「谁被点了」和「点了怎么变」拆成两件事 ——
+// 前者是平台层的事实，后者是业务的决定。合在一起就会出现
+// 「滑条和勾选框抢同一次点击」这类问题。
+fn Check.toggle(self: Check) -> Check {
+    return Check { rect: self.rect, label: self.label, on: !self.on }
+}
+
+// 带新值的版本，配合「点击归属」一次到位。
+fn Check.with(self: Check, b: Bool) -> Check {
+    return Check { rect: self.rect, label: self.label, on: b }
+}
+
+// ---- 滑条 ----
+//
+// 旧 uiSlider 在类型层里活不下来，有两个原因：
+//
+// 1. 它把「拖动」绑在 winMouseDown 上，却**不消费**点击队列，
+//    而 uiButton / uiCheck 会消费。控件之间行为不一致，同一帧里
+//    谁先画谁就能抢到那次点击 —— 这种耦合不该暴露给调用方。
+// 2. 值域用 Float，于是「0 到 100 的音量」这种整数场景也要走浮点，
+//    最后再 toInt 回来，多一次舍入，还多一处可能写错的地方。
+//
+// Slider 改成：值域是 Int，比例由 ratio() 单独给，鼠标状态由调用方
+// 传进来。这样它就没有任何隐藏的平台依赖，纯粹是「算」而不是「问」。
+struct Slider {
+    rect: Rect,
+    lo: Int,
+    hi: Int,
+}
+
+fn Slider.of(r: Rect, lo: Int, hi: Int) -> Slider {
+    return Slider { rect: r, lo: lo, hi: hi }
+}
+
+// 可拖动的纵向范围。比矩形略高，让鼠标好按一点 ——
+// 12px 高的轨道按起来太窄，24px 是手感下限。
+fn Slider.track(self: Slider) -> Rect {
+    return Rect { x: self.rect.x, y: self.rect.y - 4,
+                  w: self.rect.w, h: self.rect.h + 8 }
+}
+
+// 当前值占值域的比例，0.0 ~ 1.0。Progress 可以直接吃这个值。
+fn Slider.ratio(self: Slider, v: Int) -> Float {
+    if (self.hi <= self.lo) { return 0.0 }
+    var t = toFloat(v - self.lo) / toFloat(self.hi - self.lo)
+    if (t < 0.0) { t = 0.0 }
+    if (t > 1.0) { t = 1.0 }
+    return t
+}
+
+// 鼠标横坐标换算成值。分母用 w-1 而不是 w，否则最右一像素到不了 hi。
+fn Slider.valueAt(self: Slider, mx: Int) -> Int {
+    let span = self.rect.w
+    if (span <= 1) { return self.lo }
+    var t = toFloat(mx - self.rect.x) / toFloat(span - 1)
+    if (t < 0.0) { t = 0.0 }
+    if (t > 1.0) { t = 1.0 }
+    return self.lo + toInt(t * toFloat(self.hi - self.lo) + 0.5)
+}
+
+// 画一帧。pressing 由调用方给（通常是 winMouseDown(0)），
+// 返回这一帧之后的值 —— 没有按下就是原值。
+fn Slider.draw(self: Slider, v: Int, pressing: Bool, th: Theme) -> Int {
+    let r = self.rect
+    let trackH = 6
+    let knobW = 14
+    let knobH = 20
+    let cy = r.y + knobH / 2 - trackH / 2
+    let active = pressing && self.track().hovered()
+
+    // 轨道：胶囊形。trackH/2 做半径，两端是半圆 —— 12px 的细条
+    // 如果是直角，看起来像一根黑色积木而不是滑轨。
+    let trackStyle = Style.plain().fill(th.track).radius(trackH / 2)
+    Style.drawBox(trackStyle, Rect { x: r.x, y: cy, w: r.w, h: trackH })
+
+    // 已填充段：半径必须比轨道小 1，否则它会把轨道的半圆盖掉，
+    // 视觉上表现为「填充段的两端是方头」，而轨道本身是圆的。
+    let ratio = self.ratio(v)
+    let knobX = r.x + toInt(ratio * toFloat(r.w - knobW) + 0.5)
+    let filled = knobX - r.x + knobW / 2
+    if (filled > 0) {
+        let fillStyle = Style.plain().fill(th.accent)
+            .radius((trackH - 2) / 2)
+        Style.drawBox(fillStyle, Rect { x: r.x, y: cy, w: filled, h: trackH })
+    }
+
+    // 把手：按下时边变主色，平时用次要前景色 —— 这是唯一的反馈，不能省。
+    //
+    // 画成「面 + 边」两层，与类层的 uiSliderEx 保持同一套视觉语言。
+    // 早先用的是实心 th.text：深色主题下是一个白方块，切到浅色主题
+    // 立刻变成压在浅灰轨道上的**纯黑方块**，像块贴上去的胶带。
+    // 同样两块代码画同一个东西，就应该是同一个画法。
+    //
+    // 现在是胶囊形（半径 = 宽/2）+ 按下时投影，和轨道同一套圆角语言。
+    var knobEdge = th.textDim
+    if (active) { knobEdge = th.accent }
+    let knobStyle = Style.plain()
+        .fill(th.surface)
+        .border(knobEdge, 1)
+        .radius(knobW / 2)
+    let knobRect = Rect { x: knobX, y: r.y, w: knobW, h: knobH }
+    if (active) {
+        Style.drawBox(knobStyle.withShadow(0x000000, 0, 2), knobRect)
+    } else {
+        Style.drawBox(knobStyle, knobRect)
+    }
+
+    if (active) {
+        return self.valueAt(winMouseX())
+    }
+    return v
+}
+
+// 值右对齐在滑条右侧的读数。**必须**给读数预留宽度：
+// 如果滑条自己占满整行，读数就会画到面板边框外面去。
+//
+// 这是我在 demo 里踩过的第二个坑：`slider.x + slider.w + 6` 看着
+// 没问题，但 slider.w 等于内容区宽，加 6 已经出界了。
+fn Slider.readout(self: Slider, v: Int, suffix: String,
+                  th: Theme) {
+    let s = toString(v) + suffix
+    let tw = winTextWidth(s)
+    winText(self.rect.right() + 12, self.rect.y + 2, s, th.textDim)
+}
+
+// ============================================================
+// 帧 —— 点击归属
+// ============================================================
+//
+// 这是类型层最重要的一个类型，也是我写 demo 时才发现的真正问题。
+//
+// ── 旧 API 到底错在哪 ────────────────────────────────────────
+//
+// `uiCheck` / `uiButton` 各自去 `winPollClick()` 取一次点击。它们是
+// **有顺序的**：第一个调用的拿走事件，后面的什么都拿不到。
+//
+// 于是「点击归属」变成了「绘制顺序的副产品」：
+//
+//     uiCheck(...背景音乐...)     // 先画，抢走这次点击
+//     uiCheck(...音效...)         // 永远收不到
+//     uiSlider(...)               // 根本不进队列，完全不受影响
+//
+// 三处都不报错，行为却是错的。而且调换两行代码的顺序就会改变
+// 结果 —— 这种耦合是不能靠注释挡住的，只能靠类型挡住。
+//
+// ── Frame 的做法 ────────────────────────────────────────────
+//
+// 一帧开始取**一次**快照，之后所有控件查同一份数据：
+//
+//     var f = Frame.begin()
+//     let yes = Button.primary(r, "保存").hit(f)   // 查快照
+//     f = f.claim(r)                                // 标记已归属
+//
+// `hit` 是纯查询，画多少次、按什么顺序画都不影响结果；
+// `claim` 显式声明「这次点击归我」，之后的控件 `hit` 一律为假。
+// 想改归属顺序，改 claim 的顺序就行，不必动绘制代码。
+//
+// ── 为什么 Frame 是值而不是可变对象 ──────────────────────────
+//
+// claim 返回新的 Frame，调用方写 `f = f.claim(r)`。字段不可变的
+// 约束让这里必须显式回写 —— 看起来不如 `f.claim(r)` 简洁，但它
+// 顺带保证了一件事：忘了回写就是忘了，`hit` 必然为假，不会出现
+// 「状态悄悄改了但没人知道」。
+struct Frame {
+    cx: Int,          // 点击的横坐标
+    cy: Int,          // 点击的纵坐标
+    button: Int,      // 0=左键 1=右 2=中
+    has: Bool,        // 这一帧到底有没有点击
+    claimed: Bool,    // 已经归属给某个控件了
+}
+
+// 取本帧快照。必须在**所有控件之前**调用且只调一次。
+fn Frame.begin() -> Frame {
+    let ev = winPollClick()
+    if (typeOf(ev) == "Null") {
+        return Frame { cx: 0, cy: 0, button: 0, has: false, claimed: false }
+    }
+    return Frame { cx: toInt(ev[0]), cy: toInt(ev[1]), button: toInt(ev[2]),
+                   has: true, claimed: false }
+}
+
+// 点击是否落在 r 内，且还没被别的控件拿走。纯查询，无副作用。
+fn Frame.hit(self: Frame, r: Rect) -> Bool {
+    if (!self.has) { return false }
+    if (self.claimed) { return false }
+    if (self.button != 0) { return false }
+    return self.cx >= r.x && self.cy >= r.y &&
+           self.cx < r.x + r.w && self.cy < r.y + r.h
+}
+
+// 声明这次点击归 r。只有 hit(r) 为真时才会真的归属 ——
+// 所以 `f = f.claim(r)` 可以无条件写在每个控件后面，不必先判。
+fn Frame.claim(self: Frame, r: Rect) -> Frame {
+    if (!self.hit(r)) { return self }
+    return Frame { cx: self.cx, cy: self.cy, button: self.button,
+                   has: self.has, claimed: true }
+}
+
+// 便利别名。等价于 hit，只是名字在「按钮被按下」这个语境下读起来更顺。
+// 注意它**不** claim —— claim 必须显式写，否则「谁被点了」又变成隐式的了。
+fn Frame.press(self: Frame, r: Rect) -> Bool {
+    return self.hit(r)
+}
+
+// 本帧是否还有未被认领的点击 —— 调试用。
+fn Frame.pending(self: Frame) -> Bool {
+    return self.has && !self.claimed
+}
+
+// ============================================================
+// 用类型层重写控件（推荐用法）
+// ============================================================
+//
+// 下面这几个是「类型版」的完整控件：描述 + 画 + 判定分离。
+// 旧的 uiXxx 函数全部保留不动（兼容），但新代码应该用这些。
+
+// 按钮：画 + 判定
+fn Button.clicked(self: Button, f: Frame) -> Bool {
+    return self.enabled && f.hit(self.rect)
+}
+
+// 勾选框：判定 + 给出新状态。返回 Check，永远不会被误当 Bool。
+fn Check.clicked(self: Check, f: Frame) -> Check {
+    if (self.rect.w <= 0) { return self }
+    if (f.hit(self.rect)) { return self.toggle() }
+    return self
+}
+
+// 滑条：判定 + 给出新值。
+//
+// 拖动和点击是两件事：拖动看的是「现在按着没」，不需要事件队列，
+// 所以 Slider 不参与 claim —— 否则按住拖动时会把点击抢走。
+// 但合成点击（f.has 为真）仍要能落到滑条上，否则 demo 的截图模式
+// 里滑条永远点不动。
+fn Slider.dragged(self: Slider, v: Int, f: Frame) -> Int {
+    let pressing = winMouseDown(0)
+    if (pressing && self.track().hovered()) {
+        return self.valueAt(winMouseX())
+    }
+    if (f.hit(self.rect)) {
+        return self.valueAt(f.cx)
+    }
+    return v
+}
+
+// ============================================================
+// 设计说明：为什么组件是类型而不是函数
+// ============================================================
+//
+// 1. **描述与判定分离**。函数式 API 把「画」「判」「改状态」揉在一个
+//    返回值里（uiCheck 返回新值、uiButton 返回是否点击、uiSlider 返回
+//    新值），三种语义共用一个 Bool/Float 通道，必然会有人用错。
+//    类型化之后每个方法的契约写在名字上：`.draw` 只画、`.hit` 只判、
+//    `.toggle` 只改。
+//
+// 2. **组合靠字段，不靠参数**。`uiButtonEx(x,y,w,h,label,bg,bgHover,fg)`
+//    是 8 个参数——再加一个「圆角」就是 9 个，而且调用点全是位置参数。
+//    `Button { rect, label, kind }` 加字段不影响任何调用点。
+//
+// 3. **状态归属清楚**。控件不带跨帧状态（字段不可变），业务状态只有
+//    调用方一份。所以不存在「控件里一份、逻辑里一份」的同步问题。
+//
+// 4. **点击归属显式**。Frame 把「谁被点了」从绘制顺序里解耦出来。
+//    这是唯一必须引入的东西，因为即时模式天然没有事件循环。
+//
+// ── 已知限制 ────────────────────────────────────────────────
+//
+// - 一帧只有一次点击快照。如果一帧内积压了多次点击，多余的会被丢弃。
+//   真实窗口循环一帧只处理一次输入，所以这不构成问题；但用合成事件
+//   连跑多帧（就像 demo 的截图模式）时，需要每帧都 begin。
+// - 字段不可变，所以「改一个字段」必须整个重建结构体。这是值语义的
+//   代价，换来的是任何时刻的值都是完整的。
+
+// ============================================================
+// 类层：可派发的控件树（v0.15）
+// ============================================================
+//
+// ── 为什么还需要类，结构体不是已经够了吗 ────────────────────
+//
+// 上面那套 `struct Button / Label / Panel / Check / Slider` 解决的是
+// **描述**问题：把散落的 4 个 Int 收成一个 Rect、把 8 个位置参数收成
+// 一个具名字段集合。它做得很成功，但有一件事它永远做不到：
+//
+//     fn drawAll(ws: Array) { for w in ws { w.draw(th) } }
+//
+// 结构体没有虚方法。`ws[i].draw(th)` 必须在编译期确定调哪一个
+// `draw` —— 而数组里混着按钮和标签时，编译器没有任何办法知道
+// 这一格是什么。想让这段循环成立只有两条路：
+//
+//   a) 在循环体里手写 if-else 判断每格的真实类型（每加一种控件
+//      就要改这里，而「忘记改」不会被编译器发现）
+//   b) 引入引用语义的类型 + 虚方法派发 → 就是类
+//
+// 这不是「面向对象更优雅」，而是**异构集合遍历**这个具体需求在
+// 值语义下的唯一出路。选择 a 的代价是每次加控件都要找到所有分派点，
+// 而选择 b 之后新增控件只需要写一个 `extends Widget` 的新类。
+//
+// ── 与结构体层的关系 ────────────────────────────────────────
+//
+// 类和结构体在这里是**分工**而不是替代：
+//
+//   Rect / Theme  几何与配色，小而多的值 → 结构体（值语义，拷贝便宜）
+//   Button / Label 的字段      → 结构体（不可变描述）
+//   Widget 树     有身份、可变、需要派发 → 类（引用语义）
+//
+// 一个 `UiButton` 类里同时装着 `Rect`（结构体）和 `Button`（结构体），
+// 这是有意为之：布局是值，控件是对象。把 Rect 也改成类会让每次
+// 传递都变成共享可变状态，而几何数据恰恰是最不该被共享的。
+
+// ---- 抽象基类 ----
+//
+// `abstract` 在这里的作用不是「不允许实例化」（那只是附带效果），
+// 而是**强制子类给出 draw**：Widget 自己不知道一个控件长什么样，
+// 它只知道所有控件都能被画、都有边界、都能判定命中。
+//
+// 三个具体方法（bounds/hit/setPos）在基类里实现一次，所有子类继承。
+// 这是继承真正省事的地方 —— 不是省代码行数，而是省「一致性」：
+// 不可能出现某个控件的 hit 忘记检查 vis 这种偏差。
+abstract class Widget {
+    // 几何。用 Rect 而不是四个 Int —— 传参错位在类型层面不可能发生。
+    r: Rect,
+
+    // 是否参与绘制与命中。隐藏的控件仍占着 r，但不响应任何输入。
+    vis: Bool,
+
+    // 构造只接受几何：子类的标注、文字、配色各不相同，无法在基类
+    // 统一定义。所以基类只保证「新控件的 vis 默认可见」这条不变量。
+    constructor(r: Rect) {
+        self.r   = r
+        self.vis = true
+    }
+
+    // 抽象方法：画自己。
+    //
+    // 没有返回值 —— 绘制就是副作用，返回 Bool 会诱使人把它当成
+    // 「是否被点」。判定交给 hit。
+    abstract fn draw(th: Theme)
+
+    // 边界。返回 Rect（值语义），调用方改它不会影响控件本身。
+    fn bounds() -> Rect {
+        return self.r
+    }
+
+    // 命中判定。vis 为假时恒为假 —— 这一条只写一次，全子类共享。
+    fn hit(mx: Int, my: Int) -> Bool {
+        return self.vis && self.r.contains(mx, my)
+    }
+
+    // 移动。返回 self 是为了能链式调用，也让「移动」看起来像一次
+    // 状态变更而不是一次赋值。
+    fn moveTo(x: Int, y: Int) -> Widget {
+        self.r = Rect { x: x, y: y, w: self.r.w, h: self.r.h }
+        return self
+    }
+
+    fn hide() -> Widget {
+        self.vis = false
+        return self
+    }
+
+    fn show() -> Widget {
+        self.vis = true
+        return self
+    }
+}
+
+// ---- 标签 ----
+class UiLabel extends Widget {
+    text: String,
+    color: Int,
+
+    constructor(r: Rect, text: String) {
+        self.r     = r
+        self.vis   = true
+        self.text  = text
+        self.color = -1        // -1 = 用主题的正文色
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        var c = th.text
+        if (self.color >= 0) { c = self.color }
+        uiTextInRect(self.r.x, self.r.y, self.r.w, self.r.h, self.text, c)
+    }
+
+    fn dim(th: Theme) {
+        self.color = th.textDim
+    }
+
+    fn tint(c: Int) {
+        self.color = c
+    }
+
+    fn setText(t: String) {
+        self.text = t
+    }
+}
+
+// ---- 按钮 ----
+//
+// `kind` 用一个 Int 表示三档配色而不是枚举 —— 语言还没有 enum，
+// 而字符串比较在绘制热路径上没必要。取值约定写在下面三行里。
+const UI_BTN_NORMAL  = 0
+const UI_BTN_PRIMARY = 1
+const UI_BTN_DANGER  = 2
+
+class UiButton extends Widget {
+    label: String,
+    kind: Int,
+    enabled: Bool,
+
+    constructor(r: Rect, label: String) {
+        self.r       = r
+        self.vis     = true
+        self.label   = label
+        self.kind    = UI_BTN_NORMAL
+        self.enabled = true
+    }
+
+    static fn primary(r: Rect, label: String) -> UiButton {
+        let b = new UiButton(r, label)
+        b.kind = UI_BTN_PRIMARY
+        return b
+    }
+
+    static fn danger(r: Rect, label: String) -> UiButton {
+        let b = new UiButton(r, label)
+        b.kind = UI_BTN_DANGER
+        return b
+    }
+
+    fn off() {
+        self.enabled = false
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // 三档配色映射到 uiButtonEx 的 (bg, bgHover, fg)。
+        //
+        // 禁用态刻意画成「低对比」而不是灰掉：低对比在深浅主题下都
+        // 成立，而硬编码的灰在浅色主题里会看不见 —— 这个坑在
+        // Progress 上已经踩过一次。
+        var bg  = th.surface
+        var hov = th.surfaceHover
+        var fg  = th.text
+        if (self.kind == UI_BTN_PRIMARY) {
+            bg  = th.accent
+            hov = th.accentDark
+            fg  = th.onAccent
+        } else if (self.kind == UI_BTN_DANGER) {
+            bg  = th.err
+            hov = th.err
+            fg  = th.onAccent
+        }
+        if (!self.enabled) {
+            bg  = th.surface
+            hov = th.surface
+            fg  = th.textDim
+        }
+        uiButtonEx(self.r.x, self.r.y, self.r.w, self.r.h, self.label,
+                   bg, hov, fg)
+    }
+}
+
+// ---- 面板 ----
+//
+// 面板是唯一会「自己画一块背景」的控件，所以它的 draw 用
+// uiPanelTitled（带标题）或 uiPanel（无标题）。
+class UiPanel extends Widget {
+    title: String,
+
+    constructor(r: Rect, title: String) {
+        self.r     = r
+        self.vis   = true
+        self.title = title
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        if (len(self.title) > 0) {
+            uiPanelTitledEx(self.r.x, self.r.y, self.r.w, self.r.h, self.title, th)
+        } else {
+            uiPanelEx(self.r.x, self.r.y, self.r.w, self.r.h, th)
+        }
+    }
+
+    // 内容区：去掉边框与标题占位后的区域。
+    //
+    // 放在面板上而不是让调用方自己算，是因为「标题高度」这个数字
+    // 只有面板自己知道 —— 复制到调用点就会与绘制脱节。
+    fn body() -> Rect {
+        var top = 12
+        if (len(self.title) > 0) { top = 40 }
+        return Rect { x: self.r.x + 12, y: self.r.y + top,
+                      w: self.r.w - 24, h: self.r.h - top - 12 }
+    }
+}
+
+// ---- 进度条 ----
+class UiProgress extends Widget {
+    ratio: Float,      // 0.0 .. 1.0
+    withText: Bool,
+
+    constructor(r: Rect, ratio: Float) {
+        self.r        = r
+        self.vis      = true
+        self.ratio    = ratio
+        self.withText = false
+    }
+
+    fn labeled() -> UiProgress {
+        self.withText = true
+        return self
+    }
+
+    fn set(pct: Int) {
+        // 夹在 0..100。越界的进度条画出来会是负宽度或溢出面板 ——
+        // 而这两种情况在像素层面都是「看不懂」，很难回溯到这里。
+        var v = pct
+        if (v < 0)   { v = 0 }
+        if (v > 100) { v = 100 }
+        self.ratio = toFloat(v) / 100.0
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        if (self.withText) {
+            uiProgressLabeledEx(self.r.x, self.r.y, self.r.w, self.r.h,
+                                self.ratio, th)
+        } else {
+            uiProgressEx(self.r.x, self.r.y, self.r.w, self.r.h,
+                         self.ratio, th)
+        }
+    }
+}
+
+// ---- 勾选框 ----
+//
+// 与结构体版 Check 的关键差异：Check 是不可变值，`toggle()` 返回
+// **新值**，调用方必须接手；UiCheck 是对象，`toggle()` 直接改自己。
+//
+// 后者不可能被误用 —— 而结构体版当年的 bug 恰恰是「返回新值被当成
+// 是否被点」，`if (uiCheck(...))` 在第一帧凑巧正确、第二帧立刻翻掉。
+class UiCheck extends Widget {
+    label: String,
+    on: Bool,
+
+    constructor(r: Rect, label: String, on: Bool) {
+        self.r     = r
+        self.vis   = true
+        self.label = label
+        self.on    = on
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        uiCheckEx(self.r.x, self.r.y, self.label, self.on, th)
+    }
+
+    fn toggle() {
+        self.on = !self.on
+    }
+
+    fn set(b: Bool) {
+        self.on = b
+    }
+}
+
+// ---- 滑条 ----
+class UiSlider extends Widget {
+    lo: Int,
+    hi: Int,
+    v: Int,
+
+    constructor(r: Rect, lo: Int, hi: Int, v: Int) {
+        self.r  = r
+        self.vis = true
+        self.lo = lo
+        self.hi = hi
+        self.v  = v
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        uiSliderEx(self.r.x, self.r.y, self.r.w, self.ratio(), th)
+    }
+
+    // 当前值占值域的像素比例。
+    //
+    // 抽成方法而不是在 draw 里就地算，是因为「值 → 比例」这个换算
+    // 还有第二个使用者：调用方要判断「把手在哪」时也需要它。两处
+    // 各写一遍，分母写错（用 hi 还是 hi-lo）不会有任何报错，只会
+    // 画出一条永远拖不到最大值的滑条。
+    fn ratio() -> Float {
+        let span = self.hi - self.lo
+        if (span <= 0) { return 0.0 }
+        var t = toFloat(self.v - self.lo) / toFloat(span)
+        if (t < 0.0) { t = 0.0 }
+        if (t > 1.0) { t = 1.0 }
+        return t
+    }
+
+    // 直接设定值（夹到 lo..hi）。
+    //
+    // 与 dragBy 分开：dragBy 是「根据鼠标算」，set 是「你告诉我多少」。
+    // 混成一个方法会需要「有没有鼠标」这种标志参数，而那是把两种
+    // 调用意图塞进一个布尔里 —— 调用点读起来完全看不出在做什么。
+    fn set(nv: Int) {
+        var v = nv
+        if (v < self.lo) { v = self.lo }
+        if (v > self.hi) { v = self.hi }
+        self.v = v
+    }
+
+    // 按鼠标 x 更新自己。
+    //
+    // 拖动与点击是两件事：拖动看「现在按着没」，不需要事件队列；
+    // 点击落在条上也要能改值。两者都在这里收口，调用方只需要
+    // 每帧调一次。
+    fn dragBy(mx: Int, frame: Frame) {
+        if (!self.vis) { return }
+        let pressing = winMouseDown(0)
+        if (pressing && self.r.contains(mx, winMouseY())) {
+            self.v = self.valueAt(mx)
+            return
+        }
+        if (frame.has && frame.cx >= self.r.x && frame.cx < self.r.x + self.r.w &&
+            frame.cy >= self.r.y && frame.cy < self.r.y + self.r.h) {
+            self.v = self.valueAt(frame.cx)
+        }
+    }
+
+    fn valueAt(mx: Int) -> Int {
+        // 与 uiSliderEx 的绘制公式**必须**是同一个映射。
+        //
+        // 绘制：把手左边 = x + t * (w - knobW)，也就是 t 是「把手
+        // 可移动行程」的比例，不是「轨道宽度」的比例。
+        //
+        // 反过来算值，就要先把 mx 换算成「把手中心的行程位置」：
+        //
+        //     t = (mx - knobW/2 - x) / (w - knobW)
+        //
+        // 早先用 (mx - x) / w 算过一个版本，结果是「把手拖到最右端
+        // 只显示 97」—— 因为最右端 mx = x + w - 1，代入得 (w-1)/w。
+        // 这种偏差不会报错，只会在截图里看到读数永远差几个点。
+        let knobW = 14
+        let span = self.r.w - knobW
+        if (span <= 0) { return self.lo }
+
+        var t = toFloat(mx - knobW / 2 - self.r.x) / toFloat(span)
+        if (t < 0.0) { t = 0.0 }
+        if (t > 1.0) { t = 1.0 }
+
+        // 四舍五入而不是截断：截断会让「拖到最右」落在 hi-1 上。
+        return self.lo + toInt(t * toFloat(self.hi - self.lo) + 0.5)
+    }
+}
+
+// ============================================================
+// 控件树：异构集合的遍历
+// ============================================================
+//
+// 这是整个类层存在的**唯一理由**：
+//
+//     tree.draw(th)
+//
+// 一行代码画完整个界面，新增控件只写一个新类，不动这里。用结构体
+// 写同样的东西需要一个 if-else 链加一个「控件种类」字段，而漏掉一个
+// 分支不会有任何编译错误 —— 只会有一个控件不出现，然后在截图里
+// 被人发现。
+//
+// ── 为什么容器是数组而不是树形结构 ──────────────────────────
+//
+// 树需要「子节点列表」字段，也就是 `Array` 里装 `Widget` —— 而
+// 数组元素类型是动态的，能装。但遍历顺序、裁剪、z 序都要重新定义。
+// 面板那种「内容区」用坐标表达已经够（见 UiPanel.body），
+// 不需要真正的嵌套。真需要嵌套时再加 children 字段，不影响现在。
+class UiTree {
+    // 按**绘制顺序**排列，先画的在下面。
+    items: Array,
+
+    constructor() {
+        self.items = array(0, null)
+    }
+
+    // 加入并返回 self：`tree.add(a).add(b)` 读起来就是「依次加入」。
+    fn add(w: Widget) -> UiTree {
+        arrPush(self.items, w)
+        return self
+    }
+
+    fn size() -> Int {
+        return len(self.items)
+    }
+
+    fn at(i: Int) -> Widget {
+        return self.items[i]
+    }
+
+    // 全量绘制。这就是多态的价值所在：这个循环体对每种控件都成立。
+    fn draw(th: Theme) {
+        for i in 0..len(self.items) {
+            let w: Widget = self.items[i]
+            w.draw(th)
+        }
+    }
+
+    // 命中查询：返回最上面那个被点到的控件，没有则 null。
+    //
+    // ── 为什么是「正序遍历、最后命中的赢」 ────────────────────
+    //
+    // 绘制是正序的，后画的压在上面。所以「最上面」= 数组里下标
+    // 最大的那个命中项。正序遍历并**每次覆盖** hitw，跑完剩下的
+    // 恰好就是最后画的那个 —— 与倒序遍历 + 首个命中即 break
+    // 等价，但少一个 break，也不会出现「忘了 break 就返回了最
+    // 底下那个」这类错误。
+    //
+    // 用 hit() 而不是直读 r：hit 里含 vis 判定，隐藏的控件不该
+    // 被 pick 到。如果这里改成 w.r.contains(...)，隐藏控件就会
+    // 重新变成可点的 —— 而它在画面上是不存在的。
+    fn pick(mx: Int, my: Int) -> Widget {
+        var hitw = null
+        for i in 0..len(self.items) {
+            let w: Widget = self.items[i]
+            if (w.hit(mx, my)) { hitw = w }
+        }
+        return hitw
+    }
+}
+
+// ============================================================
+// 类层的设计说明
+// ============================================================
+//
+// 1. **为什么 Widget 是 abstract 而不是 interface**
+//
+//    接口只描述行为、不占对象布局。而 Widget 需要携带 r / vis 两个
+//    字段并让所有子类共享 —— 这是「实现」而非「契约」，必须用
+//    抽象类。接口留给纯粹的能力描述（比如「能被拖动」「能获得
+//    焦点」），那是另一层。
+//
+// 2. **为什么 moveTo 返回 Widget 而不是具体子类类型**
+//
+//    返回父类类型让链式调用对任何子类都成立：`btn.moveTo(...).hide()`
+//    里 hide 是基类方法，不需要知道具体类型。代价是链式之后静态
+//    类型退化成 Widget，再想调子类专有方法就要重新声明类型。
+//    这个取舍跟 Java 的 `returns this` 不是一回事，但够用。
+//
+// 3. **为什么 UiSlider 的 dragBy 需要 Frame，而 UiCheck 不需要**
+//
+//    勾选是「一次点击翻转一次」，天然幂等；拖动是「持续跟随鼠标」，
+//    必须在按住期间每帧读取鼠标位置。Frame 提供的是**这一帧的
+//    点击快照**，而按住状态来自 winMouseDown —— 两者是不同的输入，
+//    所以滑条两个都要，勾选框只需要前者。
+//
+// 3b. **为什么有两套绘制函数（uiXxx 与 uiXxxEx）**
+//
+//    这不是「忘了删旧代码」。两套的差别是**语义**，不是风格：
+//
+//      uiXxx      颜色写死在函数体里，且内部调用 uiConsumeClick
+//                 去 winPollClick 取点击 —— 它是自成一体的即时模式
+//                 控件，「画 + 判 + 改状态」一次做完。
+//      uiXxxEx    颜色全部由 Theme 传入，**完全不碰事件队列** ——
+//                 它只画。判定交给 Frame / Rect 统一做。
+//
+//    混用的后果不是「颜色不对」那么轻。假设一帧里先画一个 uiButton
+//    （消费式），再画一个 UiCheck（走 Frame）：uiButton 内部把
+//    winPollClick 里的事件取走了，Frame.begin() 随后取到的是 null，
+//    于是这一帧所有类层控件统统收不到点击 —— 表现为「有的按钮能点、
+//    有的完全没反应」，而且取决于绘制顺序，极难定位。
+//
+//    所以规则是一条硬线：**类层（Widget 及其子类）只准调 Ex 版本**。
+//    旧函数保留给 tests/p0/28 那类纯即时模式的用法。
+//
+// 4. **为什么不上「脏标记 + 重绘」**
+//
+//    即时模式 GUI 每帧全画。省下来的那点绘制开销，远小于引入一套
+//    缓存失效逻辑的复杂度 —— 而失效逻辑写错的症状是「界面不刷新」，
+//    排查成本极高。这一层不做优化。
+//
+// 5. **数据驱动视觉的一条实测结论**
+//
+//    UiCheck 与 UiSlider 最初直接转调旧 uiCheck / uiSlider，在深色
+//    主题下完全正常，切到浅色立刻暴露三处缺陷：滑条轨道纯黑、勾选
+//    方块纯黑、勾选框标签文字几乎不可见。原因只有一个 —— 那几个
+//    函数把 0x22222A / 0xE8E8F0 这类深色常量写在了函数体里。
+//
+//    这件事的教训不是「记得传颜色」，而是：**任何写进绘制代码的
+//    字面量颜色，都等于替所有主题做了决定**。绘制函数的参数表里
+//    没有 Theme，它就永远只能服务一个主题 —— 而这一点在深色主题
+//    下完全看不出来，因为深色恰好是那些常量的取值。

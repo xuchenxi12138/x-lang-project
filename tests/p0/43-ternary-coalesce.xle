@@ -1,0 +1,105 @@
+// 43-ternary-coalesce.xle — 三元 `?:` 与空值合并 `??`
+//
+// 为什么现在支持三元：规范 01 §12 原本写「if 是表达式，不需要 ?:」。
+// 那个裁决低估了一件事 —— `if` 表达式占一行，而三元能塞进一行里的
+// 中间位置（函数实参、结构体字段、数组元素、字符串插值）。写
+// `let s = if a { "x" } else { "y" }` 可以，但
+// `f(if a { 1 } else { 2 }, 3)` 读起来就是在跟语法搏斗。
+//
+// 实现上没有新增字节码：三元与 EX_IF 共用同一套
+// JUMP_IF_FALSE / JUMP 骨架，只是外层不再要求块。
+//
+// `??` 同理，降级成 DUP + PUSH_NULL + NE + JUMP_IF_FALSE。
+// 没有专门的 JUMP_IF_NOT_NULL 指令，也没为它加一条 —— 加指令要同时
+// 改 x.h 枚举、interp 分派、codegen_c 生成、xbc 序列化、栈效应表，
+// 而 .xbc 格式版本一升，所有已编译产物失效。多两条指令换格式稳定。
+
+fn pick(flag: Bool) -> String {
+    return flag ? "yes" : "no"
+}
+
+fn side(n: Int) -> Int {
+    println("  求值 {n}")
+    return n
+}
+
+// 带副作用的求值，用来证明三元只算一支、`??` 左侧只算一次。
+// 返回 Int，不碰 null —— 避免「声明 Int 实际返 Null」的类型警告
+// 把测试输出弄脏。
+fn side2(n: Int) -> Int {
+    println("  求值 {n}")
+    return n
+}
+
+fn main() -> Int {
+    // ---- 1. 基本三元 ----
+    let a = true ? 1 : 2
+    let b = false ? 1 : 2
+    println(a)                    // 1
+    println(b)                    // 2
+
+    // ---- 2. 右结合：a ? b : (c ? d : e) ----
+    println(false ? 1 : true ? 2 : 3)     // 2
+    println(true ? 1 : true ? 2 : 3)      // 1
+
+    // ---- 3. 未走的分支不报错也不报副作用 ----
+    // 若实现成「两支都算再选」，这里会打印两行；正确实现只打印一行。
+    println(true ? side(7) : side(8))     // 求值 7 / 7
+    println(false ? side(7) : side(8))    // 求值 8 / 8
+
+    // ---- 4. 条件只求值一次 ----
+    let cond = true
+    println(cond ? "T" : "F")             // T
+
+    // ---- 5. 类型合并：Int 与 Float 混合取 Float ----
+    let m = true ? 1 : 2.5
+    println(m)                            // 1
+
+    // ---- 6. 字符串与非字符串混合 ----
+    println(true ? 5 : "x")               // 5
+
+    // ---- 7. 套进函数实参与结构体字段的位置 ----
+    println(pick(a > 0))                  // yes
+    println(pick(a < 0))                  // no
+
+    // ---- 8. ?? 基本 ----
+    let nl = null
+    println(nl ?? 42)                     // 42
+    println(7 ?? 42)                      // 7
+    println("" ?? "空")                    // （空串不是 null，原样输出空行）
+    println(false ?? true)                // false —— false 不是 null
+
+    // ---- 9. ?? 左侧只求值一次 ----
+    // 若实现成「算两次左侧」，side2 会打印两次。这里用「左侧是
+    // 带副作用的调用」来验证 —— 值是 null 还是非 null 无所谓，
+    // 关键是打印次数。
+    let nul = null
+    println(side2(1) ?? 99)               // 求值 1 / 1
+    println(nul ?? side2(2))              // 求值 2 / 2
+
+    // 左侧为 null，右侧被求值；左侧非 null，右侧不求值。
+    println(nul ?? side2(3))              // 求值 3 / 3
+    let seven = 7
+    println(seven ?? side2(4))            // 7  —— 不打印「求值 4」
+
+    // ---- 10. ?? 链式（左结合）----
+    let x = null
+    let y = null
+    println(x ?? y ?? 3)                  // 3
+    println(x ?? 1 ?? 2)                  // 1
+
+    // ---- 11. 与三元组合 ----
+    let v = null
+    println((v ?? 0) > 0 ? "正" : "非正")   // 非正
+
+    // ---- 12. 类型合并里 null 必须被吸收 ----
+    // 这是最容易写错的一处：打印指令在**编译期**按推断类型选，
+    // 若合并规则忘了把 TY_NULL 当成「无信息」，推断结果会是
+    // TY_NULL，于是选中 TOSTRING_NULL —— 它不读栈、直接打印
+    // "null"。值是对的，显示是错的，而且错得完全不指向类型推断。
+    println(null ?? 8)                    // 8
+    println(null ?? "s")                  // s
+    println(null ?? 1.5)                  // 1.5
+
+    return 0
+}

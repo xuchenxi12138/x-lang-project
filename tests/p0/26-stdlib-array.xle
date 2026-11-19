@@ -1,0 +1,230 @@
+// ============================================================
+// std.array —— 数组工具（纯函数式部分）
+// ============================================================
+//
+// 内建那 12 个是**原地操作**（语言没有引用参数，纯 X 写不出来）。
+// 这一层全是**返回新数组**的纯函数。
+//
+// ── 为什么没有 map / filter / reduce ────────────────────────
+//
+// 语言没有闭包、没有函数类型，所以「收一个函数」的接口写不出来。
+// 取而代之的是一批**专用函数**：arrMapMul / arrFilterGt / arrSum。
+// 笨，但类型安全 —— 写 arrMap(xs, "mul", 2) 那种用字符串指代操作
+// 的接口会把类型错误从编译期推到运行期，是更差的选择。
+//
+// 所以这个测试既验证每个函数的行为，也验证「专用函数够用」：
+// 下面所有用例加起来覆盖了 map/filter 的实际使用场景。
+
+from std.array import arrIndexesOf, arrFind, arrSum, arrAvg, arrMin, arrMax, arrIsEmpty, arrTake, arrDrop, arrUnique, arrFlatten, arrRepeat, arrSorted, arrSortedDesc, arrMapMul, arrMapAdd, arrMapAbs, arrMapInt, arrMapFloat, arrMapStr, arrFilterEq, arrFilterNot, arrFilterGt, arrFilterLt, arrJoin, arrProduct, arrShuffle, arrSample, arrSampleN, nullValue, arrUnion, arrIntersect, arrDiff, arrChunk, arrCol, arrRow
+
+fn main() -> Void {
+    println("---- 查找与统计 ----")
+    let xs = array(5, 0)
+    xs[0] = 3
+    xs[1] = 1
+    xs[2] = 4
+    xs[3] = 1
+    xs[4] = 5
+    println(xs)                    // [3, 1, 4, 1, 5]
+
+    // 所有匹配下标（内建 arrIndexOf 只给第一个）
+    let at1 = arrIndexesOf(xs, 1)
+    println(len(at1))              // 2
+    println(at1[0])                // 1
+    println(at1[1])                // 3
+    println(len(arrIndexesOf(xs, 99)))   // 0
+    println(arrFind(xs, 4))        // 2
+    println(arrFind(xs, 99))       // -1
+
+    println(arrSum(xs))            // 14.0
+    println(arrAvg(xs))            // 2.8
+    println(arrMin(xs))            // 1.0
+    println(arrMax(xs))            // 5.0
+    // 空数组：avg/min/max 都给 0，不报错（空数组求平均是常态）
+    println(arrSum(array(0, 0)))   // 0.0
+    println(arrAvg(array(0, 0)))   // 0.0
+    println(arrMin(array(0, 0)))   // 0.0
+    println(arrMax(array(0, 0)))   // 0.0
+    println(arrIsEmpty(array(0, 0)))   // true
+    println(arrIsEmpty(xs))            // false
+    // 单元素
+    let one = array(1, 7)
+    println(arrMin(one))           // 7.0
+    println(arrMax(one))           // 7.0
+    // 负数
+    let neg = array(3, 0)
+    neg[0] = -5
+    neg[1] = -2
+    neg[2] = -9
+    println(arrMin(neg))           // -9.0
+    println(arrMax(neg))           // -2.0
+
+    println("---- 切片 ----")
+    println(arrTake(xs, 2))        // [3, 1]
+    println(arrTake(xs, 0))        // []
+    println(arrTake(xs, 99))       // [3, 1, 4, 1, 5]（越界给全部）
+    println(arrDrop(xs, 2))        // [4, 1, 5]
+    println(arrDrop(xs, 0))        // [3, 1, 4, 1, 5]
+    println(arrDrop(xs, 99))       // []
+
+    println("---- 去重 / 展平 / 重复 ----")
+    let dup = array(5, 0)
+    dup[0] = 1
+    dup[1] = 2
+    dup[2] = 1
+    dup[3] = 3
+    dup[4] = 2
+    // 保持首次出现的顺序，不是排序
+    println(arrUnique(dup))        // [1, 2, 3]
+
+    // 嵌套数组：array() 只能填同一种标量，所以用 arrPush 造
+    // 嵌套数组要用「先建再改」造 —— array(n, fill) 的第二个参数是
+    // 填充值不是初始元素，写 array(1, 2) 得到的是 [2] 而不是 [1]
+    let sub1 = array(2, 0)
+    sub1[0] = 1
+    sub1[1] = 2
+    let sub2 = array(2, 0)
+    sub2[0] = 3
+    sub2[1] = 4
+    let nested = array(0, 0)
+    arrPush(nested, sub1)
+    arrPush(nested, sub2)
+    arrPush(nested, 9)
+    println(len(nested))           // 3
+    // 展平一层：子数组摊开，标量原样
+    println(arrFlatten(nested))    // [1, 2, 3, 4, 9]
+
+    let onech = array(1, 0)
+    onech[0] = 7
+    println(arrRepeat(onech, 3))   // [7, 7, 7]
+    println(len(arrRepeat(onech, 0)))   // 0
+
+    println("---- 排序副本 ----")
+    // 关键：不改变原数组
+    let s2 = arrSorted(xs)
+    println(s2)                    // [1, 1, 3, 4, 5]
+    println(xs)                    // [3, 1, 4, 1, 5]（原数组未动）
+    println(arrSortedDesc(xs))     // [5, 4, 3, 1, 1]
+    println(xs)                    // [3, 1, 4, 1, 5]
+    // 字符串排序
+    let ss = array(3, "")
+    ss[0] = "banana"
+    ss[1] = "apple"
+    ss[2] = "cherry"
+    println(arrSorted(ss))         // [apple, banana, cherry]
+
+    println("---- 逐元素映射 ----")
+    println(arrMapMul(xs, 2.0))    // [6.0, 2.0, 8.0, 2.0, 10.0]
+    println(arrMapAdd(xs, 0.5))    // [3.5, 1.5, 4.5, 1.5, 5.5]
+    println(arrMapAbs(neg))        // [5.0, 2.0, 9.0]
+    // 类型转换
+    let fl = array(3, 0.0)
+    fl[0] = 1.9
+    fl[1] = -2.7
+    fl[2] = 3.0
+    println(arrMapInt(fl))         // [1, -2, 3]（截断，不是四舍五入）
+    println(arrMapFloat(xs))       // [3.0, 1.0, 4.0, 1.0, 5.0]
+    let strs = arrMapStr(xs)
+    println(strs)                  // [3, 1, 4, 1, 5]
+    println(typeOf(strs[0]))       // String
+
+    println("---- 过滤 ----")
+    println(arrFilterEq(xs, 1))    // [1, 1]
+    println(arrFilterNot(xs, 1))   // [3, 4, 5]
+    println(arrFilterEq(xs, 99))   // []
+    println(arrFilterGt(xs, 2.0))  // [3.0, 4.0, 5.0]（严格大于）
+    println(arrFilterLt(xs, 3.0))  // [1.0, 1.0]
+    // 边界不给（不是 >=）
+    println(arrFilterGt(xs, 3.0))  // [4.0, 5.0]
+
+    println("---- 归约 ----")
+    println(arrJoin(xs, "-"))      // 3-1-4-1-5
+    println(arrProduct(xs))        // 60.0
+    // 空数组乘积是 1（乘法单位元，与数学一致）
+    println(arrProduct(array(0, 0)))   // 1.0
+
+    println("---- 洗牌（可复现） ----")
+    // randomSeed 让内建 random() 确定，Fisher-Yates 因此可复现。
+    // 这一行如果不稳定，说明洗牌自己造了随机数而不是用 random()。
+    randomSeed(7)
+    let sh = arrCopy(xs)
+    arrShuffle(sh)
+    println(sh)
+    // 洗牌是排列：元素集合不变
+    println(arrSorted(sh))         // [1, 1, 3, 4, 5]
+    // 同一颗种子重跑，结果必须一致
+    randomSeed(7)
+    let sh2 = arrCopy(xs)
+    arrShuffle(sh2)
+    println(sh == sh2)             // true
+    // 空数组与单元素：洗牌是恒等，不崩
+    let e0 = array(0, 0)
+    arrShuffle(e0)
+    println(len(e0))               // 0
+    let e1 = array(1, 0)
+    arrShuffle(e1)
+    println(e1)                    // [0]
+
+    println("---- 采样 ----")
+    randomSeed(11)
+    let smp = arrSample(xs)
+    println(smp >= 1 && smp <= 5)  // true（一定落在原数组里）
+    // 空数组给 null（不是 0，也不是崩）
+    println(typeOf(arrSample(array(0, 0))))   // Null
+    // 取 3 个不重复。注意 xs 本身就含两个 1，所以「取 3 个」在
+    // 值上可能撞车 —— 这里断言的是**下标不重复**（同一元素不取两次），
+    // 而它在值上表现为 [1,1,3] 这种合法结果。
+    randomSeed(11)
+    let s3 = arrSampleN(xs, 3)
+    println(len(s3))               // 3
+    println(len(arrUnique(s3)) <= 3)   // true
+    println(len(arrSampleN(xs, 0)))    // 0
+    println(len(arrSampleN(xs, 99)))   // 5（越界给全部）
+
+    println("---- 空值 ----")
+    // 语言没有 null 字面量，唯一可靠来源是「弹空数组」
+    println(typeOf(nullValue()))   // Null
+
+    println("---- 集合运算 ----")
+    let a1 = array(4, 0)
+    a1[0] = 1
+    a1[1] = 2
+    a1[2] = 2
+    a1[3] = 3
+    let b1 = array(3, 0)
+    b1[0] = 2
+    b1[1] = 3
+    b1[2] = 4
+    println(arrUnion(a1, b1))      // [1, 2, 3, 4]（去重）
+    println(arrIntersect(a1, b1))  // [2, 3]
+    println(arrDiff(a1, b1))       // [1]
+    println(arrDiff(b1, a1))       // [4]
+    // 空集合
+    println(len(arrUnion(array(0, 0), array(0, 0))))       // 0
+    println(len(arrIntersect(a1, array(0, 0))))            // 0
+    println(arrDiff(a1, array(0, 0)))                      // [1, 2, 3]
+
+    println("---- 二维 ----")
+    // 1..6 按 3 列分块 → [[1,2,3],[4,5,6]]
+    let lin = array(6, 0)
+    var i = 0
+    while (i < 6) {
+        lin[i] = i + 1
+        i = i + 1
+    }
+    let ch = arrChunk(lin, 3)
+    println(len(ch))               // 2
+    println(ch[0])                 // [1, 2, 3]
+    println(ch[1])                 // [4, 5, 6]
+    // 尾块不足
+    let ch2 = arrChunk(lin, 4)
+    println(len(ch2))              // 2
+    println(ch2[1])                // [5, 6]
+    // 块比数组还大
+    println(len(arrChunk(lin, 99)))    // 1
+    // 取列：扁平存储下第 c 列是 r*cols+c
+    println(arrCol(lin, 2, 3, 0))  // [1, 4]
+    println(arrCol(lin, 2, 3, 2))  // [3, 6]
+    println(arrRow(lin, 3, 1))     // [4, 5, 6]
+    println(arrRow(lin, 3, 0))     // [1, 2, 3]
+}

@@ -1,0 +1,126 @@
+// 34-struct.xle — 结构体：声明、字面量、字段访问、相等、排序
+//
+// 这一组是完成「类」的地基。没有它，标准库只能全是函数。
+//
+// 覆盖点：
+//   1. 声明 + 字面量（含任意字段顺序、省略字段填零值）
+//   2. 字段访问、函数参数传递、返回值
+//   3. 嵌套结构体与打印格式
+//   4. 结构相等（值语义，不是地址比较）
+//   5. 排序（需要 < 比较，走 value_cmp / v_cmp）
+
+struct Pair { a: Int, b: Int }
+
+struct Inner { v: Int, tag: String }
+
+struct Outer {
+    a: Inner,
+    b: String,
+    n: Int,
+}
+
+// 结构体当参数
+fn sum(p: Pair) -> Int {
+    return p.a + p.b
+}
+
+// 结构体当返回值
+fn mk(a: Int, b: Int) -> Pair {
+    return Pair { a: a, b: b }
+}
+
+// 返回嵌套结构体
+fn mkOuter(n: Int) -> Outer {
+    return Outer { a: Inner { v: n * 2, tag: "in" }, b: "out", n: n }
+}
+
+fn main() -> Int {
+    // ---- 1. 字面量与字段顺序无关 ----
+    let p = Pair { a: 3, b: 4 }
+    let q = Pair { b: 4, a: 3 }
+    println(p)
+    println(q)
+    // 顺序不同、内容相同，必须相等
+    println(p == q)
+
+    // ---- 2. 省略字段 → 零值 ----
+    let z = Pair { a: 7 }
+    println(z)
+    println(Pair {})
+
+    // ---- 3. 字段访问 ----
+    println(p.a)
+    println(p.b)
+
+    // ---- 4. 参数 / 返回值 ----
+    println(sum(p))
+    println(mk(100, 200))
+    println(sum(mk(1, 1)))
+
+    // ---- 5. 嵌套 ----
+    let o = mkOuter(7)
+    println(o)
+    println(o.a.v)
+    println(o.a.tag)
+    println(o.n)
+
+    // 嵌套结构体也是值语义
+    let o2 = Outer { a: Inner { v: 14, tag: "in" }, b: "out", n: 7 }
+    println(o == o2)
+
+    // ---- 6. 相等是结构相等，不是指针相等 ----
+    let x = Pair { a: 1, b: 2 }
+    let y = Pair { a: 1, b: 2 }
+    let w = Pair { a: 1, b: 3 }
+    println(x == y)
+    println(x == w)
+    println(x != w)
+
+    // ---- 7. 排序 ----
+    //
+    // 注意：`<` 运算符**不**接受结构体（运行时会报「比较运算需要数值」）。
+    // 这是有意的 —— `<` 的语义在数值和字符串上是明确的，套到结构体上
+    // 就得替人决定「先比哪个字段、缺字段怎么算」，那是库该决定的事，
+    // 不是语言该硬塞的。
+    //
+    // 结构体排序走 arrSort，它内部用 value_cmp：先比类型名，
+    // 再按字段声明顺序逐个比。规则只有一处实现，所以解释器和 AOT
+    // 不可能出现两种排序结果。
+    let ys = array(0, Pair {})
+    arrPush(ys, Pair { a: 3, b: 1 })
+    arrPush(ys, Pair { a: 1, b: 9 })
+    arrPush(ys, Pair { a: 2, b: 5 })
+    arrPush(ys, Pair { a: 1, b: 2 })
+    arrSort(ys)
+    println(ys)
+    // 结果必须是 (1,2) (1,9) (2,5) (3,1)：先 a 升序，a 相同时 b 升序。
+    // 这一行是 value_cmp 字段顺序契约的证据。
+    println(ys[0])
+    println(ys[3])
+
+    // ---- 8. 结构体装进数组 ----
+    let xs = array(0, Pair {})
+    arrPush(xs, Pair { a: 5, b: 6 })
+    arrPush(xs, Pair { a: 1, b: 2 })
+    println(xs[0])
+    println(xs[1])
+    println(len(xs))
+
+    // ---- 9. 字符串字段参与比较 ----
+    //
+    // 相等可以；比大小时，字符串字段按字典序 —— 同样只在 arrSort 里
+    // 才有意义，不能用 `<`。
+    let i1 = Inner { v: 1, tag: "a" }
+    let i2 = Inner { v: 1, tag: "b" }
+    println(i1 == i2)
+
+    let is = array(0, Inner {})
+    arrPush(is, i2)
+    arrPush(is, i1)
+    arrSort(is)
+    println(is[0])
+    println(is[1])
+
+    println("struct ok")
+    return 0
+}

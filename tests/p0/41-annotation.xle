@@ -1,0 +1,142 @@
+// 41-annotation.xle — 注解：语法、元数据、运行时查询
+//
+// ── 语言层只做三件事 ───────────────────────────────────────
+//
+//   1. 解析 `@Name` / `@Name(args)` / `@Name(key = value)`
+//   2. 把名字与实参原样存成元数据（并写进 .xbc）
+//   3. 运行时提供查询
+//
+// 「@Deprecated 该不该产生警告」「@Inject 该注入什么」不是语言的事。
+// 语言不内置一套官方注解让所有人被迫接受它的语义 —— 那是框架的
+// 工作，而框架需要的是一个能存能取的机制。
+//
+// ── 实参只收字面量 ─────────────────────────────────────────
+//
+// 注解在编译期就变成元数据，还要能单独写进 .xbc 发给没有源码的
+// 机器。要支持 `@Size(n * 2)` 就得在编译期求值 —— 那是 comptime
+// 能力，当前版本没有。所以这里只收 Int / Float / String / Bool /
+// null，遇到表达式会有一条说清原因的错误。
+//
+// ── 注解不继承 ─────────────────────────────────────────────
+//
+// 字段/方法的注解是**声明点**的属性。子类没重新标注就是没有这个
+// 注解 —— 这与 @Deprecated 的语义一致：父类的旧方法废弃，不代表
+// 子类重写的方法也废弃。框架要继承语义，自己沿 classParent 走。
+
+// ============================================================
+// 1. 三种目标上的注解
+// ============================================================
+
+@Deprecated
+@Table("users")
+@Route("/api/users", method = "GET", priority = 3)
+class User {
+    @Column("user_name", len = 32)
+    @Indexed
+    name: String,
+
+    @Column("user_age")
+    age: Int,
+
+    @Inject
+    private token: String,
+
+    constructor(n: String) {
+        self.name = n
+        self.age = 0
+        self.token = "t"
+    }
+
+    @Deprecated
+    @Log(level = "warn")
+    fn legacy() -> String { return "old" }
+
+    @Log(level = "info", sample = 0.5)
+    fn current() -> String { return "new" }
+}
+
+// 无注解的类：用来验「继承不下传注解」
+class Plain {
+    field: Int,
+    constructor() { self.field = 0 }
+    fn noop() { }
+}
+
+// 子类带自己的注解
+@Table("admins")
+class Admin extends User {
+    constructor(n: String) { self.name = n }
+}
+
+// ============================================================
+// 2. 字面量实参的各类型
+// ============================================================
+
+@Config(
+    name = "app",
+    port = 8080,
+    ratio = 0.75,
+    debug = true,
+    fallback = null,
+    negative = -7
+)
+class Config2 { }
+
+fn main() {
+    let u = new User("ann")
+
+    // ---- 类注解 ----
+    println("class annos : " + annoAll(u, "class", ""))
+    println("has Table   : " + toString(annoHas(u, "class", "", "Table")))
+    println("has Nope    : " + toString(annoHas(u, "class", "", "Nope")))
+    println("Table args  : " + annoGet(u, "class", "", "Table"))
+    println("Route args  : " + annoGet(u, "class", "", "Route"))
+    println("Route kv    : " + annoGetKV(u, "class", "", "Route"))
+
+    // ---- 字段注解 ----
+    println("-- 字段 --")
+    println("field annos : " + annoAll(u, "field", "name"))
+    println("Column args : " + annoGet(u, "field", "name", "Column"))
+    println("Column kv   : " + annoGetKV(u, "field", "name", "Column"))
+    println("Indexed args: " + annoGet(u, "field", "name", "Indexed"))
+
+    // ---- 方法注解 ----
+    println("-- 方法 --")
+    println("method annos: " + annoAll(u, "method", "legacy"))
+    println("Log args    : " + annoGet(u, "method", "legacy", "Log"))
+    println("Log kv      : " + annoGetKV(u, "method", "legacy", "Log"))
+    println("Deprecated args: " + annoGet(u, "method", "legacy", "Deprecated"))
+
+    // ---- 注解不继承 ----
+    println("-- 注解不继承 --")
+    let p = new Plain()
+    println("Plain class : " + annoAll(p, "class", ""))
+    println("Plain has Table: " + toString(annoHas(p, "class", "", "Table")))
+    let a = new Admin("adm")
+    println("Admin class : " + annoAll(a, "class", ""))
+    println("Admin has Deprecated: " + toString(annoHas(a, "class", "", "Deprecated")))
+
+    // ---- 各种字面量类型 ----
+    println("-- 字面量类型 --")
+    let c = new Config2()
+    println("Config kv   : " + annoGetKV(c, "class", "", "Config"))
+
+    // ---- 框架式的用法：按注解决定行为 ----
+    println("-- 按注决定行为 --")
+    let n = 0
+    if annoHas(u, "class", "", "Table") {
+        println(className(u) + " -> table " + annoGet(u, "class", "", "Table")[0])
+        n = n + 1
+    }
+    if annoHas(p, "class", "", "Table") {
+        println(className(p) + " -> table " + annoGet(p, "class", "", "Table")[0])
+        n = n + 1
+    } else {
+        println(className(p) + " -> not an entity")
+    }
+    if annoHas(a, "class", "", "Table") {
+        println(className(a) + " -> table " + annoGet(a, "class", "", "Table")[0])
+        n = n + 1
+    }
+    println("entity count: " + toString(n))
+}

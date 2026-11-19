@@ -1,0 +1,35 @@
+// main.xle — 应用入口
+//
+// ── 这就是 Spring Boot 的 main 方法 ───────────────────────
+//
+// SpringApplication.run(App.class) 的对应物只有一行 XBoot.run()：
+// 配置装配、组件扫描、实例化、数据源、依赖注入、Mapper 元数据、
+// 注解路由、HTTP 监听、请求分派、优雅关停全部在框架里
+//（lib/xboot/xboot.xle 的 [1]~[8] 编排段）。
+//
+// ── 为什么下面的 import 一个都不能少 ──────────────────────
+//
+// Spring 的 @ComponentScan 靠类加载器遍历 classpath 找类；x-lang 的
+// 编译模型是文本级 import 合并 —— **没被 import 的类根本不在编译
+// 单元里**，字节码里不存在，运行时 classAll() 扫描不到，容器就是
+// 空的、路由就是零条（服务照常启动、照样监听，只是什么都没有 ——
+// 这个故障形态很迷惑，故写在此处）。
+//
+// 所以入口文件的 import 清单就是 @ComponentScan(basePackages=...)
+// 的对应物：新增组件类后，把它的 import 加到这里。
+//
+// 运行（在 x-lang 目录下）：
+//   build/x.exe run apps/user-demo/src/main.xle
+//
+// 配置文件 conf/application.properties 是相对**运行目录**的路径。
+
+import "../../../lib/xboot/xboot.xle"
+
+import "entity/user.xle"
+import "mapper/user_mapper.xle"
+import "service/user_service.xle"
+import "controller/user_controller.xle"
+
+fn main() -> Int {
+    return XBoot.run("apps/user-demo/conf/application.properties")
+}

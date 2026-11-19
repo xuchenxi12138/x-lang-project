@@ -1,0 +1,827 @@
+// ============================================================
+// zh —— 标准库中文别名包（04 文档 §3：L2 标准库别名层）
+// ============================================================
+//
+// 这是什么：
+//   一个纯 X 包。用户在自己的 x.toml 里声明它、在源码里
+//   `引入 @zh`，之后就能用中文调用高频标准库函数：
+//
+//     引入 @zh
+//     打印行(开方(9.0))          // println(sqrt(9.0))
+//
+// 它不是什么：
+//   不是第二个标准库。所有函数都是**一行薄包装**，本体永远是
+//   内建与 std.*。中文名与英文名并存（04 §3.3），可以混用：
+//
+//     令 a = 求和(xs)             // zh 提供的名字
+//     令 b = arrSum(xs)           // 完全等价
+//
+// ── 语言能力（v0.1.0 起依赖的两个编译器特性）────────────────
+//
+// 1. **重载**：同名不同签名可以并存，调用点按实参类型挑选。
+//    「查找」现在同时是字符串版与数组版，不用再分 查找 / 查下标。
+//    注意：参数签名完全一致才算重复定义；仅返回类型不同无法区分，
+//    仍是重复定义。
+//
+// 2. **Any（任意）类型**：参数标注 Any = 接受任何值（调用点不查
+//    该参数的类型）；返回值标注 Any = 透传函数体的返回值，运行时
+//    是什么类型就是什么类型。二者合起来，abs / min / max / arrPop
+//    这类「返回类型保持输入」的函数终于包得住：
+//
+//      fn 绝对值(x: Any) -> Any { return math(abs, x) }
+//
+//    代价：Any 返回值在调用点是静态未知的，后续运算走动态路径、
+//    编译期不再帮它查类型 —— 需要强类型时用英文原函数。
+//
+// 覆盖范围（04 §3.2：高频全量、低频不做）：
+//   做了   打印 / 数学 / 统计 / 矩阵 / 字符串 / 数组 / 文件 / 时间 / 转换
+//   不做   db / http / ui / json / 反射 —— 低频专业 API 直接用英文，
+//          别名总数控制住，用户才记得住「哪个有中文名」。
+// ============================================================
+
+import std.math
+import std.array
+import std.str
+import std.conv
+import std.fs
+
+// ============================================================
+// 一、打印与核心（自由内建的多态包装）
+// ============================================================
+
+// 输出一行（自动换行）。参数任意类型。
+// 多参数打印 P0 包不了（没有可变参数），需要时用英文 println。
+fn 打印行(x: Any) -> Void {
+    println(x)
+}
+
+// 输出但不换行。
+fn 打印(x: Any) -> Void {
+    print(x)
+}
+
+// 任何值转成字符串。
+fn 转字符串(x: Any) -> String {
+    return toString(x)
+}
+
+// 转整数。字符串按解析算，浮点向零截断，布尔 真=1 假=0。
+fn 转整数(x: Any) -> Int {
+    return toInt(x)
+}
+
+// 转浮点。
+fn 转浮点(x: Any) -> Float {
+    return toFloat(x)
+}
+
+// 长度。字符串是 UTF-8 字节数，数组是元素个数。
+fn 长度(xs: Any) -> Int {
+    return len(xs)
+}
+
+// 建一个长度 n、每个元素都是 填充 的数组。
+fn 建数组(n: Int, 填充: Any) -> Array {
+    return array(n, 填充)
+}
+
+// ============================================================
+// 二、数学（math 单入口的具名包装）
+// ============================================================
+//
+// 标量数学走 `math(操作名, 参数...)` 单入口。zh 在这里把它摊平
+// 成具名函数 —— 调用点读起来是 开方(9.0)，不再是 math(sqrt, 9.0)。
+
+fn 开方(x: Float) -> Float {
+    return math(sqrt, x)
+}
+
+fn 幂(a: Float, b: Float) -> Float {
+    return math(pow, a, b)
+}
+
+fn 立方根(x: Float) -> Float {
+    return math(cbrt, x)
+}
+
+fn 向下取整(x: Float) -> Int {
+    return math(floor, x)
+}
+
+fn 向上取整(x: Float) -> Int {
+    return math(ceil, x)
+}
+
+fn 四舍五入(x: Float) -> Int {
+    return math(round, x)
+}
+
+fn 截断小数(x: Float) -> Int {
+    return math(trunc, x)
+}
+
+fn 正弦(x: Float) -> Float {
+    return math(sin, x)
+}
+
+fn 余弦(x: Float) -> Float {
+    return math(cos, x)
+}
+
+fn 正切(x: Float) -> Float {
+    return math(tan, x)
+}
+
+fn 反正弦(x: Float) -> Float {
+    return math(asin, x)
+}
+
+fn 反余弦(x: Float) -> Float {
+    return math(acos, x)
+}
+
+fn 反正切(x: Float) -> Float {
+    return math(atan, x)
+}
+
+fn 自然对数(x: Float) -> Float {
+    return math(log, x)
+}
+
+fn 二进对数(x: Float) -> Float {
+    return math(log2, x)
+}
+
+fn 常用对数(x: Float) -> Float {
+    return math(log10, x)
+}
+
+fn 指数(x: Float) -> Float {
+    return math(exp, x)
+}
+
+fn 斜边长(a: Float, b: Float) -> Float {
+    return math(hypot, a, b)
+}
+
+fn 浮点求余(a: Float, b: Float) -> Float {
+    return math(fmod, a, b)
+}
+
+// ---- 类型保持组（Any 进、原类型出）----
+//
+// math(min/max/abs) 与 arrPop 的返回类型跟随输入，只有 Any 返回
+// 类型能透传。下游做算术前编译期不再查类型 —— 要强类型就用
+// 英文 abs / min / max。
+
+fn 绝对值(x: Any) -> Any {
+    return math(abs, x)
+}
+
+fn 最小值(a: Any, b: Any) -> Any {
+    return math(min, a, b)
+}
+
+fn 最大值(a: Any, b: Any) -> Any {
+    return math(max, a, b)
+}
+
+// 符号：负 → -1，零 → 0，正 → 1（math 表固定返回 Int）。
+fn 符号(x: Any) -> Int {
+    return math(sign, x)
+}
+
+// ============================================================
+// 三、数论与统计（std.math / std.array）
+// ============================================================
+
+fn 阶乘(n: Int) -> Float {
+    return fact(n)
+}
+
+fn 组合数(n: Int, k: Int) -> Float {
+    return comb(n, k)
+}
+
+fn 最大公约数(a: Int, b: Int) -> Int {
+    return gcd(a, b)
+}
+
+fn 最小公倍数(a: Int, b: Int) -> Int {
+    return lcm(a, b)
+}
+
+fn 是质数(n: Int) -> Bool {
+    return isPrime(n)
+}
+
+// 浮点比较不能用 ==，用这个 + 容差。
+fn 近似相等(a: Float, b: Float, 容差: Float) -> Bool {
+    return nearly(a, b, 容差)
+}
+
+fn 线性插值(a: Float, b: Float, t: Float) -> Float {
+    return lerp(a, b, t)
+}
+
+// 把 x 从 [下限, 上限] 归一化到 [0, 1]。
+fn 归一化(x: Float, 下限: Float, 上限: Float) -> Float {
+    return normalize(x, 下限, 上限)
+}
+
+// ---- 数值统计（数组按 Float 累计）----
+
+fn 求和(xs: Array) -> Float {
+    return arrSum(xs)
+}
+
+fn 平均值(xs: Array) -> Float {
+    return arrayMean(xs)
+}
+
+fn 方差(xs: Array) -> Float {
+    return variance(xs)
+}
+
+fn 总体方差(xs: Array) -> Float {
+    return popVariance(xs)
+}
+
+fn 标准差(xs: Array) -> Float {
+    return stddev(xs)
+}
+
+fn 总体标准差(xs: Array) -> Float {
+    return popStddev(xs)
+}
+
+fn 中位数(xs: Array) -> Float {
+    return median(xs)
+}
+
+fn 数值最大值(xs: Array) -> Float {
+    return arrMax(xs)
+}
+
+fn 数值最小值(xs: Array) -> Float {
+    return arrMin(xs)
+}
+
+fn 数值乘积(xs: Array) -> Float {
+    return arrProduct(xs)
+}
+
+// ============================================================
+// 四、矩阵（std.math，行优先扁平数组）
+// ============================================================
+//
+// P0 没有结构体，矩阵 = 长度 rows*cols 的一维数组，元素 (r,c)
+// 在下标 r*cols + c。每个函数显式收行列数，不打包成对象。
+
+fn 零矩阵(rows: Int, cols: Int) -> Array {
+    return matZeros(rows, cols)
+}
+
+fn 全一矩阵(rows: Int, cols: Int) -> Array {
+    return matOnes(rows, cols)
+}
+
+fn 单位矩阵(rows: Int, cols: Int) -> Array {
+    return matEye(rows, cols)
+}
+
+fn 矩阵加(a: Array, b: Array) -> Array {
+    return matAdd(a, b)
+}
+
+fn 矩阵减(a: Array, b: Array) -> Array {
+    return matSub(a, b)
+}
+
+fn 对位乘(a: Array, b: Array) -> Array {
+    return matMulElem(a, b)
+}
+
+fn 矩阵缩放(m: Array, k: Float) -> Array {
+    return matScale(m, k)
+}
+
+fn 矩阵乘(a: Array, a行: Int, a列: Int, b: Array, b列: Int) -> Array {
+    return matMul(a, a行, a列, b, b列)
+}
+
+fn 转置(m: Array, rows: Int, cols: Int) -> Array {
+    return matTranspose(m, rows, cols)
+}
+
+fn 取元素(m: Array, cols: Int, r: Int, c: Int) -> Float {
+    return matGet(m, cols, r, c)
+}
+
+fn 设元素(m: Array, cols: Int, r: Int, c: Int, v: Float) -> Void {
+    matSet(m, cols, r, c, v)
+}
+
+// ============================================================
+// 五、字符串（str* 内建 + std.str）
+// ============================================================
+//
+// 所有下标按**码点**算（一个汉字是一个），不是字节 —— 与编辑器
+// 光标一致。区间一律左闭右开。
+
+fn 取字符(s: String, i: Int) -> String {
+    return strAt(s, i)
+}
+
+// 左闭右开：取子串("中文编程", 0, 2) == "中文"。
+fn 取子串(s: String, 起点: Int, 终点: Int) -> String {
+    return strSub(s, 起点, 终点)
+}
+
+// 重载一：子串第一次出现的码点下标，找不到返回 -1。
+fn 查找(s: String, 子: String) -> Int {
+    return strFind(s, 子)
+}
+
+// 重载二：元素第一次出现的下标，找不到返回 -1。
+fn 查找(xs: Array, v: Any) -> Int {
+    return arrIndexOf(xs, v)
+}
+
+// 从指定下标开始找。
+fn 查找自(s: String, 子: String, 起点: Int) -> Int {
+    return strFindFrom(s, 子, 起点)
+}
+
+fn 切分(s: String, 分隔: String) -> Array {
+    return strSplit(s, 分隔)
+}
+
+// 数组元素转字符串后用 分隔 连接。
+fn 拼接(xs: Array, 分隔: String) -> String {
+    return strJoin(xs, 分隔)
+}
+
+fn 转大写(s: String) -> String {
+    return strUpper(s)
+}
+
+fn 转小写(s: String) -> String {
+    return strLower(s)
+}
+
+fn 去首尾空白(s: String) -> String {
+    return strTrim(s)
+}
+
+fn 替换(s: String, 旧: String, 新: String) -> String {
+    return strReplace(s, 旧, 新)
+}
+
+fn 开头是(s: String, 前缀: String) -> Bool {
+    return strStarts(s, 前缀)
+}
+
+fn 结尾是(s: String, 后缀: String) -> Bool {
+    return strEnds(s, 后缀)
+}
+
+fn 重复(s: String, n: Int) -> String {
+    return strRepeat(s, n)
+}
+
+// 单字符 → Unicode 码点。
+fn 字符码(c: String) -> Int {
+    return strCode(c)
+}
+
+// Unicode 码点 → 单字符。
+fn 码转字符(n: Int) -> String {
+    return strFromCode(n)
+}
+
+// 字符串 → 整数，解析不了返回 0。
+fn 解析整数(s: String) -> Int {
+    return strParseInt(s)
+}
+
+// 字符串 → 浮点，解析不了返回 0.0。
+fn 解析浮点(s: String) -> Float {
+    return strParseFloat(s)
+}
+
+fn 是空串(s: String) -> Bool {
+    return strIsEmpty(s)
+}
+
+// 只含空白（或长度为 0）才算真 —— 与 是空串 的区别。
+fn 是空白串(s: String) -> Bool {
+    return strIsBlank(s)
+}
+
+fn 左补齐(s: String, 宽: Int, 补: String) -> String {
+    return strPadLeft(s, 宽, 补)
+}
+
+fn 右补齐(s: String, 宽: Int, 补: String) -> String {
+    return strPadRight(s, 宽, 补)
+}
+
+fn 居中补齐(s: String, 宽: Int, 补: String) -> String {
+    return strPadCenter(s, 宽, 补)
+}
+
+// 显示宽度：汉字占 2，ASCII 占 1 —— 与终端实际渲染一致。
+fn 显示宽度(s: String) -> Int {
+    return strDisplayWidth(s)
+}
+
+fn 出现次数(s: String, 子: String) -> Int {
+    return strCount(s, 子)
+}
+
+fn 反转(s: String) -> String {
+    return strReverse(s)
+}
+
+fn 行数(s: String) -> Int {
+    return strLineCount(s)
+}
+
+// ============================================================
+// 六、数组（arr* 内建 + std.array）
+// ============================================================
+//
+// 原地修改类（追加/插入/倒转/排序/填充/洗牌）直接改数组本体；
+// 返回新数组的（取段/合并/去重/...）不动原数组。
+
+// 尾部追加一个元素，返回新长度。**原地修改**。
+fn 追加(xs: Array, v: Any) -> Int {
+    return arrPush(xs, v)
+}
+
+// 在下标 i 处插入，返回新长度。**原地修改**。
+fn 插入(xs: Array, i: Int, v: Any) -> Int {
+    return arrInsert(xs, i, v)
+}
+
+// 取 [起点, 终点) 的元素，负数与越界钳制。返回新数组。
+fn 取段(xs: Array, 起点: Int, 终点: Int) -> Array {
+    return arrSlice(xs, 起点, 终点)
+}
+
+// 两个数组首尾相接。返回新数组。
+fn 合并(a: Array, b: Array) -> Array {
+    return arrConcat(a, b)
+}
+
+// 原地反转。
+fn 倒转(xs: Array) -> Void {
+    arrReverse(xs)
+}
+
+// 原地升序排序。
+fn 排序(xs: Array) -> Void {
+    arrSort(xs)
+}
+
+// 深拷贝一份。
+fn 复制(xs: Array) -> Array {
+    return arrCopy(xs)
+}
+
+fn 包含(xs: Array, v: Any) -> Bool {
+    return arrContains(xs, v)
+}
+
+// 把所有元素设为 v。**原地修改**。
+fn 填充(xs: Array, v: Any) -> Void {
+    arrFill(xs, v)
+}
+
+// v 出现的所有下标。
+fn 所有下标(xs: Array, v: Int) -> Array {
+    return arrIndexesOf(xs, v)
+}
+
+fn 是空数组(xs: Array) -> Bool {
+    return arrIsEmpty(xs)
+}
+
+// 取前 n 个 / 去掉前 n 个。都返回新数组。
+fn 取前n个(xs: Array, n: Int) -> Array {
+    return arrTake(xs, n)
+}
+
+fn 去前n个(xs: Array, n: Int) -> Array {
+    return arrDrop(xs, n)
+}
+
+// 保留首次出现，去掉后面的重复。返回新数组。
+fn 去重(xs: Array) -> Array {
+    return arrUnique(xs)
+}
+
+// 二维拍平成一维。
+fn 展平(xs: Array) -> Array {
+    return arrFlatten(xs)
+}
+
+// 重复 的数组重载：整个数组重复 n 遍。
+fn 重复(xs: Array, n: Int) -> Array {
+    return arrRepeat(xs, n)
+}
+
+// 排好序的**副本**（原数组不动 —— 与 排序 的原地版区分）。
+fn 已排序(xs: Array) -> Array {
+    return arrSorted(xs)
+}
+
+fn 降序排序(xs: Array) -> Array {
+    return arrSortedDesc(xs)
+}
+
+// 原地随机打乱。
+fn 洗牌(xs: Array) -> Void {
+    arrShuffle(xs)
+}
+
+// 随机抽 n 个（不重复）。
+fn 抽取(xs: Array, n: Int) -> Array {
+    return arrSampleN(xs, n)
+}
+
+fn 并集(a: Array, b: Array) -> Array {
+    return arrUnion(a, b)
+}
+
+fn 交集(a: Array, b: Array) -> Array {
+    return arrIntersect(a, b)
+}
+
+// a 有 b 没有的元素。
+fn 差集(a: Array, b: Array) -> Array {
+    return arrDiff(a, b)
+}
+
+// 把一维数组按每 cols 个一行分块。
+fn 分块(xs: Array, cols: Int) -> Array {
+    return arrChunk(xs, cols)
+}
+
+// 行优先扁平矩阵的行 / 列。
+fn 取行(xs: Array, cols: Int, r: Int) -> Array {
+    return arrRow(xs, cols, r)
+}
+
+fn 取列(xs: Array, rows: Int, cols: Int, c: Int) -> Array {
+    return arrCol(xs, rows, cols, c)
+}
+
+// ---- 逐元素映射与筛选 ----
+//
+// 语言还没有闭包，所以「对每个元素做 X」是一组具名函数。
+// 这是当前语言形态下唯一正确的做法（std.array 顶部注释有完整论证）。
+
+fn 每项乘(xs: Array, k: Float) -> Array {
+    return arrMapMul(xs, k)
+}
+
+fn 每项加(xs: Array, k: Float) -> Array {
+    return arrMapAdd(xs, k)
+}
+
+fn 每项取绝对值(xs: Array) -> Array {
+    return arrMapAbs(xs)
+}
+
+fn 每项转整数(xs: Array) -> Array {
+    return arrMapInt(xs)
+}
+
+fn 每项转浮点(xs: Array) -> Array {
+    return arrMapFloat(xs)
+}
+
+fn 每项转字符串(xs: Array) -> Array {
+    return arrMapStr(xs)
+}
+
+fn 筛选等于(xs: Array, v: Int) -> Array {
+    return arrFilterEq(xs, v)
+}
+
+fn 筛选不等于(xs: Array, v: Int) -> Array {
+    return arrFilterNot(xs, v)
+}
+
+fn 筛选大于(xs: Array, v: Float) -> Array {
+    return arrFilterGt(xs, v)
+}
+
+fn 筛选小于(xs: Array, v: Float) -> Array {
+    return arrFilterLt(xs, v)
+}
+
+// ============================================================
+// 七、文件（fs* 内建 + std.fs）
+// ============================================================
+
+// 读整个文件为 UTF-8 文本，读不到直接报错。
+fn 读文件(p: String) -> String {
+    return fsRead(p)
+}
+
+// 读不到返回 缺省 而不是报错。
+fn 读文件或(p: String, 缺省: String) -> String {
+    return fsReadOr(p, 缺省)
+}
+
+// 整体覆盖写。返回是否成功。
+fn 写文件(p: String, s: String) -> Bool {
+    return fsWrite(p, s)
+}
+
+fn 追加写(p: String, s: String) -> Bool {
+    return fsAppend(p, s)
+}
+
+fn 存在吗(p: String) -> Bool {
+    return fsExists(p)
+}
+
+fn 是目录吗(p: String) -> Bool {
+    return fsIsDir(p)
+}
+
+fn 删除文件(p: String) -> Bool {
+    return fsRemove(p)
+}
+
+// 字节数。
+fn 文件大小(p: String) -> Int {
+    return fsSize(p)
+}
+
+// 目录下的文件与子目录名。返回新数组。
+fn 列目录(p: String) -> Array {
+    return fsList(p)
+}
+
+// 单层目录，父目录必须已存在。
+fn 建目录(p: String) -> Bool {
+    return fsMkdir(p)
+}
+
+// 逐级建齐整条路径。
+fn 确保目录(p: String) -> Bool {
+    return fsEnsureDir(p)
+}
+
+// 自动补缺失的父目录。
+fn 深度写(p: String, s: String) -> Bool {
+    return fsWriteDeep(p, s)
+}
+
+fn 按行读(p: String) -> Array {
+    return fsReadLines(p)
+}
+
+fn 按行写(p: String, 行集: Array) -> Bool {
+    return fsWriteLines(p, 行集)
+}
+
+fn 追加一行(p: String, 行: String) -> Bool {
+    return fsAppendLine(p, 行)
+}
+
+fn 拼路径(a: String, b: String) -> String {
+    return fsJoin(a, b)
+}
+
+fn 取文件名(p: String) -> String {
+    return fsBaseName(p)
+}
+
+fn 取目录名(p: String) -> String {
+    return fsDirName(p)
+}
+
+fn 取扩展名(p: String) -> String {
+    return fsExtName(p)
+}
+
+// ============================================================
+// 八、时间与随机
+// ============================================================
+
+// [0, 1) 随机浮点。
+fn 随机数() -> Float {
+    return random()
+}
+
+fn 设随机种子(n: Int) -> Void {
+    randomSeed(n)
+}
+
+fn 当前毫秒() -> Int {
+    return nowMillis()
+}
+
+// Unix epoch 起的秒数。
+fn 当前秒() -> Int {
+    return nowSeconds()
+}
+
+// 单调时钟 —— 计时用这个，不受系统改时间影响。
+fn 单调毫秒() -> Int {
+    return monoMillis()
+}
+
+fn 睡眠(ms: Int) -> Void {
+    sleep(ms)
+}
+
+// 弹出尾部元素并返回它（**原地修改**）。空数组的行为与 arrPop 一致。
+fn 弹出(xs: Array) -> Any {
+    return arrPop(xs)
+}
+
+// ============================================================
+// 九、转换（std.conv）
+// ============================================================
+
+// 解析失败返回 缺省 而不是 0 —— 适合「配置项读不出就用默认值」。
+fn 转整数或(s: String, 缺省: Int) -> Int {
+    return toIntOr(s, 缺省)
+}
+
+fn 转浮点或(s: String, 缺省: Float) -> Float {
+    return toFloatOr(s, 缺省)
+}
+
+// 只认英文布尔字面量（不区分大小写）："true"/"yes"/"y"/"on"/"1" → 真，
+// 其余一律假（与 toBool 逐字节一致）。中文「是/否」**不是**布尔字面量
+// —— 转换层不做智能猜测（04 §5：中英混排自动转换明确不做）。
+fn 转布尔(s: String) -> Bool {
+    return toBool(s)
+}
+
+fn 转布尔或(s: String, 缺省: Bool) -> Bool {
+    return toBoolOr(s, 缺省)
+}
+
+fn 转十六进制(n: Int) -> String {
+    return toHex(n)
+}
+
+fn 转二进制(n: Int) -> String {
+    return toBin(n)
+}
+
+fn 转八进制(n: Int) -> String {
+    return toOct(n)
+}
+
+fn 从十六进制(s: String) -> Int {
+    return fromHex(s)
+}
+
+fn 从二进制(s: String) -> Int {
+    return fromBin(s)
+}
+
+fn 补零(n: Int, 宽: Int) -> String {
+    return padZero(n, 宽)
+}
+
+// 固定小数位输出，如 保留小数(3.14159, 2) == "3.14"。
+fn 保留小数(x: Float, 位: Int) -> String {
+    return fixed(x, 位)
+}
+
+fn 千分位(n: Int) -> String {
+    return thousands(n)
+}
+
+fn 百分比(x: Float, 位: Int) -> String {
+    return percent(x, 位)
+}
+
+fn 布尔转字符串(b: Bool) -> String {
+    return boolToString(b)
+}
+
+// 整个字符串长得像整数 / 浮点（用于输入校验，比先解析再回滚干净）。
+fn 是整数样(s: String) -> Bool {
+    return convIsIntLike(s)
+}
+
+fn 是浮点样(s: String) -> Bool {
+    return convIsFloatLike(s)
+}
+
+// ============================================================
+// 包版本（供宿主程序探测，如 打印行(中文别名版本)）
+// ============================================================
+const 中文别名版本 = "0.1.0"

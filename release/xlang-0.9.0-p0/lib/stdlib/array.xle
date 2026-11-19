@@ -1,0 +1,416 @@
+// ============================================================
+// std.array —— 数组工具
+// ============================================================
+//
+// 基础操作（arrPush/arrPop/arrInsert/arrRemove/arrSlice/
+// arrConcat/arrReverse/arrIndexOf/arrContains/arrFill/arrSort/
+// arrCopy）已经是内建 —— 因为它们必须原地操作（语言没有
+// 引用参数，纯 X 函数做不到）。
+//
+// 这里补的是**纯函数式工具**：它们返回新数组或一个值，不需要
+// 原地修改，所以放在标准库里正合适。
+//
+// ── 回调问题 ────────────────────────────────────────────────
+//
+// 语言没有闭包、没有函数类型，所以 map/filter/reduce 这类
+// 「收一个函数」的接口写不出来。这一层的替代做法是**专用函数**：
+// 需要「对每个元素乘 2」就写 arrMapMul，需要「取绝对值」就写
+// arrMapAbs。听起来笨，但它是当前语言能提供的唯一正确形态 ——
+// 写 arrMap(xs, "mul", 2) 那种用字符串指代操作的做法会把类型
+// 错误从编译期推到运行期，是更差的选择。
+//
+// 等语言支持函数值之后，这一层会加 arrMap/arrFilter/arrReduce
+// 三个通用版本，而现有专用函数保留（它们更快，且调用点更清楚）。
+
+// ---- 查找与统计 ----
+
+// 所有匹配值的下标。arrIndexOf 只给第一个。
+fn arrIndexesOf(xs: Array, v: Int) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(xs)) {
+        if (xs[i] == v) { arrPush(out, i) }
+        i = i + 1
+    }
+    return out
+}
+
+// 第一个满足「等于 v」的下标，找不到给 -1（与内建 arrIndexOf 同）。
+// 保留这个名字是为了让调用点读起来像「查找」而不是「取下标」。
+fn arrFind(xs: Array, v: Int) -> Int {
+    return arrIndexOf(xs, v)
+}
+
+// 数值数组求和
+fn arrSum(xs: Array) -> Float {
+    var s = 0.0
+    var i = 0
+    while (i < len(xs)) {
+        s = s + toFloat(xs[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn arrAvg(xs: Array) -> Float {
+    if (len(xs) == 0) { return 0.0 }
+    return arrSum(xs) / toFloat(len(xs))
+}
+
+fn arrMin(xs: Array) -> Float {
+    if (len(xs) == 0) { return 0.0 }
+    var v = toFloat(xs[0])
+    var i = 1
+    while (i < len(xs)) {
+        let x = toFloat(xs[i])
+        if (x < v) { v = x }
+        i = i + 1
+    }
+    return v
+}
+
+fn arrMax(xs: Array) -> Float {
+    if (len(xs) == 0) { return 0.0 }
+    var v = toFloat(xs[0])
+    var i = 1
+    while (i < len(xs)) {
+        let x = toFloat(xs[i])
+        if (x > v) { v = x }
+        i = i + 1
+    }
+    return v
+}
+
+// 是否为空
+fn arrIsEmpty(xs: Array) -> Bool {
+    return len(xs) == 0
+}
+
+// ---- 生成新数组 ----
+
+// 取前 n 个（越界给全部，不报错）
+fn arrTake(xs: Array, n: Int) -> Array {
+    if (n <= 0) { return array(0, 0) }
+    if (n >= len(xs)) { return arrCopy(xs) }
+    return arrSlice(xs, 0, n)
+}
+
+// 丢掉前 n 个
+fn arrDrop(xs: Array, n: Int) -> Array {
+    if (n <= 0) { return arrCopy(xs) }
+    if (n >= len(xs)) { return array(0, 0) }
+    return arrSlice(xs, n, len(xs))
+}
+
+// 去重，保持首次出现的顺序。O(n²) —— 语言没有哈希表，
+// 而小数组（配置项、标签列表）是主要用途，不值得为它造一棵树。
+fn arrUnique(xs: Array) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(xs)) {
+        if (!arrContains(out, xs[i])) {
+            arrPush(out, xs[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 展平一层。[[1,2],[3]] → [1,2,3]
+fn arrFlatten(xs: Array) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(xs)) {
+        let e = xs[i]
+        if (typeOf(e) == "Array") {
+            var j = 0
+            while (j < len(e)) {
+                arrPush(out, e[j])
+                j = j + 1
+            }
+        } else {
+            arrPush(out, e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 重复 n 次拼起来。["a"] ×3 → [a,a,a]
+fn arrRepeat(xs: Array, n: Int) -> Array {
+    let out = array(0, 0)
+    var k = 0
+    while (k < n) {
+        var i = 0
+        while (i < len(xs)) {
+            arrPush(out, xs[i])
+            i = i + 1
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// 升序副本（不动原数组）。内建 arrSort 是原地排序。
+fn arrSorted(xs: Array) -> Array {
+    let c = arrCopy(xs)
+    arrSort(c)
+    return c
+}
+
+// 降序副本
+fn arrSortedDesc(xs: Array) -> Array {
+    let c = arrCopy(xs)
+    arrSort(c)
+    arrReverse(c)
+    return c
+}
+
+// ---- 本质操作（纯函数版） ----
+//
+// 命名规则：arrMapXxx 对每个元素做同一件事，返回新数组。
+
+fn arrMapMul(xs: Array, k: Float) -> Array {
+    let out = array(0, 0.0)
+    var i = 0
+    while (i < len(xs)) {
+        arrPush(out, toFloat(xs[i]) * k)
+        i = i + 1
+    }
+    return out
+}
+
+fn arrMapAdd(xs: Array, k: Float) -> Array {
+    let out = array(0, 0.0)
+    var i = 0
+    while (i < len(xs)) {
+        arrPush(out, toFloat(xs[i]) + k)
+        i = i + 1
+    }
+    return out
+}
+
+fn arrMapAbs(xs: Array) -> Array {
+    let out = array(0, 0.0)
+    var i = 0
+    while (i < len(xs)) {
+        arrPush(out, math(abs, toFloat(xs[i])))
+        i = i + 1
+    }
+    return out
+}
+
+fn arrMapInt(xs: Array) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(xs)) {
+        arrPush(out, toInt(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn arrMapFloat(xs: Array) -> Array {
+    let out = array(0, 0.0)
+    var i = 0
+    while (i < len(xs)) {
+        arrPush(out, toFloat(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn arrMapStr(xs: Array) -> Array {
+    let out = array(0, "")
+    var i = 0
+    while (i < len(xs)) {
+        arrPush(out, toString(xs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 过滤（按谓词种类分） ----
+
+// 只留等于 v 的
+fn arrFilterEq(xs: Array, v: Int) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(xs)) {
+        if (xs[i] == v) { arrPush(out, xs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// 丢掉等于 v 的
+fn arrFilterNot(xs: Array, v: Int) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(xs)) {
+        if (xs[i] != v) { arrPush(out, xs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// 只留 > v 的
+fn arrFilterGt(xs: Array, v: Float) -> Array {
+    let out = array(0, 0.0)
+    var i = 0
+    while (i < len(xs)) {
+        let x = toFloat(xs[i])
+        if (x > v) { arrPush(out, x) }
+        i = i + 1
+    }
+    return out
+}
+
+// 只留 < v 的
+fn arrFilterLt(xs: Array, v: Float) -> Array {
+    let out = array(0, 0.0)
+    var i = 0
+    while (i < len(xs)) {
+        let x = toFloat(xs[i])
+        if (x < v) { arrPush(out, x) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 归约 ----
+
+// 两两求和的字符串拼接。seps 是分隔符。
+fn arrJoin(xs: Array, sep: String) -> String {
+    return strJoin(xs, sep)
+}
+
+// 累积乘
+fn arrProduct(xs: Array) -> Float {
+    var p = 1.0
+    var i = 0
+    while (i < len(xs)) {
+        p = p * toFloat(xs[i])
+        i = i + 1
+    }
+    return p
+}
+
+// ---- 洗牌与采样 ----
+
+// 原地洗牌（Fisher-Yates）。
+//
+// 为什么用 Fisher-Yates 而不是「随机排序」：后者每个元素都要
+// 调一次比较函数，而比较函数本身不确定 —— 那是 O(n log n) 次
+// 随机调用，且分布可证明有偏。Fisher-Yates 是 O(n) 次、无偏。
+//
+// 注意它**必须**用内建的 random()，而不是自己造随机数：
+// 这样 randomSeed 的设定对洗牌也生效，测试才能复现。
+fn arrShuffle(xs: Array) -> Void {
+    var i = len(xs) - 1
+    while (i > 0) {
+        let j = toInt(math(floor, random() * toFloat(i + 1)))
+        let t = xs[i]
+        xs[i] = xs[j]
+        xs[j] = t
+        i = i - 1
+    }
+}
+
+// 随机取一个。空数组给 null。
+//
+// 返回类型不标注：元素可能是任意类型，而语言没有联合类型。
+// 这是「无注解即任意类型」的正常用法，不是遗漏。
+fn arrSample(xs: Array) {
+    if (len(xs) == 0) { return nullValue() }
+    let i = toInt(math(floor, random() * toFloat(len(xs))))
+    // random() 是 [0,1)，理论上不会给出 len，但浮点乘法在边界上
+    // 可能恰好得到 len —— 夹一下，不让它变成越界访问。
+    var k = i
+    if (k >= len(xs)) { k = len(xs) - 1 }
+    if (k < 0) { k = 0 }
+    return xs[k]
+}
+
+// 取 n 个不重复的随机元素（洗牌后取前 n）。
+fn arrSampleN(xs: Array, n: Int) -> Array {
+    if (n <= 0) { return array(0, 0) }
+    let c = arrCopy(xs)
+    arrShuffle(c)
+    return arrTake(c, n)
+}
+
+// 空值。语言没有 null 字面量，唯一可靠的来源是弹空数组 ——
+// 「弹空数组返回 null」这条语义的副产品，而它恰好能用。
+fn nullValue() {
+    let e = array(0, 0)
+    return arrPop(e)
+}
+
+// ---- 集合运算（按值比较，O(n²)） ----
+
+fn arrUnion(a: Array, b: Array) -> Array {
+    return arrUnique(arrConcat(a, b))
+}
+
+fn arrIntersect(a: Array, b: Array) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(a)) {
+        if (arrContains(b, a[i]) && !arrContains(out, a[i])) {
+            arrPush(out, a[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn arrDiff(a: Array, b: Array) -> Array {
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(a)) {
+        if (!arrContains(b, a[i]) && !arrContains(out, a[i])) {
+            arrPush(out, a[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- 二维（矩阵友好） ----
+
+// 按 cols 分块成二维。末块可能不足 cols 个元素。
+fn arrChunk(xs: Array, cols: Int) -> Array {
+    if (cols <= 0) {
+        fail("arrChunk: 块大小必须为正（收到 " + toString(cols) + "）")
+    }
+    let out = array(0, 0)
+    var i = 0
+    while (i < len(xs)) {
+        var end = i + cols
+        if (end > len(xs)) { end = len(xs) }
+        arrPush(out, arrSlice(xs, i, end))
+        i = end
+    }
+    return out
+}
+
+// 取一列：把第 c 列的所有元素提成数组。rows/cols 与矩阵表示一致。
+fn arrCol(xs: Array, rows: Int, cols: Int, c: Int) -> Array {
+    let out = array(0, 0)
+    var r = 0
+    while (r < rows) {
+        arrPush(out, xs[r * cols + c])
+        r = r + 1
+    }
+    return out
+}
+
+// 取一行
+fn arrRow(xs: Array, cols: Int, r: Int) -> Array {
+    let start = r * cols
+    if (start < 0 || start >= len(xs)) {
+        fail("arrRow: 行号越界（" + toString(r) + "）")
+    }
+    return arrSlice(xs, start, start + cols)
+}

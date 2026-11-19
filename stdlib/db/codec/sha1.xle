@@ -1,0 +1,172 @@
+// db/codec/sha1.xle — SHA-1 摘要
+//
+// ── 为什么语言里要自己实现一个哈希 ────────────────────
+//
+// P0 的内建函数表里没有任何摘要算法（grep `sha` 在 src/ 下零命中）。
+// 而 MySQL 的 mysql_native_password 认证、PostgreSQL 的部分老认证
+// 方式都要求 SHA-1。没有它就连不上数据库 —— 这不是「可以以后再补」
+// 的东西，是入口的钥匙。
+//
+// ── 为什么不直接用系统库 ──────────────────────────
+//
+// 因为语言没有 FFI，也没有 exec/spawn，无法调用 openssl 命令行。
+// 所有密码学原语只能在语言内实现。
+
+from "bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "../../conv.xle" import toIntOr, toFloatOr, convIsIntLike, convIsFloatLike, toBool, toBoolOr, boolToString, toBase, toHex, toBin, toOct, fromHex, fromBin, padZero, fixed, thousands, percent, bytes, numbersToString, stringToNumbers, stringToInts, isSpace, isPrintableAscii, escapeChar
+
+// SHA-1 的初始链接值（FIPS 180-4 规定）。
+const SHA1_H0 = 0x67452301
+const SHA1_H1 = 0xEFCDAB89
+const SHA1_H2 = 0x98BADCFE
+const SHA1_H3 = 0x10325476
+const SHA1_H4 = 0xC3D2E1F0
+
+// 32 位无符号值的掩码。语言只有 64 位有符号 Int，所有中间结果
+// 都必须显式截断到 32 位，否则进位会污染高位。
+const SHA1_MASK32 = 0xFFFFFFFF
+
+class Sha1 {
+    // ── 32 位循环左移 ──────────────────────────
+    //
+    // ── 为什么 v >> (32-n) 不会出错 ─────────────────
+    //
+    // 因为 v 已经被 & 0xFFFFFFFF 限制在 [0, 2^32)，在 64 位有符号
+    // Int 里是**正数**，所以 >> 是逻辑右移，高位补 0。这是整个实现
+    // 能成立的前提 —— 只要有一处忘了掩码，负数进来就会补 1，结果
+    // 全错。
+    static fn rotl(x: Int, n: Int) -> Int {
+        let v = x & SHA1_MASK32
+        let sh = 32 - n
+        return ((v << n) | (v >> sh)) & SHA1_MASK32
+    }
+
+    // ── 填充 ──────────────────────────────────
+    //
+    // 规则（FIPS 180-4）：先补一个 0x80，再补 0 直到长度 ≡ 56 (mod 64)，
+    // 最后补 8 字节大端的**原始比特长度**。
+    //
+    // ── 为什么长度是比特数而不是字节数 ─────────────────
+    //
+    // 这是 SHA-1 规范的定义，不是可选的实现细节。写成字节数会让所有
+    // 摘要都错，而且错得很隐蔽（只在某些长度下才崩）。
+    static fn padded(data: Array) -> Array {
+        let out = bbSlice(data, 0, len(data))
+        let bitLen = len(data) * 8
+        bbPut(out, 0x80)
+        while (len(out) % 64) != 56 {
+            bbPut(out, 0)
+        }
+        bbPutU32BE(out, (bitLen >> 32) & SHA1_MASK32)
+        bbPutU32BE(out, bitLen & SHA1_MASK32)
+        return out
+    }
+
+    // ── 主计算：输入字节数组，输出 20 字节摘要 ──────────
+    static fn hash(data: Array) -> Array {
+        var h0 = SHA1_H0
+        var h1 = SHA1_H1
+        var h2 = SHA1_H2
+        var h3 = SHA1_H3
+        var h4 = SHA1_H4
+
+        let msg = Sha1.padded(data)
+        let total = len(msg)
+        var off = 0
+
+        while off < total {
+            // 512 位分块 → 16 个 32 位大端字
+            let w = []
+            var t = 0
+            while t < 16 {
+                arrPush(w, bbU32BE(msg, off + t * 4) & SHA1_MASK32)
+                t = t + 1
+            }
+            // 扩展成 80 个字：w[t] = rotl1(w[t-3]^w[t-8]^w[t-14]^w[t-16])
+            while t < 80 {
+                let x = toInt(w[t - 3]) ^ toInt(w[t - 8])
+                      ^ toInt(w[t - 14]) ^ toInt(w[t - 16])
+                arrPush(w, Sha1.rotl(x, 1))
+                t = t + 1
+            }
+
+            var a = h0
+            var b = h1
+            var c = h2
+            var d = h3
+            var e = h4
+
+            t = 0
+            while t < 80 {
+                var f = 0
+                var k = 0
+                if (t < 20) {
+                    // Ch(b,c,d) = (b & c) | (~b & d)
+                    f = (b & c) | ((~b & SHA1_MASK32) & d)
+                    k = 0x5A827999
+                } else if (t < 40) {
+                    // Parity(b,c,d)
+                    f = b ^ c ^ d
+                    k = 0x6ED9EBA1
+                } else if (t < 60) {
+                    // Maj(b,c,d) = (b&c) | (b&d) | (c&d)
+                    f = (b & c) | (b & d) | (c & d)
+                    k = 0x8F1BBCDC
+                } else {
+                    f = b ^ c ^ d
+                    k = 0xCA62C1D6
+                }
+                let temp = (Sha1.rotl(a, 5) + (f & SHA1_MASK32) + e
+                          + k + toInt(w[t])) & SHA1_MASK32
+                e = d
+                d = c
+                c = Sha1.rotl(b, 30)
+                b = a
+                a = temp
+                t = t + 1
+            }
+
+            h0 = (h0 + a) & SHA1_MASK32
+            h1 = (h1 + b) & SHA1_MASK32
+            h2 = (h2 + c) & SHA1_MASK32
+            h3 = (h3 + d) & SHA1_MASK32
+            h4 = (h4 + e) & SHA1_MASK32
+            off = off + 64
+        }
+
+        let out = []
+        bbPutU32BE(out, h0)
+        bbPutU32BE(out, h1)
+        bbPutU32BE(out, h2)
+        bbPutU32BE(out, h3)
+        bbPutU32BE(out, h4)
+        return out
+    }
+
+    // 对文本求摘要（先按 UTF-8 编码）。
+    static fn hashText(s: String) -> Array {
+        return Sha1.hash(bbFromUtf8(s))
+    }
+
+    // 十六进制表示（40 个字符）。
+    static fn hex(data: Array) -> String {
+        return Sha1.hexOf(Sha1.hash(data))
+    }
+
+    static fn hexText(s: String) -> String {
+        return Sha1.hexOf(Sha1.hashText(s))
+    }
+
+    // 把任意字节数组转成小写十六进制。
+    static fn hexOf(b: Array) -> String {
+        var out = ""
+        var i = 0
+        let n = len(b)
+        while i < n {
+            let v = bbAt(b, i)
+            out = out + toHex(v >> 4) + toHex(v & 0x0F)
+            i = i + 1
+        }
+        return out
+    }
+}

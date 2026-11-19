@@ -1,0 +1,465 @@
+// ui/control/field.xle — 单行文本输入框
+//
+// ── 输入框为什么是 UI 库里最难的那个 ────────────────
+//
+// 看起来它只是个带边框的矩形，但它必须处理：
+//
+//   · 光标（一个插入点，在字符之间而不是字符上）
+//   · 选区（锚点 + 活动端，可以从任意方向拖动）
+//   · 水平滚动（文字比框宽时，光标必须可见）
+//   · 密码遮罩（显示 ● 但保留原值）
+//   · 占位符（空值时显示提示，但不可选中）
+//   · 只读与禁用的区别（只读能选中复制、禁用连光标都没有）
+//   · 错误的视觉（红框 + 错误提示占位）
+//
+// 这些状态互相影响，所以它们的组合必须由**一个**状态机管。
+// 如果让每个使用输入框的地方自己判断，就必然出现「密码框里
+// 光标位置按明文字符算」这种问题。
+//
+// ── 光标位置的单位 ────────────────────────────
+//
+// 光标用「字符索引」而不是像素：0 表示最前，len(text) 表示
+// 最后。像素位置是绘制时才算出来的派生值。
+//
+// 反过来做（存像素位置）会在文字变化时失效 —— 删掉一个字之后
+// 原来的像素位置指向别的字符，光标会"跳"。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 输入框内边距。左边留 8 给光标，右边留 8 防止文字贴边。
+const FIELD_PAD = 8
+
+class Field extends Widget {
+    // 当前值。密码框里这里存的是**明文**，遮罩只发生在绘制时。
+    //
+    // 为什么不在写入时就加密/遮罩：那样「切换显示密码」就要
+    // 重新求值，而原文一旦丢了就找不回来。保持明文、绘制时遮罩
+    // 是唯一能支持「眼睛图标」的做法。
+    text: String,
+
+    // 光标位置（字符索引，0..len(text)）。
+    cursor: Int,
+
+    // 选区锚点。-1 表示没有选区。
+    //
+    // ── 为什么是锚点 + 光标而不是 (start, end) ─────────
+    //
+    // 因为拖选可以有方向：从右往左拖时，光标在左、锚点在右。
+    // 用 (start, end) 就必须在每次移动时判断方向并交换两个值，
+    // 而「忘记交换」会导致选区算成负数长度。锚点法天然无方向。
+    anchor: Int,
+
+    // 占位符。空值时显示，颜色是次要色。
+    placeholder: String,
+
+    // 是否密码框。
+    password: Bool,
+
+    // 是否只读。只读能选中、能复制、不能改。
+    readonly: Bool,
+
+    // 是否有错误。红框 + 红字，具体消息由外部标签显示。
+    invalid: Bool,
+
+    // 水平滚动偏移（像素）。文字比框宽时用。
+    scrollX: Int,
+
+    constructor(r: Rect, text: String) {
+        self.r           = r
+        self.vis         = true
+        self.enabled     = true
+        self.focused     = false
+        self.hovered     = false
+        self.text        = text
+        self.cursor      = len(text)
+        self.anchor      = 0 - 1
+        self.placeholder = ""
+        self.password    = false
+        self.readonly    = false
+        self.invalid     = false
+        self.scrollX     = 0
+        self.style       = Style.input(Theme.dark())
+    }
+
+    // ── 工厂 ────────────────────────────────────
+
+    static fn of(r: Rect, text: String) -> Field {
+        return new Field(r, text)
+    }
+
+    static fn empty(r: Rect) -> Field {
+        return new Field(r, "")
+    }
+
+    static fn passwordOf(r: Rect, text: String) -> Field {
+        let f = new Field(r, text)
+        f.password = true
+        return f
+    }
+
+    static fn readOnly(r: Rect, text: String) -> Field {
+        let f = new Field(r, text)
+        f.readonly = true
+        return f
+    }
+
+    // ── 值与光标 ──────────────────────────────────
+
+    fn value() -> String {
+        return self.text
+    }
+
+    fn setValue(s: String) -> Field {
+        self.text = s
+        // 值变短时光标可能越界，夹紧而不是归零 —— 归零会让
+        // 「程序化改值」时用户的输入位置突然跳回开头。
+        if (self.cursor > len(s)) { self.cursor = len(s) }
+        if (self.cursor < 0) { self.cursor = 0 }
+        return self
+    }
+
+    fn setPlaceholder(s: String) -> Field {
+        self.placeholder = s
+        return self
+    }
+
+    fn setInvalid(v: Bool) -> Field {
+        self.invalid = v
+        return self
+    }
+
+    // 光标移到末尾。聚焦时默认行为。
+    fn cursorEnd() -> Field {
+        self.cursor = len(self.text)
+        self.anchor = 0 - 1
+        return self
+    }
+
+    // ── 编辑操作 ──────────────────────────────────
+    //
+    // 这一组都返回 Bool：true 表示内容真的变了。调用方据此决定
+    // 「要不要标脏」「要不要触发校验」。
+    //
+    // 为什么插入/删除返回「是否变化」而不是 void：因为只读框、
+    // 尾部插入、删除空选区这些操作**没有变化**，而调用方需要
+    // 区分「用户按了键但没效果」和「用户按了键改了值」。
+
+    // 在光标处插入一个字符/字符串。
+    fn insert(s: String) -> Bool {
+        if (self.readonly) { return false }
+        if (!self.enabled) { return false }
+        if (len(s) == 0) { return false }
+
+        // 有选区先删选区 —— 这是所有编辑器的一致行为：
+        // 选中文字后打字是替换，不是追加。
+        self.deleteSelection()
+
+        let before = strSub(self.text, 0, self.cursor)
+        let after = strSub(self.text, self.cursor, len(self.text))
+        self.text = before + s + after
+        self.cursor = self.cursor + len(s)
+        return true
+    }
+
+    // 退格：删光标左边一个字符。
+    fn backspace() -> Bool {
+        if (self.readonly) { return false }
+        if (!self.enabled) { return false }
+
+        if (self.hasSelection()) {
+            return self.deleteSelection()
+        }
+        if (self.cursor <= 0) { return false }
+
+        let before = strSub(self.text, 0, self.cursor - 1)
+        let after = strSub(self.text, self.cursor, len(self.text))
+        self.text = before + after
+        self.cursor = self.cursor - 1
+        return true
+    }
+
+    // 删除键：删光标右边一个字符。
+    fn deleteForward() -> Bool {
+        if (self.readonly) { return false }
+        if (!self.enabled) { return false }
+
+        if (self.hasSelection()) {
+            return self.deleteSelection()
+        }
+        if (self.cursor >= len(self.text)) { return false }
+
+        let before = strSub(self.text, 0, self.cursor)
+        let after = strSub(self.text, self.cursor + 1, len(self.text))
+        self.text = before + after
+        return true
+    }
+
+    // 全选。
+    fn selectAll() -> Field {
+        self.anchor = 0
+        self.cursor = len(self.text)
+        return self
+    }
+
+    fn clearSelection() -> Field {
+        self.anchor = 0 - 1
+        return self
+    }
+
+    fn hasSelection() -> Bool {
+        if (self.anchor < 0) { return false }
+        return self.anchor != self.cursor
+    }
+
+    // 选区的规范化区间：返回 [start, end]，保证 start <= end。
+    //
+    // 返回 Array 而不是结构体，是因为调用点通常立刻下标取用
+    // （sel[0] / sel[1]），而多定义一个 Pair 结构体只为了两
+    // 个整数并不划算。
+    fn selection() -> Array {
+        var a = self.anchor
+        var b = self.cursor
+        if (a < 0) { a = self.cursor }
+        if (a > b) {
+            let t = a
+            a = b
+            b = t
+        }
+        return [a, b]
+    }
+
+    // 删掉选区。返回是否真的删了。
+    fn deleteSelection() -> Bool {
+        if (!self.hasSelection()) { return false }
+        let sel = self.selection()
+        let a = toInt(sel[0])
+        let b = toInt(sel[1])
+        if (a == b) {
+            self.anchor = 0 - 1
+            return false
+        }
+        let before = strSub(self.text, 0, a)
+        let after = strSub(self.text, b, len(self.text))
+        self.text = before + after
+        self.cursor = a
+        self.anchor = 0 - 1
+        return true
+    }
+
+    // ── 光标移动 ──────────────────────────────────
+
+    fn moveLeft(select: Bool) -> Field {
+        if (select) {
+            if (self.anchor < 0) { self.anchor = self.cursor }
+        } else {
+            self.anchor = 0 - 1
+        }
+        if (self.cursor > 0) { self.cursor = self.cursor - 1 }
+        return self
+    }
+
+    fn moveRight(select: Bool) -> Field {
+        if (select) {
+            if (self.anchor < 0) { self.anchor = self.cursor }
+        } else {
+            self.anchor = 0 - 1
+        }
+        if (self.cursor < len(self.text)) { self.cursor = self.cursor + 1 }
+        return self
+    }
+
+    fn moveHome(select: Bool) -> Field {
+        if (select) {
+            if (self.anchor < 0) { self.anchor = self.cursor }
+        } else {
+            self.anchor = 0 - 1
+        }
+        self.cursor = 0
+        return self
+    }
+
+    fn moveEnd(select: Bool) -> Field {
+        if (select) {
+            if (self.anchor < 0) { self.anchor = self.cursor }
+        } else {
+            self.anchor = 0 - 1
+        }
+        self.cursor = len(self.text)
+        return self
+    }
+
+    // ── 鼠标定位 ──────────────────────────────────
+    //
+    // 把鼠标 x 坐标换成字符索引。做法是从左往右累加宽度，
+    // 第一个让前缀宽度超过鼠标位置的索引就是答案。
+    //
+    // O(n) 而不是 O(log n)：字段通常只有几十个字符，二分要
+    // 先建宽度前缀表，而表本身也是 O(n) 建的。不值得。
+    fn indexAtX(mx: Int) -> Int {
+        let rel = mx - (self.r.x + FIELD_PAD) + self.scrollX
+        if (rel <= 0) { return 0 }
+
+        var w = 0
+        var i = 0
+        let n = len(self.text)
+        while i < n {
+            let cw = winTextWidth(strSub(self.text, i, i + 1))
+            // 落在字符中点右侧就跳到下一个索引 —— 这比「超过
+            // 整个字符宽度才跳」更符合手感（点字符右半边时
+            // 光标落在它后面）。
+            if (rel < w + cw / 2) {
+                return i
+            }
+            w = w + cw
+            i = i + 1
+        }
+        return n
+    }
+
+    // 点击定位：设置光标并清选区。shift 为真时保持锚点。
+    fn clickAt(mx: Int, my: Int, shift: Bool) -> Field {
+        if (!self.hit(mx, my)) { return self }
+        let i = self.indexAtX(mx)
+        if (shift) {
+            if (self.anchor < 0) { self.anchor = self.cursor }
+        } else {
+            self.anchor = 0 - 1
+        }
+        self.cursor = i
+        return self
+    }
+
+    // ── 水平滚动 ──────────────────────────────────
+    //
+    // 保证光标在可视区内。这是「打字时文字跟着走」的实现。
+    //
+    // 留 2px 余量：光标正好贴在右边界时视觉上会看不见，因为
+    // 光标自己也占 1~2px 宽。
+    fn ensureCursorVisible() {
+        let innerW = self.r.w - FIELD_PAD * 2
+        if (innerW <= 0) { return }
+
+        let cx = self.textWidthTo(self.cursor)
+
+        if (cx - self.scrollX > innerW - 2) {
+            self.scrollX = cx - innerW + 2
+        }
+        if (cx - self.scrollX < 0) {
+            self.scrollX = cx
+        }
+        if (self.scrollX < 0) { self.scrollX = 0 }
+    }
+
+    // 从开头到索引 i 的像素宽度。
+    fn textWidthTo(i: Int) -> Int {
+        if (i <= 0) { return 0 }
+        var n = i
+        if (n > len(self.text)) { n = len(self.text) }
+        return winTextWidth(strSub(self.text, 0, n))
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    // 显示用的字符串：密码框替换成等长的圆点。
+    //
+    // ── 为什么用等长替换而不是固定几个点 ────────────
+    //
+    // 固定 N 个点会泄露「密码比 N 长还是短」之外的错误信息：
+    // 光标位置按明文字符索引算，如果显示的点数不等于字符数，
+    // 光标就画不到正确位置。等长替换让索引天然对齐。
+    fn displayText() -> String {
+        if (!self.password) { return self.text }
+        var out = ""
+        var i = 0
+        while i < len(self.text) {
+            out = out + "●"
+            i = i + 1
+        }
+        return out
+    }
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        // ── 1. 边框底色 ──
+        //
+        // 四态优先级：禁用 > 错误 > 聚焦 > 悬停 > 常态。
+        // 错误优先于聚焦，因为「你填错了」比「你正在这格里」
+        // 更需要被看见。
+        var borderC = th.border
+        var bg = th.surface
+
+        if (!self.enabled) {
+            borderC = th.border
+            bg = th.bg
+        } else if (self.invalid) {
+            borderC = th.err
+        } else if (self.focused) {
+            borderC = th.accent
+        } else if (self.hovered) {
+            borderC = th.surfaceActive
+        }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, bg)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, borderC)
+
+        // ── 2. 内容 ──
+        //
+        // 裁剪到框内：文字滚出边框时必须被切掉，否则会画到
+        // 相邻控件上面。
+        winClip(self.r.x + 1, self.r.y + 1, self.r.w - 2, self.r.h - 2)
+        self.ensureCursorVisible()
+
+        let shown = self.displayText()
+        let textY = self.r.y + (self.r.h - winTextHeight()) / 2
+        let textX = self.r.x + FIELD_PAD - self.scrollX
+
+        // 占位符：空值时显示，用次要色。
+        if (len(self.text) == 0 && len(self.placeholder) > 0) {
+            winText(textX, textY, self.placeholder, th.textDim)
+        } else {
+            // 选区高亮 + 文字。
+            //
+            // 顺序很重要：先画选区底色，再画文字在上面。反过来的
+            // 话文字会被底色盖住一半。
+            if (self.hasSelection() && self.focused) {
+                let sel = self.selection()
+                let a = toInt(sel[0])
+                let b = toInt(sel[1])
+                let sx = textX + self.textWidthTo(a)
+                let sw = self.textWidthTo(b) - self.textWidthTo(a)
+                winFillRect(sx, self.r.y + 2, sw, self.r.h - 4, th.accent)
+            }
+
+            var tc = th.text
+            if (!self.enabled) { tc = th.disabled }
+            winText(textX, textY, shown, tc)
+
+            // ── 3. 光标 ──
+            //
+            // 只在聚焦时画。光标本体是一条 1px 竖线，高度比文字
+            // 略矮 —— 与文字等高看起来会「顶天立地」，不精致。
+            if (self.focused && !self.readonly) {
+                let cx = textX + self.textWidthTo(self.cursor)
+                let ch = winTextHeight() - 4
+                winFillRect(cx, self.r.y + (self.r.h - ch) / 2, 1, ch, th.text)
+            } else if (self.focused && self.readonly) {
+                // 只读框给一个细边框提示「这里能选但不能改」，
+                // 而不是画光标 —— 画光标会让人以为能打字。
+                winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, th.textDim)
+            }
+        }
+
+        winUnclip()
+
+        // ── 4. 焦点环 ──
+        //
+        // 输入框用边框变色表达焦点，不再画额外的焦点环 ——
+        // 两者都画会让边框变成双层，视觉上很脏。
+    }
+}

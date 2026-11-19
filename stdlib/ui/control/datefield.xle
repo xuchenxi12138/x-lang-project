@@ -1,0 +1,391 @@
+// ui/control/datefield.xle — 日期输入
+//
+// ── 为什么日期需要专门的控件 ─────────────────────
+//
+// 「日期」是一个有结构的值（年/月/日），但用户习惯用字符串输入
+//（"2024-03-15"）。如果只用普通 Field，就要在业务层到处写
+// 「解析这段字符串，失败怎么办」。
+//
+// DateField 把这件事收进来：内部持有年月日三个整数，绘制成
+// 标准格式，输入时逐段校验。用户打字不合法时不会崩，只是不接受。
+//
+// ── 为什么不做日历弹窗 ────────────────────────
+//
+// 日历需要「知道某年某月有几天」「某日是星期几」「闰年规则」，
+// 这些计算要写一段日历逻辑。而真正的价值在「让用户不用打字」，
+// 那是交互层的收益。这里先做输入 + 校验 + 步进，日历留作扩展 ——
+// 因为一个半成品日历比没有更差（用户会试图点它）。
+//
+// ── 日期算法 ────────────────────────────────
+//
+// 闰年：能被 4 整除但不能被 100 整除，或能被 400 整除。
+// 这条规则在 1900 年（不是闰年）和 2000 年（是闰年）上体现出来，
+// 是唯一需要背的例外。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 校验用的常量。
+const DF_MIN_YEAR = 1900
+const DF_MAX_YEAR = 2999
+
+// 是否为闰年。
+fn dateIsLeap(y: Int) -> Bool {
+    if (y % 400 == 0) { return true }
+    if (y % 100 == 0) { return false }
+    return y % 4 == 0
+}
+
+// 某年某月有几天。
+fn dateDaysIn(y: Int, m: Int) -> Int {
+    if (m == 2) {
+        if (dateIsLeap(y)) { return 29 }
+        return 28
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { return 30 }
+    if (m >= 1 && m <= 12) { return 31 }
+    return 0
+}
+
+// 是否合法的年月日组合。
+fn dateValid(y: Int, m: Int, d: Int) -> Bool {
+    if (y < DF_MIN_YEAR || y > DF_MAX_YEAR) { return false }
+    if (m < 1 || m > 12) { return false }
+    if (d < 1) { return false }
+    if (d > dateDaysIn(y, m)) { return false }
+    return true
+}
+
+// 补零到两位。
+fn datePad2(n: Int) -> String {
+    if (n < 10) { return "0" + toString(n) }
+    return toString(n)
+}
+
+// 格式化成 "YYYY-MM-DD"。
+fn dateFormat(y: Int, m: Int, d: Int) -> String {
+    var ys = toString(y)
+    while len(ys) < 4 {
+        ys = "0" + ys
+    }
+    return ys + "-" + datePad2(m) + "-" + datePad2(d)
+}
+
+// 解析 "YYYY-MM-DD"。非法返回空串。
+//
+// ── 为什么返回字符串而不是结构体 ────────────────
+//
+// 因为调用方需要区分「解析失败」和「解析成 0-0-0」两种情况，
+// 而空串是唯一不可能出现的合法结果（格式必然有内容）。用
+// 一个三字段的结构体就得再加一个 valid 字段，不如空串省事。
+fn dateParse(s: String) -> Array {
+    let parts = strSplit(s, "-")
+    if (len(parts) != 3) { return [] }
+    let ys = toString(parts[0])
+    let ms = toString(parts[1])
+    let ds = toString(parts[2])
+    if (!strIsInt(ys) || !strIsInt(ms) || !strIsInt(ds)) { return [] }
+
+    let y = strParseInt(ys)
+    let m = strParseInt(ms)
+    let d = strParseInt(ds)
+    if (!dateValid(y, m, d)) { return [] }
+
+    return [y, m, d]
+}
+
+class DateField extends Widget {
+    year: Int,
+    month: Int,
+    day: Int,
+
+    // 当前编辑的是哪一段：0=年 1=月 2=日。-1 表示没在编辑。
+    //
+    // ── 为什么分段编辑 ────────────────────────
+    //
+    // 因为连续输入 "20240315" 要能正确切成 年/月/日。分段之后
+    // 用户按 Tab 或 - 就跳到下一段，这也符合所有日期输入框的
+    // 惯例。
+    segment: Int,
+
+    // 输入缓冲（当前段的数字）。
+    buffer: String,
+
+    // 是否只读。
+    readonly: Bool,
+
+    constructor(r: Rect, y: Int, m: Int, d: Int) {
+        self.r        = r
+        self.vis      = true
+        self.enabled  = true
+        self.focused  = false
+        self.hovered  = false
+        self.year     = y
+        self.month    = m
+        self.day      = d
+        self.segment  = 0
+        self.buffer   = ""
+        self.readonly = false
+        self.style    = Style.plain()
+    }
+
+    static fn of(r: Rect, y: Int, m: Int, d: Int) -> DateField {
+        let f = new DateField(r, y, m, d)
+        return f
+    }
+
+    static fn today(r: Rect, y: Int, m: Int, d: Int) -> DateField {
+        return new DateField(r, y, m, d)
+    }
+
+    // ── 值 ──────────────────────────────────────
+
+    fn text() -> String {
+        return dateFormat(self.year, self.month, self.day)
+    }
+
+    fn setDate(y: Int, m: Int, d: Int) -> DateField {
+        if (dateValid(y, m, d)) {
+            self.year = y
+            self.month = m
+            self.day = d
+        }
+        return self
+    }
+
+    // 从字符串设置。非法则保持不变。
+    fn setText(s: String) -> DateField {
+        let v = dateParse(s)
+        if (len(v) == 3) {
+            self.year = toInt(v[0])
+            self.month = toInt(v[1])
+            self.day = toInt(v[2])
+        }
+        return self
+    }
+
+    // ── 步进 ────────────────────────────────────
+    //
+    // 加减天数，跨月跨年自动进位。这是日期控件最常用的操作
+    //（「往后一天」比「重新输入日期」快得多）。
+
+    fn addDays(n: Int) -> DateField {
+        var y = self.year
+        var m = self.month
+        var d = self.day + n
+
+        // 往后溢出的整月。
+        while true {
+            // 往前溢出。
+            if (d < 1) {
+                m = m - 1
+                if (m < 1) {
+                    m = 12
+                    y = y - 1
+                }
+                d = d + dateDaysIn(y, m)
+                continue
+            }
+            let dim = dateDaysIn(y, m)
+            if (d > dim) {
+                d = d - dim
+                m = m + 1
+                if (m > 12) {
+                    m = 1
+                    y = y + 1
+                }
+                continue
+            }
+            break
+        }
+
+        if (dateValid(y, m, d)) {
+            self.year = y
+            self.month = m
+            self.day = d
+        }
+        return self
+    }
+
+    fn addMonths(n: Int) -> DateField {
+        var total = self.year * 12 + (self.month - 1) + n
+        let y = total / 12
+        let m = total % 12 + 1
+        var d = self.day
+        let dim = dateDaysIn(y, m)
+        if (d > dim) { d = dim }
+        if (dateValid(y, m, d)) {
+            self.year = y
+            self.month = m
+            self.day = d
+        }
+        return self
+    }
+
+    // ── 分段编辑 ─────────────────────────────────
+
+    // 当前段的值。
+    fn segValue(s: Int) -> Int {
+        if (s == 0) { return self.year }
+        if (s == 1) { return self.month }
+        return self.day
+    }
+
+    fn segMax(s: Int) -> Int {
+        if (s == 0) { return DF_MAX_YEAR }
+        if (s == 1) { return 12 }
+        return dateDaysIn(self.year, self.month)
+    }
+
+    // 切到下一段。
+    fn nextSegment() -> DateField {
+        self.commitSegment()
+        if (self.segment < 2) { self.segment = self.segment + 1 }
+        self.buffer = ""
+        return self
+    }
+
+    fn prevSegment() -> DateField {
+        self.commitSegment()
+        if (self.segment > 0) { self.segment = self.segment - 1 }
+        self.buffer = ""
+        return self
+    }
+
+    // 提交当前段的缓冲。非法值丢弃（不报错 —— 输入过程中必然
+    // 出现暂时非法的中间态）。
+    fn commitSegment() {
+        if (len(self.buffer) == 0) { return }
+        if (!strIsInt(self.buffer)) {
+            self.buffer = ""
+            return
+        }
+        let v = strParseInt(self.buffer)
+        if (self.segment == 0) {
+            if (v >= DF_MIN_YEAR && v <= DF_MAX_YEAR) { self.year = v }
+        } else if (self.segment == 1) {
+            if (v >= 1 && v <= 12) { self.month = v }
+        } else {
+            let dim = dateDaysIn(self.year, self.month)
+            var d = v
+            if (d < 1) { d = 1 }
+            if (d > dim) { d = dim }
+            self.day = d
+        }
+        self.buffer = ""
+    }
+
+    // 键盘输入。返回是否消费。
+    fn typeKey(key: String) -> Bool {
+        if (self.readonly || !self.enabled) { return false }
+
+        if (key == "Tab" || key == "Right") {
+            self.nextSegment()
+            return true
+        }
+        if (key == "Left") {
+            self.prevSegment()
+            return true
+        }
+        if (key == "ArrowUp") {
+            self.commitSegment()
+            if (self.segment == 2) { self.addDays(1) }
+            else if (self.segment == 1) { self.addMonths(1) }
+            else { self.year = self.year + 1 }
+            return true
+        }
+        if (key == "ArrowDown") {
+            self.commitSegment()
+            if (self.segment == 2) { self.addDays(0 - 1) }
+            else if (self.segment == 1) { self.addMonths(0 - 1) }
+            else { self.year = self.year - 1 }
+            return true
+        }
+        if (key == "Enter") {
+            self.commitSegment()
+            return true
+        }
+        if (key == "Backspace") {
+            let n = len(self.buffer)
+            if (n > 0) {
+                self.buffer = strSub(self.buffer, 0, n - 1)
+            }
+            return true
+        }
+
+        // 数字：追加到缓冲，满位自动跳到下一段。
+        if (len(key) == 1) {
+            let c = strCode(key)
+            if (c >= 48 && c <= 57) {
+                self.buffer = self.buffer + key
+                // 年的位数是 4，月日 2 位，满了自动跳。
+                var width = 2
+                if (self.segment == 0) { width = 4 }
+                if (len(self.buffer) >= width) {
+                    self.commitSegment()
+                    if (self.segment < 2) { self.segment = self.segment + 1 }
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    // ── 绘制 ────────────────────────────────────
+    //
+    // 三段分开画，这样能给「正在编辑的那段」加高亮。
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        var bc = th.border
+        if (!self.enabled) { bc = th.border }
+        else if (self.focused) { bc = th.accent }
+
+        winFillRect(self.r.x, self.r.y, self.r.w, self.r.h, th.surface)
+        winBorderRect(self.r.x, self.r.y, self.r.w, self.r.h, 1, bc)
+
+        // 显示值：正在编辑的段如果是缓冲状态，显示缓冲。
+        var ys = datePad2(self.year / 100) + datePad2(self.year % 100)
+        var ys2 = toString(self.year)
+        var ms = datePad2(self.month)
+        var ds = datePad2(self.day)
+        if (self.focused) {
+            if (self.segment == 0 && len(self.buffer) > 0) {
+                ys2 = self.buffer
+            }
+            if (self.segment == 1 && len(self.buffer) > 0) {
+                ms = self.buffer
+            }
+            if (self.segment == 2 && len(self.buffer) > 0) {
+                ds = self.buffer
+            }
+        }
+
+        let pad = 10
+        var x = self.r.x + pad
+        let ty = self.r.y + (self.r.h - winTextHeight()) / 2
+
+        var tc = th.text
+        if (!self.enabled) { tc = th.disabled }
+
+        // 年 + "-" + 月 + "-" + 日
+        winText(x, ty, ys2, tc)
+        x = x + winTextWidth(ys2)
+        winText(x, ty, "-", th.textDim)
+        x = x + winTextWidth("-")
+
+        winText(x, ty, ms, tc)
+        x = x + winTextWidth(ms)
+        winText(x, ty, "-", th.textDim)
+        x = x + winTextWidth("-")
+
+        winText(x, ty, ds, tc)
+
+        // 焦点环（用输入框的方式：边框已经变色，不再另画）。
+    }
+}

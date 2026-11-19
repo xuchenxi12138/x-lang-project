@@ -1,0 +1,125 @@
+// ============================================================
+// std.http —— 真实的 socket 端到端
+// ============================================================
+//
+// 前面的 31 测的是纯函数（解析、编码）。这里测的是**真的开端口、
+// 走 TCP、收发字节**这条链路 —— 它是唯一能证明「这些字符串处理
+// 真的能和别的进程对话」的测试。
+//
+// ── 为什么客户端和服务端写在同一个进程里 ────────────────────
+//
+// 分开写成两个程序更"真实"，但在测试框架里行不通：四档一致性
+// 会把同一个程序跑四次（解释器 / .xbc / 关闭超指令 / AOT），
+// 两个进程的版本要么端口冲突、要么启动顺序无法保证。
+//
+// 同一进程内先 listen、再用客户端连自己，等价性完全成立：
+// TCP 栈并不关心两端是不是同一个进程，环回接口走的是真实
+// 的网络路径（不是内部旁路）。
+//
+// ── 为什么端口用 0（系统分配）────────────────────────────────
+//
+// 固定端口在多任务/并行测试时会撞车。传 0 让系统给一个空闲端口，
+// 再用 httpPort 查出来 —— 这是唯一能在任何机器上都稳定跑的做法。
+
+from std.http import httpServer, httpServerOn, httpPort, httpRoute, httpMatch, httpPump, netSleep, httpParse, httpSplitLines, httpHeader, httpHeaderInt, httpDechunk, httpPair, httpHexToInt, httpHexDigit, httpBadRequest, httpStatusText, httpRespond, httpRespondWith, httpRespondJson, httpRespondHtml, httpRespondText, httpNotFound, httpClose, httpServerClose, httpParseQuery, httpQueryGet, httpQueryInt, httpUrlDecode, httpUrlEncode, httpHex2, httpHexChar, httpUrlDecodeBytes, httpGet, httpPost, httpRequest, httpParseResponse, httpRespStatus, httpRespHeader, httpRespBody, HTTP_METHOD, HTTP_PATH, HTTP_QUERY, HTTP_VERSION, HTTP_HEADERS, HTTP_BODY, HTTP_MAX_BODY, HTTP_MAX_HEADER, SRV_LISTENER, SRV_CLIENTS, SRV_BUFS, SRV_ROUTES, SRV_PORT, HTTP_CONN, RESP_STATUS, RESP_HEADERS, RESP_BODY
+
+fn handle(req: Array) -> String {
+    let conn = toInt(req[HTTP_CONN])
+    if (req[HTTP_METHOD] == "!") {
+        httpRespond(conn, 400, "bad\n")
+        return "400"
+    }
+    let path = req[HTTP_PATH]
+    if (path == "/hello") {
+        httpRespond(conn, 200, "hello world\n")
+        return "hello"
+    }
+    if (path == "/query") {
+        let kv = httpParseQuery(req[HTTP_QUERY])
+        httpRespond(conn, 200, httpQueryGet(kv, "name", "?"))
+        return "query"
+    }
+    if (path == "/echo" && req[HTTP_METHOD] == "POST") {
+        httpRespond(conn, 200, req[HTTP_BODY])
+        return "echo"
+    }
+    if (path == "/json") {
+        let obj = array(4, "")
+        obj[0] = "ok"
+        obj[1] = true
+        obj[2] = "n"
+        obj[3] = 42
+        httpRespondJson(conn, 200, obj)
+        return "json"
+    }
+    httpNotFound(conn)
+    return "404"
+}
+
+fn main() -> Void {
+    let srv = httpServer(0)
+    let port = httpPort(srv)
+    println("port > 0: " + toString(port > 0))
+
+    httpRoute(srv, "GET", "/hello", 1)
+
+    // 起一个客户端连接（此时还没有人 accept，靠 TCP 的 backlog 挂着）。
+    //
+    // ── 这个顺序是关键 ──────────────────────────────────────
+    //
+    // 如果先 pump 再连，pump 会因为「没有待处理连接」而空转；如果
+    // 连了不 pump，客户端的 netSend 会成功（数据进了内核缓冲）
+    // 但没人读。所以：先连、再 pump。这正好也验证了 backlog 生效。
+    let cli = netConnect("127.0.0.1", port)
+    println("connected: " + toString(cli >= 0))
+
+    netSend(cli, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n")
+
+    // pump 到收到请求为止。给足轮次，但这个循环本身不会无限转 ——
+    // 几十次 5ms 之后还没收到，说明链路真的有问题，交给断言报错。
+    var got = array(0, 0)
+    var rounds = 0
+    while (len(got) == 0 && rounds < 200) {
+        got = httpPump(srv, 5)
+        rounds = rounds + 1
+    }
+    println("requests: " + toString(len(got)))
+
+    var handled = ""
+    if (len(got) > 0) {
+        handled = handle(got[0])
+    }
+    println("handled: " + handled)
+
+    // 读回响应
+    var raw = ""
+    var r2 = 0
+    while (r2 < 200) {
+        let chunk = netRecv(cli)
+        if (len(chunk) == 0) {
+            if (!netPending(cli)) { break }
+            sleep(1)
+        } else {
+            raw = raw + chunk
+        }
+        r2 = r2 + 1
+    }
+    netClose(cli)
+
+    let resp = httpParseResponse(raw)
+    println("status: " + toString(httpRespStatus(resp)))
+    println("ctype: " + httpRespHeader(resp, "content-type", "?"))
+    println("body: [" + httpTrimNL(httpRespBody(resp)) + "]")
+    println("has length: " + toString(len(httpRespHeader(resp, "content-length", "")) > 0))
+
+    httpServerClose(srv)
+    println("http live ok")
+}
+
+fn httpTrimNL(s: String) -> String {
+    var t = s
+    while (strEnds(t, "\n") || strEnds(t, "\r")) {
+        t = strSub(t, 0, len(t) - 1)
+    }
+    return t
+}

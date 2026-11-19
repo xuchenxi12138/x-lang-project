@@ -1,0 +1,326 @@
+// ui/display/dialog.xle — 输入型对话框
+//
+// ── Dialog 和 Modal 的分工 ───────────────────────
+//
+//   Modal  —— 「请确认」：一个标题、一段文字、两个按钮。没有输入。
+//   Dialog —— 「请填写」：标题 + 若干**带标签的输入行** + 按钮。
+//
+// 两者都模态、都居中、都有底部按钮栏，区别只在**中间区域是文字
+// 还是表单**。如果给 Modal 加一个「可选的表单区」，那 Modal 的
+// 状态就会一半是展示一半是编辑 —— 而编辑需要校验、需要焦点管理、
+// 需要「按 Enter 在字段间跳转」，这些都是 Modal 不该沾的。
+//
+// ── 为什么字段用「标签 + 值」两个并行数组 ────────────
+//
+// 同 tree.xle / Stack 的理由：结构体数组的元素取字段不可静态追踪。
+// 两个并行数组用下标对齐，每个元素都能直接当 String 用。
+
+from "modal.xle" import Modal, MD_FOOTER_H, MD_PAD
+from "../control/field.xle" import Field, FIELD_PAD
+from "../control/button.xle" import Button, BTN_SECONDARY, BTN_PRIMARY, BTN_DANGER, BTN_GHOST
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+// 每一行的高度（标签 + 输入框）。
+const DLG_ROW_H = 46
+
+// 标签列的宽度。够放 4 个中文字。
+const DLG_LABEL_W = 84
+
+// 内容区顶部留白。
+const DLG_TOP_PAD = 16
+
+class Dialog extends Widget {
+    title: String,
+
+    // 字段标签与初始值（并行数组）。
+    labels: Array,
+    values: Array,
+
+    // 是否显示。
+    open: Bool,
+
+    // 底部按钮文字。
+    buttons: Array,
+
+    // 结果：-1 = 未决定，0..n-1 = 点了第几个按钮。
+    result: Int,
+
+    // 每个字段的错误标记（并行数组，元素是 Bool）。
+    //
+    // ── 为什么错误标记放在 Dialog 上而不是 Field 上 ────
+    //
+    // 因为 Field 是每帧重建的（见 syncFields）。放在 Field 上的
+    // 标记会在下一帧丢掉。Dialog 是长期存在的，标记跟着它才稳。
+    errors: Array,
+
+    constructor(r: Rect, title: String) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.title   = title
+        self.labels  = []
+        self.values  = []
+        self.open    = false
+        self.buttons = ["取消", "确定"]
+        self.result  = 0 - 1
+        self.errors  = []
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect, title: String) -> Dialog {
+        return new Dialog(r, title)
+    }
+
+    // ── 字段 ────────────────────────────────────
+
+    fn addField(label: String, value: String) -> Dialog {
+        arrPush(self.labels, label)
+        arrPush(self.values, value)
+        arrPush(self.errors, false)
+        return self
+    }
+
+    fn fieldCount() -> Int {
+        return len(self.labels)
+    }
+
+    fn value(i: Int) -> String {
+        if (i < 0 || i >= len(self.values)) { return "" }
+        return toString(self.values[i])
+    }
+
+    fn setValue(i: Int, v: String) -> Dialog {
+        if (i < 0 || i >= len(self.values)) { return self }
+        self.values[i] = v
+        return self
+    }
+
+    fn setError(i: Int, v: Bool) -> Dialog {
+        if (i < 0 || i >= len(self.errors)) { return self }
+        self.errors[i] = v
+        return self
+    }
+
+    fn hasError(i: Int) -> Bool {
+        if (i < 0 || i >= len(self.errors)) { return false }
+        return toBoolOr(toString(self.errors[i]), false)
+    }
+
+    fn clearErrors() -> Dialog {
+        var i = 0
+        while i < len(self.errors) {
+            self.errors[i] = false
+            i = i + 1
+        }
+        return self
+    }
+
+    // ── 开关 ────────────────────────────────────
+
+    fn show() -> Dialog {
+        self.open   = true
+        self.result = 0 - 1
+        self.clearErrors()
+        return self
+    }
+
+    fn hide() -> Dialog {
+        self.open   = false
+        return self
+    }
+
+    // ── 几何 ────────────────────────────────────
+    //
+    // 三个区域纵向切：标题栏（复用 Modal 的常量）→ 表单区 → 按钮栏。
+    //
+    // 表单区的高度由字段数决定，所以**对话框的总高应该是算出来的**，
+    // 而不是调用方随便给的。requiredH() 就是那个计算 —— 调用方
+    // 用它来摆位置。
+
+    fn box() -> Rect {
+        return self.r
+    }
+
+    fn titleRect() -> Rect {
+        let b = self.box()
+        return rectOf(b.x + MD_PAD, b.y, b.w - MD_PAD * 2, 48)
+    }
+
+    fn bodyRect() -> Rect {
+        let b = self.box()
+        let top = 52
+        let bot = b.h - MD_FOOTER_H
+        return rectOf(b.x + MD_PAD, b.y + top, b.w - MD_PAD * 2, bot - top)
+    }
+
+    fn rowRect(i: Int) -> Rect {
+        let br = self.bodyRect()
+        return rectOf(br.x, br.y + DLG_TOP_PAD + i * DLG_ROW_H, br.w, DLG_ROW_H)
+    }
+
+    fn labelRect(i: Int) -> Rect {
+        let rr = self.rowRect(i)
+        return rectOf(rr.x, rr.y, DLG_LABEL_W, rr.h)
+    }
+
+    fn inputRect(i: Int) -> Rect {
+        let rr = self.rowRect(i)
+        return rectOf(rr.x + DLG_LABEL_W, rr.y + (rr.h - 32) / 2,
+                      rr.w - DLG_LABEL_W, 32)
+    }
+
+    fn footerRect() -> Rect {
+        let b = self.box()
+        return rectOf(b.x + MD_PAD, b.y + b.h - MD_FOOTER_H,
+                      b.w - MD_PAD * 2, MD_FOOTER_H - 8)
+    }
+
+    // 第 i 个按钮（从右往左排，主按钮在最右）。
+    fn buttonRect(i: Int) -> Rect {
+        let fr = self.footerRect()
+        let bw = 88
+        let gap = 10
+        let n = len(self.buttons)
+        let fromRight = n - 1 - i
+        let x = fr.x + fr.w - bw - fromRight * (bw + gap)
+        let h = 34
+        return rectOf(x, fr.y + (fr.h - h) / 2, bw, h)
+    }
+
+    // 建议总高度。给调用方摆位置用。
+    fn requiredH() -> Int {
+        return 52 + DLG_TOP_PAD + len(self.labels) * DLG_ROW_H + 8 + MD_FOOTER_H
+    }
+
+    // ── 交互 ────────────────────────────────────
+
+    // 点击。返回 true 表示这次点击被对话框消费掉了（包括落在遮罩上）。
+    //
+    // ── 为什么点遮罩不关闭 ───────────────────────
+    //
+    // 因为对话框里有用户刚填的内容。误点一下空白就丢掉一整张表单
+    // 是不可接受的 —— Modal 那边也是同一个取舍。
+    fn click(mx: Int, my: Int) -> Bool {
+        if (!self.open) { return false }
+        let b = self.box()
+        if (!b.contains(mx, my)) { return true }   // 遮罩：吃掉但不关
+
+        // 按钮。
+        var i = 0
+        while i < len(self.buttons) {
+            if (self.buttonRect(i).contains(mx, my)) {
+                self.result = i
+                self.open   = false
+                return true
+            }
+            i = i + 1
+        }
+        return true
+    }
+
+    // 键盘。Escape 取消，Enter 确定（最后一个按钮）。
+    fn keyDown(key: String) -> Bool {
+        if (!self.open) { return false }
+        if (key == "Escape") {
+            self.result = 0
+            self.open   = false
+            return true
+        }
+        if (key == "Enter") {
+            self.result = len(self.buttons) - 1
+            self.open   = false
+            return true
+        }
+        return false
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.open) { return }
+
+        // 遮罩：画一块超大的不透明深色。见 modal.xle 的说明 ——
+        // 窗口层没有半透明填充原语。
+        winFillRect(-4000, -4000, 8000, 8000, th.scrim)
+
+        let b = self.box()
+
+        // 本体。
+        winFillRound(b.x, b.y, b.w, b.h, 10, th.surface)
+        winBorderRound(b.x, b.y, b.w, b.h, 10, 1, th.border)
+
+        // 标题。
+        let tr = self.titleRect()
+        uiTextLeft(tr, self.title, 0, th.text)
+        // 标题下的细线。
+        winFillRect(b.x + MD_PAD, b.y + 48, b.w - MD_PAD * 2, 1, th.border)
+
+        // 表单。
+        var i = 0
+        while i < len(self.labels) {
+            let lr = self.labelRect(i)
+            uiTextLeft(lr, toString(self.labels[i]), 0, th.textDim)
+
+            // 每一行的输入框临时造一个 Field。
+            //
+            // ── 为什么每帧重建而不是常驻 ─────────────
+            //
+            // 因为 Field 的光标位置是**编辑状态**，而这里每帧都要
+            // 根据 values[i] 重建才能反映外部对值的修改。常驻的话
+            // 「调用方改了 values，界面上没变」会成为一个反复出现的
+            // 困惑。
+            //
+            // 代价是光标位置每帧归零 —— 所以这里刻意不显示光标，
+            // 把它当「只读展示 + 点击后接管」的混合体。真正的
+            // 编辑体验应该用独立的表单页，而不是对话框。
+            let ir = self.inputRect(i)
+            let f = new Field(ir, self.value(i))
+            f.enabled = self.enabled
+            if (self.hasError(i)) {
+                f.setInvalid(true)
+            }
+            f.draw(th)
+
+            i = i + 1
+        }
+
+        // 按钮。
+        //
+        // ── 为什么要先算 hover 再决定用哪个工厂 ──────────
+        //
+        // 不能写 `var btn = ...; btn = 另一个工厂(...); btn.hovered = x`
+        // —— 变量在两次赋值之间换了来源，编译器追不到 btn 的静态
+        // 类型，于是把随后的字段赋值当成「对不可追踪值的字段赋值」。
+        // 所以这里先算出所有需要的值，再一次性构造出最终的按钮。
+        let n = len(self.buttons)
+        let mx = winMouseX()
+        let my = winMouseY()
+        i = 0
+        while i < n {
+            let br = self.buttonRect(i)
+            let hov = br.contains(mx, my)
+            let cap = toString(self.buttons[i])
+
+            // 最后一个按钮是主按钮（"确定" 通常在右边）。
+            if (i == n - 1) {
+                let btn = Button.primary(br, cap)
+                btn.hovered = hov
+                btn.enabled = self.enabled
+                btn.draw(th)
+            } else {
+                let btn2 = Button.secondary(br, cap)
+                btn2.hovered = hov
+                btn2.enabled = self.enabled
+                btn2.draw(th)
+            }
+            i = i + 1
+        }
+    }
+}

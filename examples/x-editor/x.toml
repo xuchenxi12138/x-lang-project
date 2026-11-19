@@ -1,0 +1,9 @@
+[package]
+name = "x_editor"
+version = "0.1.0"
+entry = "src/main.xlc"
+profile = "desktop"
+
+[dependencies]
+# 中文别名包：随仓库分发，用相对路径引用，安装后无需绝对路径。
+zh = { path = "../../pkg/zh" }

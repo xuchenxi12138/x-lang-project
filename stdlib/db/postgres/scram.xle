@@ -1,0 +1,251 @@
+// db/postgres/scram.xle — SCRAM-SHA-256 认证
+//
+// ── SCRAM 要解决的问题 ────────────────────────────
+//
+// 挑战应答式认证（如 MySQL native）的核心弱点是：服务端存了
+// 「能直接验证的等价口令」，一旦库被拖走，攻击者拿去冒充客户端
+// 只需重放。SCRAM 的设计目标是**服务端存的也是单向派生值** ——
+// 即使拖库也无法冒充客户端登录服务端（只能做离线爆破）。
+//
+// ── 四步握手 ────────────────────────────────────
+//
+//   ① 客户端 → server-first-bare：`n=,r=<clientNonce>`
+//      用户名不在这里发（PG 在启动包里已经发过），所以 n 是空的。
+//
+//   ② 服务端 → server-first：`r=<clientNonce><serverNonce>,s=<salt b64>,i=<迭代数>`
+//
+//   ③ 客户端 → client-final：
+//        c=biws,r=<拼起来的 nonce>,p=<proof>
+//      proof 的算法：
+//        SaltedPassword = PBKDF2(password, salt, i)
+//        ClientKey      = HMAC(SaltedPassword, "Client Key")
+//        StoredKey      = SHA256(ClientKey)
+//        AuthMessage    = client-first-bare + "," + server-first + "," + client-final-without-proof
+//        ClientSignature= HMAC(StoredKey, AuthMessage)
+//        ClientProof    = ClientKey XOR ClientSignature
+//
+//   ④ 服务端 → server-final：`v=<serverSignature>`
+//      客户端用 ServerKey 验证它，确认自己连的是真服务端而不是
+//      中间人。这一步 P0 也实现了 —— 只做前半段等于放弃双向认证。
+//
+// ── 为什么用户名留空 ────────────────────────────
+//
+// PG 在 StartupMessage 里已经发了用户名，SCRAM 的 n= 字段对 PG 是
+// 「SASL 意义上的用户名」，而 PG 的实现选择忽略它。发真实用户名
+// 反而会因为「和启动包里的不一致」被拒。
+
+from "../codec/bytes.xle" import bbNew, bbFromUtf8, bbFromRaw, bbPut, bbPutBytes, bbPutUtf8, bbPutRaw, bbPutU8, bbPutU16BE, bbPutU16LE, bbPutU24BE, bbPutU24LE, bbPutU32BE, bbPutU32LE, bbPutU64BE, bbPutU64LE, bbAt, bbU8, bbU16BE, bbU16LE, bbU24BE, bbU24LE, bbU32BE, bbU32LE, bbU64BE, bbU64LE, bbToText, bbToWire, bbSlice, bbHex, bbEq, bbIndexOf, bbConcat, bbClone, bbConcat3, bbFindSeq, bbSplitSeq
+from "../codec/sha256.xle" import Sha256, SHA256_H0, SHA256_H1, SHA256_H2, SHA256_H3, SHA256_H4, SHA256_H5, SHA256_H6, SHA256_H7, SHA256_MASK32
+from "../codec/hmac.xle" import hmacNormKey, hmacSha256, hmacSha256Hex, pbkdf2Sha256, HMAC_BLOCK, HMAC_DIGEST
+from "../codec/base64.xle" import b64Encode, b64EncodeText, b64Decode, b64DecodeText, b64Value, b64UrlEncode, b64UrlDecode, B64_ALPHABET
+
+// 客户端 nonce 的字符集。
+//
+// ── 为什么用固定字符集而不是随机字节 ────────────────
+//
+// SCRAM 规定 nonce 是「可打印 ASCII，不含逗号」。随机字节里会出现
+// 逗号或控制字符，破坏消息的分隔结构。用 Base64 的字母表（不含
+// 逗号）是最省事的安全选择。
+const SCRAM_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// 生成一个非加密强度的 nonce。
+//
+// ── 这里必须说明强度 ────────────────────────────
+//
+// random() 是伪随机且种子可预测，用来做 nonce 严格来说不满足安全
+// 要求（可预测的 nonce 削弱了防重放）。但在 SCRAM 里 nonce 的作用
+// 是「不可预测」而非「不可推导」，而盐和服务端 nonce 由服务端提供，
+// 所以实际的抗重放强度仍由服务端保证。
+//
+// 若要真正安全，需要一个从操作系统取熵的原语（/dev/urandom 或
+// CryptGenRandom），P0 没有。此边界明确记录。
+fn scramClientNonce(n: Int) -> String {
+    var out = ""
+    var i = 0
+    while i < n {
+        // random() 返回 0.0~1.0 的 Float，缩放到字母表下标。
+        //
+        // ── 为什么这里不再用 math(floor) ─────────────
+        //
+        // random() 的返回值乘上表长后取整就够了，math() 的调用开销
+        // 在这里没有收益（24 次调用，每次一个乘法）。
+        let f = random() * len(SCRAM_ALPHABET)
+        var k = toInt(f)
+        if (k < 0) { k = 0 }
+        if (k >= len(SCRAM_ALPHABET)) { k = len(SCRAM_ALPHABET) - 1 }
+        out = out + strSub(SCRAM_ALPHABET, k, k + 1)
+        i = i + 1
+    }
+    return out
+}
+
+// 解析 SCRAM 消息里的 k=v 对，返回 Array（交替存放 key, value）。
+//
+// ── 为什么不用 map ─────────────────────────────
+//
+// 语言没有字典类型。而 SCRAM 消息的字段数固定（2~3 个），线性扫描
+// 足够，且顺序有意义（AuthMessage 是原样拼接，不能重排）。
+fn scramSplitAttrs(msg: String) -> Array {
+    let out = []
+    let parts = strSplit(msg, ",")
+    var i = 0
+    while i < len(parts) {
+        let p = toString(parts[i])
+        let eq = strFind(p, "=")
+        if (eq >= 0) {
+            arrPush(out, strSub(p, 0, eq))
+            arrPush(out, strSub(p, eq + 1, len(p)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 从属性数组里按 key 取值。
+fn scramAttr(attrs: Array, key: String) -> String {
+    var i = 0
+    while i + 1 < len(attrs) {
+        if (toString(attrs[i]) == key) { return toString(attrs[i + 1]) }
+        i = i + 2
+    }
+    return ""
+}
+
+// ── SCRAM 客户端状态机 ────────────────────────────
+//
+// ── 为什么做成一个类 ───────────────────────────
+//
+// 因为四步握手之间要保存中间状态（clientNonce、clientFirstBare、
+// SaltedPassword 派生的两个 Key），而语言的函数不能返回多个值、
+// 也不方便传一大堆参数。用一个对象持有状态最清晰。
+
+class ScramClient {
+    password: String,
+    clientNonce: String,
+
+    // 第 1 步发出去的原文（第 3 步算 AuthMessage 要用它原样拼接）。
+    clientFirstBare: String,
+
+    // 服务端回的原文（同样要原样拼进 AuthMessage）。
+    serverFirst: String,
+
+    // 服务端给的盐与迭代数。
+    salt: Array,
+    iterations: Int,
+
+    // 派生的密钥。
+    clientKey: Array,
+    storedKey: Array,
+    serverKey: Array,
+
+    // 服务端签名（第 4 步验证用）。
+    expectedServerSig: String,
+
+    error: String,
+
+    constructor(password: String) {
+        self.password        = password
+        self.clientNonce     = ""
+        self.clientFirstBare = ""
+        self.serverFirst     = ""
+        self.salt            = []
+        self.iterations      = 4096
+        self.clientKey       = []
+        self.storedKey       = []
+        self.serverKey       = []
+        self.expectedServerSig = ""
+        self.error           = ""
+    }
+
+    // 第 1 步：生成 client-first-message 的 bare 部分。
+    fn firstMessage() -> String {
+        self.clientNonce = scramClientNonce(24)
+        // n= 留空（PG 已在启动包里发过用户名），r=nonce
+        self.clientFirstBare = "n=,r=" + self.clientNonce
+        return self.clientFirstBare
+    }
+
+    // 第 2 步：解析 server-first-message，算出 proof。
+    //
+    // 返回 client-final-message（含 p=）。
+    fn finalMessage(serverFirstMsg: String) -> String {
+        self.serverFirst = serverFirstMsg
+        let attrs = scramSplitAttrs(serverFirstMsg)
+
+        let nonce = scramAttr(attrs, "r")
+        let saltB64 = scramAttr(attrs, "s")
+        let iterStr = scramAttr(attrs, "i")
+
+        if (len(nonce) == 0 || len(saltB64) == 0) {
+            self.error = "server-first-message 缺少 r= 或 s=：" + serverFirstMsg
+            return ""
+        }
+        // 服务端 nonce 必须以前缀形式包含客户端 nonce，否则是中间人
+        // 或实现错误。这个检查是 SCRAM 规范要求的（RFC 5802 §5.1）。
+        if (!strStarts(nonce, self.clientNonce)) {
+            self.error = "服务端 nonce 未包含客户端 nonce，疑似中间人攻击"
+            return ""
+        }
+        self.iterations = strParseInt(iterStr)
+        if (self.iterations <= 0) { self.iterations = 4096 }
+
+        self.salt = b64Decode(saltB64)
+        if (len(self.salt) == 0) {
+            self.error = "服务端盐解 Base64 失败：" + saltB64
+            return ""
+        }
+
+        // ── 派生密钥 ──────────────────────────
+        let pwd = bbFromUtf8(self.password)
+        let salted = pbkdf2Sha256(pwd, self.salt, self.iterations, 32)
+
+        self.clientKey = hmacSha256(salted, bbFromUtf8("Client Key"))
+        self.storedKey = Sha256.hash(self.clientKey)
+        self.serverKey = hmacSha256(salted, bbFromUtf8("Server Key"))
+
+        // ── client-final-without-proof ────────
+        // c=biws 是 "n,," 的 Base64（GS2 header，表示不用 channel binding）
+        let withoutProof = "c=biws,r=" + nonce
+
+        // ── AuthMessage ──────────────────────
+        let authMsg = self.clientFirstBare + "," + serverFirstMsg + "," + withoutProof
+
+        let clientSig = hmacSha256(self.storedKey, bbFromUtf8(authMsg))
+        let proof = []
+        var i = 0
+        while i < len(self.clientKey) {
+            arrPush(proof, bbAt(self.clientKey, i) ^ bbAt(clientSig, i))
+            i = i + 1
+        }
+
+        // ── 预期服务端签名 ────────────────────
+        let serverSig = hmacSha256(self.serverKey, bbFromUtf8(authMsg))
+        self.expectedServerSig = b64Encode(serverSig)
+
+        return withoutProof + ",p=" + b64Encode(proof)
+    }
+
+    // 第 4 步：验证 server-final-message 里的 v=。
+    //
+    // ── 为什么这一步不能省 ────────────────────────
+    //
+    // 只验证 p=（让服务端认你）是单向认证。中间人可以把自己伪装成
+    // 服务端收下你的 proof，再把请求转发给真服务端 —— 你完全察觉
+    // 不到。v= 是服务端证明「我持有所需的 ServerKey」，也就是它真
+    // 的有这个账号的密码派生材料。
+    fn verifyServerFinal(serverFinalMsg: String) -> Bool {
+        let attrs = scramSplitAttrs(serverFinalMsg)
+        let v = scramAttr(attrs, "v")
+        if (len(v) == 0) {
+            // 可能带 e= （错误）
+            let e = scramAttr(attrs, "e")
+            if (len(e) > 0) { self.error = "服务端 SCRAM 失败：" + e }
+            return false
+        }
+        if (v != self.expectedServerSig) {
+            self.error = "服务端签名不匹配，认证通道可能被劫持"
+            return false
+        }
+        return true
+    }
+}

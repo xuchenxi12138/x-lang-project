@@ -1,0 +1,252 @@
+// ui/display/tabs.xle — 标签页
+//
+// ── 标签页的核心是「内容区在哪」 ────────────────────
+//
+// 标签页看起来是个选择器，但它真正的职责是**划分一块区域**：
+// 标签栏在顶部固定高度，剩下的全归内容。所以 Tabs 的主要接口
+// 是 content()，而不是 draw()。
+//
+// 这一点与 Panel 相似，区别在于 Panel 的区域总是可见的，而 Tabs
+// 的区域随选中标签变化 —— 但「区域」本身的位置和大小不变。
+//
+// ── 两种视觉风格 ─────────────────────────────
+//
+//   TAB_UNDERLINE —— 下划线式（浏览器、VS Code 侧栏）
+//   TAB_SEGMENT   —— 分段式（iOS 的分段控件、设置页的切换）
+//
+// 下划线式用于「内容区很大、标签是导航」的场景，因为它的视觉
+// 重量最轻。分段式用于「几个等价的视图之间切换」，因为它明确
+// 画出了一个「这是一个选择器」的框。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+const TAB_UNDERLINE = 0
+const TAB_SEGMENT   = 1
+
+// 标签栏高度。
+const TABS_BAR_H = 36
+
+class Tabs extends Widget {
+    labels: Array,
+    selected: Int,
+    kind: Int,
+
+    // 每个标签的最小宽度。分段式用它均分；下划线式用它做下限
+    // （短标签不挤在一起）。
+    minTabW: Int,
+
+    constructor(r: Rect, labels: Array) {
+        self.r         = r
+        self.vis       = true
+        self.enabled   = true
+        self.focused   = false
+        self.hovered   = false
+        self.labels    = labels
+        self.selected  = 0
+        self.kind      = TAB_UNDERLINE
+        self.minTabW   = 90
+        self.style     = Style.plain()
+    }
+
+    static fn of(r: Rect, labels: Array) -> Tabs {
+        let t = new Tabs(r, labels)
+        return t
+    }
+
+    static fn segmented(r: Rect, labels: Array) -> Tabs {
+        let t = new Tabs(r, labels)
+        t.kind = TAB_SEGMENT
+        return t
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    // 标签栏矩形。
+    fn barRect() -> Rect {
+        return rectOf(self.r.x, self.r.y, self.r.w, TABS_BAR_H)
+    }
+
+    // 内容区：标签栏下方。
+    fn content() -> Rect {
+        let b = self.barRect()
+        return rectOf(self.r.x, b.y + b.h + 1,
+                      self.r.w, self.r.h - b.h - 1)
+    }
+
+    // 第 i 个标签的矩形。
+    fn tabRect(i: Int) -> Rect {
+        let b = self.barRect()
+        let n = len(self.labels)
+        if (n <= 0) { return rectOf(b.x, b.y, 0, b.h) }
+
+        // 分段式：等分整个宽度。
+        if (self.kind == TAB_SEGMENT) {
+            let w = b.w / n
+            return rectOf(b.x + i * w, b.y, w, b.h)
+        }
+
+        // 下划线式：宽度按文字宽 + 左右 padding，但不小于 minTabW。
+        var x = b.x
+        var k = 0
+        while k < i {
+            let prevW = self.tabWidth(k)
+            x = x + prevW
+            k = k + 1
+        }
+        return rectOf(x, b.y, self.tabWidth(i), b.h)
+    }
+
+    fn tabWidth(i: Int) -> Int {
+        if (self.kind == TAB_SEGMENT) {
+            let n = len(self.labels)
+            if (n <= 0) { return 0 }
+            return self.barRect().w / n
+        }
+        if (i < 0 || i >= len(self.labels)) { return 0 }
+        let tw = winTextWidth(toString(self.labels[i])) + 28
+        if (tw < self.minTabW) { return self.minTabW }
+        return tw
+    }
+
+    // ── 交互 ────────────────────────────────────
+
+    fn indexAt(mx: Int, my: Int) -> Int {
+        if (!self.vis || !self.enabled) { return 0 - 1 }
+        let b = self.barRect()
+        if (!b.contains(mx, my)) { return 0 - 1 }
+
+        var i = 0
+        while i < len(self.labels) {
+            let tr: Rect = self.tabRect(i)
+            if (tr.contains(mx, my)) { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    fn click(mx: Int, my: Int) -> Bool {
+        let i = self.indexAt(mx, my)
+        if (i < 0) { return false }
+        if (i == self.selected) { return false }
+        self.selected = i
+        return true
+    }
+
+    fn current() -> Int {
+        return self.selected
+    }
+
+    fn setSelected(i: Int) -> Tabs {
+        if (i >= 0 && i < len(self.labels)) { self.selected = i }
+        return self
+    }
+
+    fn currentLabel() -> String {
+        if (self.selected < 0 || self.selected >= len(self.labels)) { return "" }
+        return toString(self.labels[self.selected])
+    }
+
+    // ── 绘制 ────────────────────────────────────
+
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+
+        if (self.kind == TAB_SEGMENT) {
+            self.drawSegment(th)
+        } else {
+            self.drawUnderline(th)
+        }
+    }
+
+    // 下划线式：无背景，选中项文字变色 + 下方一条主色线。
+    fn drawUnderline(th: Theme) {
+        let b = self.barRect()
+
+        // 整条底边线，视觉上「标签栏和内容之间有分界」。
+        winFillRect(b.x, b.y + b.h - 1, b.w, 1, th.border)
+
+        var i = 0
+        while i < len(self.labels) {
+            let tr: Rect = self.tabRect(i)
+            let s = toString(self.labels[i])
+
+            // 悬停底色。
+            let hx = winMouseX()
+            let hy = winMouseY()
+            if (self.enabled && self.barRect().contains(hx, hy)
+                && self.indexAt(hx, hy) == i && i != self.selected) {
+                winFillRect(tr.x, tr.y, tr.w, tr.h - 1, th.surfaceHover)
+            }
+
+            var tc = th.textDim
+            if (i == self.selected) { tc = th.accent }
+            if (!self.enabled) { tc = th.disabled }
+
+            uiTextInRect(tr, s, tc)
+
+            // 选中项的下划线。画 2px 宽，与文字同宽加一点余量。
+            //
+            // ── 为什么线宽 2px ────────────────────
+            //
+            // 1px 在深色主题上几乎看不见，3px 会显得笨重。2px 是
+            // 「明确但不抢眼」的值，也是 Material 规范里的取值。
+            if (i == self.selected) {
+                let lw = winTextWidth(s) + 12
+                if (lw > tr.w) { lw = tr.w }
+                let lx = tr.x + (tr.w - lw) / 2
+                winFillRect(lx, tr.y + tr.h - 2, lw, 2, th.accent)
+            }
+
+            i = i + 1
+        }
+    }
+
+    // 分段式：整体一个圆角底槽，选中项是浮起的白块。
+    fn drawSegment(th: Theme) {
+        let b = self.barRect()
+
+        // 底槽：往内收 4px，让分段控件不像「贴满整行」的按钮组。
+        let inset = 4
+        let sr = Rect.inset(b, inset)
+
+        winFillRound(sr.x, sr.y, sr.w, sr.h, sr.h / 2, th.bg)
+        winBorderRound(sr.x, sr.y, sr.w, sr.h, sr.h / 2, 1, th.border)
+
+        // 选中项的高亮块：先画在文字下面。
+        var selR: Rect = rectOf(sr.x, sr.y, 0, sr.h)
+        if (self.selected >= 0 && self.selected < len(self.labels)) {
+            let tr: Rect = self.tabRect(self.selected)
+            selR = Rect.inset(tr, 2)
+            winFillRound(selR.x, selR.y, selR.w, selR.h,
+                         selR.h / 2, th.surface)
+
+            // 描边让白块在浅色底上也有边界。
+            winBorderRound(selR.x, selR.y, selR.w, selR.h,
+                           selR.h / 2, 1, th.border)
+        }
+
+        // 文字。
+        var i = 0
+        while i < len(self.labels) {
+            let tr: Rect = self.tabRect(i)
+            let s = toString(self.labels[i])
+            let avail = tr.w - 12
+            var shown = s
+            if (winTextWidth(shown) > avail) {
+                shown = uiEllipsize(shown, avail)
+            }
+
+            var tc = th.textDim
+            if (i == self.selected) { tc = th.text }
+            if (!self.enabled) { tc = th.disabled }
+            uiTextInRect(tr, shown, tc)
+
+            i = i + 1
+        }
+    }
+}

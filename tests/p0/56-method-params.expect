@@ -1,0 +1,13 @@
+-- 按名查参数（实例接收者）--
+search: [[self, UserRepo], [keyword, String], [limit, Int]]
+noParams: [[self, BaseRepo]]
+-- 继承方法的参数表来自实现方 --
+findById: [[self, BaseRepo], [id, Int], [withLogs, Bool]]
+-- 按类名查（扫描阶段还没有实例）--
+UserRepo.search: [[self, UserRepo], [keyword, String], [limit, Int]]
+OrderRepo.create: [[self, OrderRepo], [userId, Int], [amount, Float], [note, String]]
+-- 没有参数的方法返回空数组 --
+len: 1
+-- 不存在的方法返回空数组（查无此参 ≠ 查无此法）--
+missing: []
+done

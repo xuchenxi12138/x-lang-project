@@ -1,0 +1,56 @@
+// 05-string.x — 字符串
+//
+// 验证点：
+//   1. 拼接（String + 任意类型）
+//   2. 相等比较（字典序内容比较，不是指针比较）
+//   3. len()
+//   4. toString / toInt / toFloat
+//   5. 转义字符
+//   6. 引用计数：大量拼接不应崩溃或泄漏
+
+println("=== 拼接 ===")
+let name = "X"
+let version = "0.7"
+println("language: " + name + " " + version)
+
+println("=== 拼接非字符串 ===")
+let n = 42
+let f = 3.14
+let b = true
+println("int=" + n + " float=" + f + " bool=" + b)
+
+println("=== 相等 ===")
+let s1 = "hello"
+let s2 = "hel"
+let s3 = "lo"
+// 运行时拼接出来的字符串要和字面量内容相等
+println(s1 == s2 + s3)      // true
+println(s1 == "hello")      // true
+println(s1 != "world")      // true
+
+println("=== len ===")
+println(len(""))            // 0
+println(len("abc"))         // 3
+println(len("你好"))         // 6（UTF-8 字节数，不是字符数）
+
+println("=== 转换 ===")
+println(toString(123))
+println(toString(4.5))
+println(toString(false))
+println(toInt("456") + 1)   // 457
+println(toFloat("2.5") * 2.0)   // 5.0
+
+println("=== 转义 ===")
+println("tab:\there")
+println("quote: \"quoted\"")
+println("backslash: \\")
+println("null-byte-len: " + len("a\0b"))   // 3
+
+println("=== 大量拼接（引用计数压力） ===")
+var acc = ""
+var i = 0
+while i < 100 {
+    acc = acc + "x"
+    i += 1
+}
+println(len(acc))           // 100

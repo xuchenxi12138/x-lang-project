@@ -1,0 +1,219 @@
+// ui/display/toast.xle — 轻提示管理器（队列 + 生命周期）
+//
+// ── 队列还是单条 ──────────────────────────────
+//
+// 用队列。因为「连续保存五次」会连续弹五条提示，而单条实现
+// 会让它们互相覆盖 —— 用户只看到最后一条，前四条的反馈丢了。
+//
+// 队列的容量设 3（TOAST_MAX）：再多就是噪音，而人一次也只能
+// 看 2~3 条。
+//
+// ── 永不拦截点击 ─────────────────────────────
+//
+// 很多实现把 toast 画成一个面板，而面板天然会参与命中判定 ——
+// 于是「提示条挡住了一个按钮」变成了一个真 bug。这里 Toaster
+// 的 hit() 恒返回 false，它在任何情况下都不响应输入。
+
+from "../widget/widget.xle" import Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W
+from "../core/text.xle" import uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H
+from "../core/rect.xle" import rectOf, rectFromLTRB, rectZero, Rect, rectCentered
+from "../core/theme.xle" import Theme
+from "../core/style.xle" import Style
+from "../core/palette.xle" import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE
+
+from "toastitem.xle" import ToastItem, TOAST_INFO, TOAST_SUCCESS, TOAST_WARN, TOAST_ERROR, TOAST_H, TOAST_MAX, TOAST_DUR
+
+class Toaster extends Widget {
+    // 队列（ToastItem 数组）。
+    queue: Array,
+
+    // 最大宽度。Toast 宽度按文字自适应，但不该横跨整个窗口。
+    maxW: Int,
+
+    // 在屏幕上的对齐：底部居中（默认）或顶部居中。
+    atTop: Bool,
+
+    constructor(r: Rect) {
+        self.r       = r
+        self.vis     = true
+        self.enabled = true
+        self.focused = false
+        self.hovered = false
+        self.queue   = []
+        self.maxW    = 420
+        self.atTop   = false
+        self.style   = Style.plain()
+    }
+
+    static fn of(r: Rect) -> Toaster {
+        return new Toaster(r)
+    }
+
+    // ── 添加 ────────────────────────────────────
+
+    fn show(text: String, kind: Int) -> Toaster {
+        let it = new ToastItem(text, kind)
+        arrPush(self.queue, it)
+
+        // 超容量时丢最早的。丢最老而不是丢弃新的，因为最新的
+        // 反馈才是用户刚触发的。
+        while len(self.queue) > TOAST_MAX {
+            arrRemove(self.queue, 0)
+        }
+        return self
+    }
+
+    fn info(s: String) -> Toaster {
+        return self.show(s, TOAST_INFO)
+    }
+
+    fn success(s: String) -> Toaster {
+        return self.show(s, TOAST_SUCCESS)
+    }
+
+    fn warn(s: String) -> Toaster {
+        return self.show(s, TOAST_WARN)
+    }
+
+    fn error(s: String) -> Toaster {
+        return self.show(s, TOAST_ERROR)
+    }
+
+    fn count() -> Int {
+        return len(self.queue)
+    }
+
+    fn clear() -> Toaster {
+        self.queue = []
+        return self
+    }
+
+    // ── 推进时间 ────────────────────────────────────
+    //
+    // 每帧调一次。递减剩余时间、推进进入动画、移除过期的。
+    //
+    // ── 为什么移除要单独一趟而不是在遍历里 arrRemove ──────
+    //
+    // 在遍历中删除会让下标错位。所以先标记，再统一清。这里
+    // 用「重建数组」的方式：留下 remain > 0 的项。
+    fn tick(dt: Float) -> Toaster {
+        let keep = []
+        var i = 0
+        while i < len(self.queue) {
+            let it: ToastItem = self.queue[i]
+            it.remain = it.remain - dt
+            if (it.enter < 1.0) {
+                it.enter = it.enter + dt * 4.0
+                if (it.enter > 1.0) { it.enter = 1.0 }
+            }
+            if (it.remain > 0.0) {
+                arrPush(keep, it)
+            }
+            i = i + 1
+        }
+        self.queue = keep
+        return self
+    }
+
+    // ── 几何 ────────────────────────────────────
+
+    // 单条 Toast 的宽度：文字宽 + 图标 + 内边距，夹紧到 maxW。
+    fn itemWidth(it: ToastItem) -> Int {
+        let w = winTextWidth(it.text) + 64
+        if (w > self.maxW) { return self.maxW }
+        if (w < 160) { return 160 }
+        return w
+    }
+
+    // 第 i 条的矩形。
+    //
+    // 底部对齐时从下往上堆（最新的在下面），顶部对齐时从上往下。
+    fn itemRect(i: Int) -> Rect {
+        let n = len(self.queue)
+        if (i < 0 || i >= n) { return rectOf(0, 0, 0, 0) }
+
+        let it: ToastItem = self.queue[i]
+        let w = self.itemWidth(it)
+        let cx = self.r.x + self.r.w / 2
+        let left = cx - w / 2
+
+        let gap = 8
+        if (self.atTop) {
+            let y = self.r.y + 20 + i * (TOAST_H + gap)
+            return rectOf(left, y, w, TOAST_H)
+        }
+
+        // 底部：第 0 条（最老）在最上面，最新的一条贴着底边。
+        let fromBottom = (n - 1 - i)
+        let y = self.r.y + self.r.h - 24 - TOAST_H - fromBottom * (TOAST_H + gap)
+        return rectOf(left, y, w, TOAST_H)
+    }
+
+    // ── 绘制 ────────────────────────────────────
+    //
+    // 在**所有控件之后**调用。
+    fn draw(th: Theme) {
+        if (!self.vis) { return }
+        if (len(self.queue) == 0) { return }
+
+        var i = 0
+        while i < len(self.queue) {
+            let it: ToastItem = self.queue[i]
+            let ir: Rect = self.itemRect(i)
+
+            // 进入动画：从下方 8px 浮上来。
+            //
+            // 用 (1 - enter) 而不是直接用 enter，因为 enter 从 0
+            // 涨到 1 表示「进入完成」，位移应该是从「偏移」回到
+            // 「原位」，即反比。
+            let dy = toInt((1.0 - it.enter) * 8.0)
+            let rr = Rect.offset(ir, 0, dy)
+
+            // 阴影。
+            winFillRound(rr.x + 1, rr.y + 2, rr.w, rr.h, 8, th.scrim)
+
+            // 底：不透明深色卡片。不用 surface 是因为要在
+            // 任何背景上都能看清，而 surface 在某些主题下与
+            // 背景太接近。
+            winFillRound(rr.x, rr.y, rr.w, rr.h, 8, th.bg)
+            winBorderRound(rr.x, rr.y, rr.w, rr.h, 8, 1, th.border)
+
+            // 左侧强调色竖条（4px 宽）。
+            //
+            // 这是「类型」的唯一视觉编码位置。也可以用图标颜色，
+            // 但竖条在扫视时更容易被注意到。
+            winFillRect(rr.x + 1, rr.y + 6, 3, rr.h - 12, it.accentColor(th))
+
+            // 图标：一个带底色的小方块。
+            let icx = rr.x + 16
+            let icy = rr.y + rr.h / 2
+            let ir2 = rectOf(icx, icy - 8, 16, 16)
+            winFillRound(ir2.x, ir2.y, ir2.w, ir2.h, 4, it.accentColor(th))
+            uiTextInRect(ir2, it.icon(), th.bg)
+
+            // 文字。
+            let tx = icx + 16 + 10
+            let tmax = rr.x + rr.w - tx - 12
+            var s = it.text
+            if (winTextWidth(s) > tmax) {
+                s = uiEllipsize(s, tmax)
+            }
+            let tr = rectOf(tx, rr.y, tmax, rr.h)
+            uiTextLeft(tr, s, 0, th.text)
+
+            i = i + 1
+        }
+    }
+
+    // ── 不实现 hit ─────────────────────────────
+    //
+    // 有意为之。Toast 不响应任何输入 —— 它只是通知，不是控件。
+    // 如果它响应点击，它就会挡住下面真正可点的东西，而那正是
+    // 用户最不希望发生的事。
+    //
+    // 所以这里覆写 hit 让它永远为假。基类的实现会检查 r.contains，
+    // 而 Toaster 的 r 是整块区域 —— 那会挡掉一大片。
+    fn hit(mx: Int, my: Int) -> Bool {
+        return false
+    }
+}

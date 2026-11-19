@@ -1,0 +1,7 @@
+[package]
+name = "zh_demo"
+version = "0.1.0"
+entry = "src/main.xlc"
+
+[dependencies]
+zh = { path = "../../pkg/zh" }

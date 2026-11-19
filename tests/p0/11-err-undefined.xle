@@ -1,0 +1,2 @@
+// 未定义变量必须编译期报错
+println(no_such_var)

@@ -1,0 +1,411 @@
+// ============================================================
+// std.ui（重构版）—— 纯逻辑层测试
+// ============================================================
+//
+// 这个测试**不开窗**。它只验证新组件库里所有「不需要窗口」的部分：
+//
+//   · 几何计算（Rect 各方法、布局游标、按比例分配）
+//   · 颜色推导（主题派生、混合、语义色）
+//   · 状态机（输入框的插入/删除/选区、步骤条的状态、分页的省略）
+//   · 度量（文字宽、标签宽、折行）
+//
+// ── 为什么不开窗也能测这么多 ──────────────────────
+//
+// 因为重构时把「算」和「画」彻底分开了：
+//
+//   Widget.draw(th)          —— 画，需要窗口
+//   Widget.measure()         —— 量，纯算术
+//   Widget.click(x, y)       —— 判，纯算术
+//
+// 老版本把这些混在 draw 里（draw 自己调 winPollClick 判定点击），
+// 于是「点击归谁」必须先开窗才能测。
+//
+// ── 为什么断言用 println 而不是 assert ────────────
+//
+// 因为这个语言的测试框架就是「跑一遍、比对输出」。用 println
+// 打印精确值，与 .expect 文件逐行比对 —— 比手写 assert 更容易
+// 发现「没预料到的额外输出」。
+
+from std.ui.index import UI_BG, UI_SURFACE, UI_SURFACE_H, UI_SURFACE_A, UI_BORDER, UI_TEXT, UI_TEXT_DIM, UI_ACCENT, UI_ACCENT_D, UI_OK, UI_WARN, UI_ERR, UI_TRACK, UI_SCRIM, UI_SHADOW, UI_FOCUS, UI_DISABLED, UI_NONE, rectOf, rectFromLTRB, rectZero, Rect, rectCentered, Theme, Style, Anim, uiTextWidth, uiTextHeight, uiLineCount, uiTextInRect, uiTextLeft, uiTextRight, uiTextTopLeft, uiTextCentered, uiTextCenter, uiTextLeftAt, uiEllipsize, uiTruncate, uiEllipsizeEnd, uiLastFind, uiWrapLines, uiTextBlock, UI_FONT_H, Widget, WSTATE_NORMAL, WSTATE_HOVER, WSTATE_ACTIVE, WSTATE_FOCUS, WSTATE_DISABLED, W_FOCUS_W, frameBegin, frameEmpty, frameHit, frameHover, frameClaim, frameClaimAll, frameTake, Frame, Label, TEXT_CENTER, TEXT_LEFT, TEXT_RIGHT, Button, BTN_SECONDARY, BTN_PRIMARY, BTN_DANGER, BTN_GHOST, Toggle, CK_BOX, CK_GAP, Check, Radio, RadioGroup, Field, FIELD_PAD, SearchBox, SB_ICON_W, SB_CLEAR_W, TextArea, TA_LINE_H, TA_PAD, TA_PAD_Y, Slider, SL_TRACK_H, SL_KNOB_W, SL_KNOB_H, Progress, lerpColor, Switch, SW_W, SW_H, Spinner, SP_BTN_W, Dropdown, DD_ROW_H, DD_MAX_ROWS, dateIsLeap, dateDaysIn, dateValid, datePad2, dateFormat, dateParse, DateField, DF_MIN_YEAR, DF_MAX_YEAR, colorGraySwatches, colorHueSwatches, hex2, ColorPicker, CP_SWATCH, CP_GAP, layoutFrame, layoutRaw, layoutColumn, layoutRow, layoutNext, layoutAdvance, layoutNextCol, layoutAdvanceCol, layoutSplit, layoutSplitV, layoutAt, layoutPlace, layoutCenter, layoutHCenter, layoutInset, layoutPadLeft, layoutPadRight, layoutPadTop, layoutPadBottom, layoutPadH, layoutPadV, layoutRemainder, layoutSpacer, Cursor, ALIGN_START, ALIGN_CENTER, ALIGN_END, ALIGN_STRETCH, Panel, PANEL_TITLE_H, Card, Group, Divider, ScrollView, Spacer, Stack, Splitter, SP_BAR_W, SP_SCALE, SP_MIN, Toolbar, TBAR_H, TBAR_GAP, TBAR_PAD, arrJoinStrings, StatusBar, SBAR_H, SBAR_SEP, ListBase, LIST_ROW_H, List, Table, Tree, TREE_ROW_H, TREE_INDENT, TREE_ARROW_W, Tabs, TAB_UNDERLINE, TAB_SEGMENT, TABS_BAR_H, Modal, MD_FOOTER_H, MD_PAD, Dialog, DLG_ROW_H, DLG_LABEL_W, DLG_TOP_PAD, ToastItem, TOAST_INFO, TOAST_SUCCESS, TOAST_WARN, TOAST_ERROR, TOAST_H, TOAST_MAX, TOAST_DUR, Toaster, badgeBlend, Badge, BADGE_MAX, DOT_ONLINE, DOT_BUSY, DOT_AWAY, DOT_OFFLINE, Tooltip, TIP_DELAY, TIP_PAD, TIP_GAP, TIP_MAX_W, alertBlend, Alert, ALERT_INFO, ALERT_SUCCESS, ALERT_WARN, ALERT_ERROR, ALERT_MIN_H, ALERT_PAD, ALERT_ICON, Pagination, PG_SIZE, PG_GAP, PG_SIMPLE_MAX, Breadcrumb, BC_SEP_PAD, menuIsSep, menuIsDisabled, menuLabel, menuShortcut, MenuBar, MENUBAR_H, MENU_ITEM_PAD, Menu, MENU_ROW_H, MENU_POPUP_W, tagBlend, Tag, TAG_H, TAG_PAD, TAG_NEUTRAL, TAG_ACCENT, TAG_OK, TAG_WARN, TAG_ERR, TAG_DIM, Chip, Avatar, AVATAR_SM, AVATAR_MD, AVATAR_LG, Stepper, STEP_DONE, STEP_CURRENT, STEP_TODO, STEP_ERROR, STEP_DOT, STEP_LABEL_GAP, FilePicker, FP_PATH_H, FP_ROW_H
+
+fn main() -> Int {
+    println("---- Rect ----")
+    let r = rectOf(10, 20, 100, 40)
+    println(Rect.right(r))
+    println(Rect.bottom(r))
+    println(Rect.cx(r))
+    println(Rect.cy(r))
+    println(Rect.area(r))
+    println(Rect.isEmpty(r))
+
+    let inset = Rect.inset(r, 8)
+    println("{inset.x},{inset.y},{inset.w},{inset.h}")
+
+    let half = Rect.leftHalf(r, 4)
+    println("left={half.w}")
+    let rhalf = Rect.rightHalf(r, 4)
+    println("right={rhalf.x}+{rhalf.w}")
+
+    println(Rect.contains(r, 50, 30))
+    println(Rect.contains(r, 5, 30))
+
+    let o = Rect.offset(r, 5, 5)
+    println("{o.x},{o.y}")
+
+    println("---- 布局游标 ----")
+    let area = rectOf(0, 0, 300, 200)
+    var f = layoutColumn(area, 10)
+    let r1: Rect = layoutNext(f, 24)
+    println("{r1.x},{r1.y},{r1.w},{r1.h}")
+    f = layoutAdvance(f, 24, 8)
+    let r2: Rect = layoutNext(f, 32)
+    println("{r2.y}")
+    f = layoutAdvance(f, 32, 8)
+    let r3: Rect = layoutNext(f, 500)
+    println("clamped={r3.h}")
+
+    println("---- 按比例分配 ----")
+    let parts = layoutSplit(area, [1, 1, 1], 4)
+    println(layoutAt(parts, 0).w)
+    println(layoutAt(parts, 1).w)
+    let p2 = layoutAt(parts, 2)
+    println("{p2.w},{p2.x + p2.w}")
+
+    println("---- 对齐 ----")
+    let c = layoutCenter(area, 100, 50)
+    println("{c.x},{c.y}")
+    let hc = layoutHCenter(area, 100)
+    println("{hc.x},{hc.h}")
+
+    println("---- 主题 ----")
+    let dark = Theme.dark()
+    let light = Theme.light()
+    println(dark.bg != light.bg)
+    println(dark.text != light.text)
+
+    let accented = Theme.withAccent(dark, 0xFF0000)
+    println(accented.accent == 0xFF0000)
+    println(dark.accent == 0xFF0000)
+
+    println("---- 语义色 ----")
+    println(Style.primary(dark).fill == dark.accent)
+    println(Style.danger(dark).fill == dark.err)
+    println(Style.success(dark).fill == dark.ok)
+
+    println("---- 三步判断 ----")
+    let s = Style.primary(dark)
+    println(Style.fillFor(s, false, false, true) == dark.accent)
+    println(Style.fillFor(s, true, false, true) == dark.accentDark)
+    println(Style.fillFor(s, true, true, true) == dark.accentDark)
+    let dis = Style.disabled(dark)
+    println(Style.fillFor(dis, false, false, false) == dis.fill)
+
+    println("---- 动画 ----")
+    println(Anim.easeApply(0, 0.5))
+    println(Anim.easeApply(1, 0.5))
+    println(Anim.easeApply(2, 0.5))
+
+    let an = Anim.at(0.0, 10.0, 1.0)
+    let an2 = Anim.startedAt(an, 0.5)
+    println(Anim.progress(an2))
+    println(Anim.value(an2))
+    println(Anim.done(an2))
+
+    println("---- 文字度量 ----")
+    println(uiTextWidth(""))
+    println(uiTextWidth("a"))
+    println(uiTextWidth("ab"))
+    println(uiTextWidth("ab") > uiTextWidth("a"))
+    println(uiLineCount("aaa", 1000))
+    println(uiLineCount("aaa", 10))
+
+    println("---- 文字截断 ----")
+    println(uiTruncate("hello", 1000))
+    println(len(uiEllipsize("hello world", 40)) > 0)
+
+    println("---- 折行 ----")
+    let lines = uiWrapLines("aa bb cc dd", 40)
+    println(len(lines) > 1)
+    let joined = strJoin(lines, " ")
+    println(joined == "aa bb cc dd")
+
+    println("---- 按钮状态 ----")
+    let th = Theme.dark()
+    let br = rectOf(0, 0, 100, 32)
+    let btn = Button.primary(br, "OK")
+    println(btn.kind == BTN_PRIMARY)
+    println(btn.hit(50, 16))
+    println(btn.hit(150, 16))
+    btn.disable()
+    println(btn.hit(50, 16))
+    println(btn.enabled)
+    btn.enable()
+    println(btn.hit(50, 16))
+
+    println("---- 复选框 ----")
+    let ck = Check.of(rectOf(0, 0, 120, 20), "开启", false)
+    println(ck.on)
+    ck.toggle()
+    println(ck.on)
+    let box: Rect = ck.box()
+    println(box.w)
+    let lr: Rect = ck.labelRect()
+    println(lr.x == box.x + box.w + CK_GAP)
+
+    println("---- 单选组 ----")
+    let rg = RadioGroup.of(rectOf(0, 0, 160, 90), ["A", "B", "C"], 0)
+    println(rg.indexAt(10, 10))
+    println(rg.indexAt(10, 40))
+    println(rg.indexAt(10, 200))
+    println(rg.click(10, 40))
+    println(rg.current())
+    println(rg.click(10, 40))
+
+    println("---- 输入框 ----")
+    let fl = Field.of(rectOf(0, 0, 200, 28), "abc")
+    println(fl.value())
+    println(fl.cursor)
+    println(fl.insert("X"))
+    println(fl.value())
+    println(fl.backspace())
+    println(fl.value())
+    fl.selectAll()
+    println(fl.hasSelection())
+    let sel = fl.selection()
+    println("{sel[0]},{sel[1]}")
+    println(fl.insert("Z"))
+    println(fl.value())
+    println(fl.hasSelection())
+
+    // 密码框：显示遮罩但值是明文
+    let pw = Field.passwordOf(rectOf(0, 0, 200, 28), "secret")
+    println(pw.value())
+    println(pw.displayText())
+    println(len(pw.displayText()) == len(pw.value()))
+
+    // 居中定位
+    let ml = Field.of(rectOf(0, 0, 200, 28), "abcdef")
+    println(ml.indexAtX(8))
+    println(ml.indexAtX(5))
+
+    println("---- 滑块 ----")
+    let sl = Slider.of(rectOf(0, 0, 200, 24), 0, 100, 50)
+    println(sl.get())
+    println(sl.ratio())
+    println(sl.valueAt(0))
+    println(sl.valueAt(200))
+    sl.setStep(10)
+    sl.setValue(37)
+    println(sl.get())
+    sl.setValue(999)
+    println(sl.get())
+
+    println("---- 开关 ----")
+    let sw = Switch.of(rectOf(0, 0, 160, 24), "启用", false)
+    println(sw.isOn())
+    sw.toggle()
+    println(sw.isOn())
+    println(sw.animating())
+    sw.tick(1.0)
+    println(sw.pos)
+    println(sw.animating())
+
+    println("---- 数字步进 ----")
+    let sp = Spinner.of(rectOf(0, 0, 120, 28), 0, 100, 50)
+    println(sp.get())
+    sp.inc()
+    println(sp.get())
+    sp.dec()
+    println(sp.get())
+    sp.setValue(0)
+    println(sp.dec())
+    sp.setValue(100)
+    println(sp.inc())
+
+    println("---- 下拉框 ----")
+    let dd = Dropdown.of(rectOf(0, 0, 200, 32), ["甲", "乙", "丙"], 0)
+    println(dd.currentText())
+    println(dd.selected)
+    dd.select(2)
+    println(dd.currentText())
+    println(dd.open)
+
+    println("---- 日期 ----")
+    println(dateIsLeap(2024))
+    println(dateIsLeap(1900))
+    println(dateIsLeap(2000))
+    println(dateDaysIn(2024, 2))
+    println(dateValid(2023, 2, 29))
+    println(dateFormat(2024, 3, 5))
+    println(len(dateParse("2024-03-15")))
+    println(len(dateParse("2024-02-30")))
+
+    let dt = DateField.of(rectOf(0, 0, 160, 28), 2024, 12, 31)
+    dt.addDays(1)
+    println(dt.text())
+    dt.addDays(0 - 1)
+    println(dt.text())
+    dt.setDate(2024, 1, 31)
+    dt.addMonths(1)
+    println(dt.text())
+
+    println("---- 颜色选择 ----")
+    let cp = ColorPicker.of(rectOf(0, 0, 240, 200), 0x3B82F6)
+    println(cp.hex())
+    cp.setColor(0xFFFFFF)
+    println(cp.hex())
+
+    println("---- 列表 ----")
+    let list = List.of(rectOf(0, 0, 200, 200), ["a", "b", "c", "d", "e"])
+    println(list.rowCount)
+    println(list.visibleRows() > 0)
+    println(list.rowAt(10, 10))
+    println(list.clickRow(10, 40))
+    println(list.selected)
+    println(list.currentText())
+    println(list.keyMove("ArrowDown"))
+    println(list.selected)
+    println(list.keyMove("ArrowUp"))
+    println(list.selected)
+
+    println("---- 表格 ----")
+    let tb = Table.of(rectOf(0, 0, 300, 200),
+                      ["名称", "值"],
+                      [100, 200],
+                      [["甲", "1"], ["乙", "2"]])
+    println(tb.rowCount)
+    println(tb.headerH())
+    println(tb.colX(0))
+    println(tb.colX(1))
+    let tvp: Rect = tb.viewport()
+    println(tvp.y)
+
+    println("---- 树 ----")
+    let tr = Tree.of(rectOf(0, 0, 300, 300))
+    tr.setNodes(["根", "子1", "孙", "子2"], [0, 1, 2, 1], [true, true, false, false])
+    println(tr.visibleCount())
+    tr.expand(0)
+    println(tr.visibleCount())
+    tr.expand(1)
+    println(tr.visibleCount())
+    tr.collapse(0)
+    println(tr.visibleCount())
+
+    println("---- 标签页 ----")
+    let tabs = Tabs.of(rectOf(0, 0, 400, 300), ["常规", "高级"])
+    println(tabs.current())
+    println(tabs.currentLabel())
+    let tc: Rect = tabs.content()
+    println(tc.y > tabs.r.y)
+    println(tabs.click(150, 10))
+    println(tabs.current())
+
+    println("---- 模态框 ----")
+    let md = Modal.confirm(rectOf(100, 100, 400, 220), "确认", "内容")
+    println(md.open)
+    md.show()
+    println(md.open)
+    println(md.click(10, 10))
+    println(md.open)
+    let mbb: Rect = md.buttonRect(1)
+    println(md.click(mbb.x + 10, mbb.y + 10))
+    println(md.result)
+    println(md.open)
+
+    println("---- 提示条 ----")
+    let ts = Toaster.of(rectOf(0, 0, 800, 600))
+    println(ts.count())
+    ts.success("好")
+    ts.error("坏")
+    println(ts.count())
+    ts.tick(10.0)
+    println(ts.count())
+    println(ts.hit(400, 500))
+
+    println("---- 徽标 ----")
+    println(Badge.of(5).shouldShow())
+    println(Badge.of(0).shouldShow())
+    println(Badge.of(150).displayText())
+    println(Badge.dot(DOT_ONLINE).shouldShow())
+
+    println("---- 提示气泡 ----")
+    let tip = Tooltip.of("提示")
+    tip.anchor = rectOf(400, 400, 80, 30)
+    println(tip.showing)
+    tip.update(true, 0.1)
+    println(tip.showing)
+    tip.update(true, 0.3)
+    println(tip.showing)
+    tip.update(false, 0.1)
+    println(tip.showing)
+
+    println("---- 内联提示 ----")
+    let al = Alert.warn(rectOf(0, 0, 400, 44), "注意")
+    println(al.measureH(400) >= ALERT_MIN_H)
+    let alx = Alert.error(rectOf(0, 0, 400, 44), "错误").setClosable(true)
+    let arc: Rect = alx.closeRect()
+    println(alx.click(arc.x + 5, arc.y + 5))
+    println(alx.vis)
+
+    println("---- 分页 ----")
+    let pg = Pagination.of(rectOf(0, 0, 400, 32), 100, 50)
+    println(len(pg.pageList()))
+    println(pg.pageList()[0])
+    println(pg.pageList()[1])
+    println(pg.pageList()[len(pg.pageList()) - 1])
+    pg.current = 1
+    println(len(pg.pageList()))
+
+    println("---- 面包屑 ----")
+    let bc = Breadcrumb.of(rectOf(0, 0, 600, 24),
+                           ["首页", "项目", "x-lang", "stdlib", "ui", "core", "rect.xle"])
+    println(len(bc.displayIndices()))
+    println(bc.displayIndices()[0])
+    println(bc.displayIndices()[1])
+
+    println("---- 菜单 ----")
+    println(menuLabel("新建  Ctrl+N"))
+    println(menuShortcut("新建  Ctrl+N"))
+    println(menuIsSep("-"))
+    println(menuIsDisabled("!删除"))
+    println(menuLabel("!删除"))
+
+    println("---- 标签 ----")
+    let tg = Tag.ok(rectOf(0, 0, 0, 0), "完成")
+    println(tg.measure().h)
+    println(tg.measure().w > 0)
+    let ah = Avatar.of(rectOf(0, 0, 32, 32), "张三")
+    println(ah.initial())
+    println(ah.bgColor(Theme.dark()) == ah.bgColor(Theme.dark()))
+
+    println("---- 步骤条 ----")
+    let stp = Stepper.of(rectOf(0, 0, 600, 60), ["一", "二", "三"], 1)
+    println(stp.states[0])
+    println(stp.states[1])
+    println(stp.states[2])
+    stp.setState(1, STEP_ERROR)
+    println(stp.states[1])
+
+    println("---- 容器 ----")
+    let pn = Panel.of(rectOf(0, 0, 300, 200), "标题")
+    let pc: Rect = pn.content()
+    println(pc.x > pn.r.x)
+    println(pc.y > pn.r.y)
+    println(pn.header)
+
+    let sv = ScrollView.of(rectOf(0, 0, 200, 100))
+    sv.contentH = 400
+    println(sv.maxOffset())
+    sv.scroll(-1)
+    println(sv.offset)
+    sv.scroll(100)
+    println(sv.offset)
+
+    println("---- 帧 ----")
+    let fr = frameEmpty()
+    println(fr.clicked)
+    println(frameHit(fr, rectOf(0, 0, 100, 100)))
+
+    println("---- 完成 ----")
+    return 0
+}

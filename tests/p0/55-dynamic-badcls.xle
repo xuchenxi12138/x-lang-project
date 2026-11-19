@@ -1,0 +1,9 @@
+// 55-dynamic-badcls.xle — classNew 查无此类：报错而不是返回 null
+//
+// 静态 new 的类名写错是编译错误；动态调用把「类名写错」推迟到了
+// 运行时，但推迟不等于吞掉 —— 返回 null 只会把崩溃变成更远的
+// 空指针。所以这里必须硬报错，退出码 70。
+fn main() {
+    let x = classNew("NoSuchClass")
+    println("unreachable: " + className(x))
+}
